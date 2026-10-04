@@ -1,0 +1,24 @@
+[package]
+name = "hello_switch"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Minimal 3D Bevy test application for Nintendo Switch"
+
+[dependencies]
+bevy = { version = "0.19", default-features = false, features = [
+    "bevy_window",
+    "bevy_winit",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_ui_render",
+    "bevy_gilrs",
+    "x11",
+    "png",
+] }
+bevy_horizon = { path = "../../crates/bevy_horizon" }

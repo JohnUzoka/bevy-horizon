@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/bevy_horizon",
+    "examples/hello_switch",
     "patches/bevy_asset",
     "patches/cpal",
     "patches/memmap2",
@@ -11,3 +12,9 @@ members = [
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/JohnUzoka/bevy-horizon"
+
+[patch.crates-io]
+bevy_asset = { path = "patches/bevy_asset" }
+cpal = { path = "patches/cpal" }
+memmap2 = { path = "patches/memmap2" }
+

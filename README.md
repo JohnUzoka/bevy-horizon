@@ -46,8 +46,30 @@ fn main() {
 }
 ```
 
-## Cross-Compiling with Podman
+## Testing with `hello_switch`
+
+A minimal 3D spinning cube demo with Joy-Con input is included under `examples/hello_switch`.
+
+### 1. Compile to `.nro`
 
 ```bash
-./scripts/build.sh
+./scripts/build_example.sh
 ```
+
+This produces `hello_switch.nro`.
+
+### 2. Test in Emulator or Hardware
+
+- **PC Emulator (Ryujinx / Sudachi)**:
+  Drag and drop `hello_switch.nro` directly into the emulator window. Live logs will stream to your terminal.
+- **Nintendo Switch (Atmosphere CFW)**:
+  Copy `hello_switch.nro` to `sdmc:/switch/hello_switch.nro` on your SD card. Launch via **Title Override** (hold `R` while launching any game title) to ensure full memory access.
+
+### Controls
+
+| Action | Switch Controller | Desktop Keyboard |
+|---|---|---|
+| Adjust Rotation Speed | Left Stick / D-Pad | Arrow Keys |
+| Cycle Cube Color | **(A)** Button | Space |
+| Exit | **(+)** Button | Escape |
+
