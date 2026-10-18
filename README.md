@@ -80,8 +80,8 @@ This produces `hello_switch.nro`.
 
 ## Credits
 
-bevy-horizon copies and adapts code from other projects, among them kyokoxdev's crate patches, danfromtico's mesa-switch and libnx. [CREDITS.md](CREDITS.md) lists every source with its license and what it was used for.
+bevy-horizon copies and adapts code from other projects, among them kyokoxdev's crate patches, danfromtico's mesa-switch, libnx and SDL. [CREDITS.md](CREDITS.md) lists every source with its license and what it was used for.
 
 ## License
 
-bevy-horizon is licensed under either of the [MIT license](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option. The crates under `patches/` keep their own licenses.
+bevy-horizon is licensed under either of the [MIT license](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option. The crates under `patches/` keep their own licenses, and [CREDITS.md](CREDITS.md#license-notices) has the notices for code adapted from libnx (ISC) and SDL (zlib).

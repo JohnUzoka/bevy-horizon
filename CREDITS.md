@@ -6,7 +6,8 @@ bevy-horizon is built on other people's work. This file lists what was copied or
 
 | What | Source | License | Where |
 |---|---|---|---|
-| cpal's Horizon audio host, copied unchanged (`src/host/horizon/mod.rs`, 306 lines), with the `cfg` lists that exclude Horizon from the other hosts | [kyokoxdev/iw4l-nx-crate-patches](https://github.com/kyokoxdev/iw4l-nx-crate-patches) (`cpal`), on cpal 0.17.3 from [RustAudio/cpal](https://github.com/RustAudio/cpal) | Apache-2.0 | `patches/cpal` |
+| The `cfg` lists that keep Horizon out of cpal's other hosts (`src/host/mod.rs`, `src/platform/mod.rs`). kyokoxdev's patch also had a Horizon host over SDL2; the hosts here replace it. They were written here and drive libnx's audio renderer themselves (`src/host/horizon/mod.rs`), setting it up as SDL's Switch backend does (next row) | [kyokoxdev/iw4l-nx-crate-patches](https://github.com/kyokoxdev/iw4l-nx-crate-patches) (`cpal`), on cpal 0.17.3 from [RustAudio/cpal](https://github.com/RustAudio/cpal) | Apache-2.0 | `patches/cpal`, `patches/bevy-0.18/cpal` |
+| How cpal's Horizon hosts set up the audio renderer: its configuration (48 kHz, 24 voices, one sink, a final mix of two buffers), the buffers' layout (every buffer spans the whole pool, and its sample offsets pick its part), and the order of the calls that open it | SDL2's Switch audio backend, `src/audio/switch/SDL_switchaudio.c` in [devkitPro/SDL](https://github.com/devkitPro/SDL), branch `switch-sdl-2.28` | zlib ([notice](#sdl)) | `patches/cpal/src/host/horizon/mod.rs`, `patches/bevy-0.18/cpal/src/host/horizon/mod.rs` |
 | memmap2's Horizon changes in `src/lib.rs`, which keep Horizon out of the `unix` backend. kyokoxdev's patch sent Horizon to memmap2's stub backend, which fails every map; here Horizon has a backend of its own that holds maps on the heap (`src/horizon.rs`, written here) | kyokoxdev/iw4l-nx-crate-patches (`memmap2`), on memmap2 0.9.11 from [RazrFalcon/memmap2-rs](https://github.com/RazrFalcon/memmap2-rs) | MIT OR Apache-2.0 | `patches/memmap2` |
 | bevy_asset's Horizon changes. kyokoxdev's patch for 0.19.0 gave Horizon a file reader without `async-io`; it was remade here on 0.19.1 and on 0.18.1. Added here: `under_base_path` (asset roots that name a device, such as `sdmc:/`), and Horizon now reads files with Bevy's own synchronous reader (`sync_file_asset.rs`, unchanged) instead of the `async-fs` one | kyokoxdev/iw4l-nx-crate-patches (`bevy_asset`), on [bevyengine/bevy](https://github.com/bevyengine/bevy) | MIT OR Apache-2.0 | `patches/bevy_asset`, `patches/bevy-0.18/bevy_asset` |
 | crates.io releases with Horizon changes made here: bevy_tasks 0.19.1 and 0.18.1, getrandom 0.4.3 and 0.2.17, inventory 0.3.24 (Horizon added to the targets whose `.init_array` constructors run), libc 0.2.190, lua-src 551.0.2, polling 3.10.0, ring 0.17.14, rustix 1.1.5 | [bevyengine/bevy](https://github.com/bevyengine/bevy), [rust-random/getrandom](https://github.com/rust-random/getrandom), [dtolnay/inventory](https://github.com/dtolnay/inventory), [rust-lang/libc](https://github.com/rust-lang/libc), [mlua-rs/lua-src-rs](https://github.com/mlua-rs/lua-src-rs), [smol-rs/polling](https://github.com/smol-rs/polling), [briansmith/ring](https://github.com/briansmith/ring), [bytecodealliance/rustix](https://github.com/bytecodealliance/rustix) | As each crate's license files state | `patches/*`, `patches/bevy-0.18/bevy_tasks` |
@@ -14,9 +15,11 @@ bevy-horizon is built on other people's work. This file lists what was copied or
 | The same Vulkan changes ported to the releases Bevy 0.18 uses: wgpu 27.0.1, wgpu-core 27.0.3, wgpu-hal 27.0.4 and wgpu-core-deps-windows-linux-android 27.0.0. wgpu-hal 27.0.4 also logs the size and memory type of a Vulkan allocation that fails, and keeps a ledger of the memory wgpu's buffers and textures hold (its `[GPU]` lines), alongside wgpu-hal's own `buffer_memory` and `texture_memory` counters | [gfx-rs/wgpu](https://github.com/gfx-rs/wgpu) | MIT OR Apache-2.0 | `patches/bevy-0.18/wgpu*` |
 | render_check's viewport tiles with per-camera UI, and its depth-test-off `ExtendedMaterial` | Bevy 0.19.1's `split_screen`, `extended_material` and `clustered_decals` examples, [bevyengine/bevy](https://github.com/bevyengine/bevy) | MIT OR Apache-2.0 | `examples/render_check/src/main.rs` |
 | The Breakout game, adapted: gamepad input, the FPS chord, `FixedUpdate`, and `[Game]` log lines added; the collision sound and the stepping plugin left out | Bevy 0.19.1's `examples/showcase/breakout.rs`, [bevyengine/bevy](https://github.com/bevyengine/bevy) | MIT OR Apache-2.0 | `examples/breakout/src/main.rs` |
-| The target specification and link settings | [nx-std/mono](https://github.com/nx-std/mono) `aarch64-nintendo-horizon.json`. The repository states no license. | — | `aarch64-nintendo-horizon.json` |
+| The target specification and its link settings. Its link script is libnx's `switch.ld`, which nx-std's copy has unchanged. Added here: a `PT_TLS` segment for `.tdata` and `.tbss`, aligned to their alignment and checked by an `ASSERT`; `env` `newlib`, `target-family` `unix` and `frame-pointer` `always`; and the linker's `--wrap` for `threadCreate`, `fchmod`, `rename` and `rmdir`, whose wrappers are in `crates/bevy_horizon/src/compat.rs` | [nx-std/mono](https://github.com/nx-std/mono) `aarch64-nintendo-horizon.json`, which states no license; the link script from [switchbrew/libnx](https://github.com/switchbrew/libnx) (`nx/switch.ld`) | None stated (nx-std); ISC for the link script ([notice](#libnx)) | `aarch64-nintendo-horizon.json` |
 | The NVK build: Mesa's Vulkan driver ported to the Switch, built by a script that follows mesa-switch's `build-switch.sh`, `build-unified.sh` and `Docker.rust`. bevy-horizon patches mesa-switch's `src/nouveau/horizon/nouveau_horizon_memory.c` so NVK takes GPU memory from the top of the heap downward, and `src/nouveau/vulkan/nvk_physical_device.c` so its GPU timestamps convert to nanoseconds with the Tegra X1's tick (1.6276 ns) instead of 1 ns. Its patches to NAK, Mesa's shader compiler for NVIDIA GPUs, add `NAK_DEBUG=stats` (`nak/api.rs`), cross-block scoreboards (`NAK_DEBUG=xbar`, `nak/calc_instr_deps.rs`), and input sinking and switch-compare rematerialization (`NAK_DEBUG=sink` and `remat`: `nak_nir.c` and a new `nak_nir_rematerialize_bools.c`, whose block walk follows NAK's `nak_nir_rematerialize_load_const.c`); `scripts/build_nvk.sh` applies the patches | [danfromtico/mesa-switch](https://github.com/danfromtico/mesa-switch) by danfromtico and NaGaa95, a port of [Mesa](https://mesa3d.org) | MIT (Mesa) | `scripts/build_nvk.sh`, `patches/mesa-switch/`, `nvk/` |
-| `extern "C"` declarations, constants and struct layouts transcribed from libnx's headers | [switchbrew/libnx](https://github.com/switchbrew/libnx) | ISC | `crates/bevy_horizon/src`, `examples/switch_captest/src` |
+| `extern "C"` declarations, constants and struct layouts transcribed from libnx's headers | [switchbrew/libnx](https://github.com/switchbrew/libnx) | ISC ([notice](#libnx)) | `crates/bevy_horizon/src`, `examples/switch_captest/src` |
+
+kyokoxdev/iw4l-nx-crate-patches is no longer online: GitHub returns 404 for it as of 2026-10-18. What remains of it here is what the cpal, memmap2 and bevy_asset rows describe.
 
 ## Linked or used to build
 
@@ -79,3 +82,44 @@ bevy-horizon is built on other people's work. This file lists what was copied or
 | Atmosphère's kernel, mesosphère, at `36cc9a9f` ([Atmosphere-NX/Atmosphere](https://github.com/Atmosphere-NX/Atmosphere)): `libraries/libvapours/include/vapours/svc/svc_select_thread_local_region.hpp:44`, `libraries/libvapours/include/vapours/svc/arch/arm64/svc_thread_local_region.hpp:39-41`, `libraries/libmesosphere/include/mesosphere/kern_k_thread_local_page.hpp:29`, `libraries/libmesosphere/source/kern_k_scheduler.cpp:120-145,447` and `libraries/libmesosphere/source/svc/kern_svc_thread.cpp:89-110`. Also libnx's `nx/source/runtime/newlib.c:409-421` ([switchbrew/libnx](https://github.com/switchbrew/libnx) at `feebd026`) | GPL-2.0; ISC | That a thread's local region is 0x200 bytes, eight to a page, at the address in `tpidrro_el0`, which picks a thread's shard of the allocator's cache. That each core runs its highest-priority ready thread, so the cache's locks are only ever tried, never waited for. And that Rust's `thread::sleep` calls `svcSleepThread` through `nanosleep`: a positive time lets lower-priority threads run, where 0 only goes behind threads of the same priority (`crates/bevy_horizon/src/allocator.rs`, `crates/bevy_horizon/src/allocator/small_blocks.rs`) |
 
 The docs in `docs/` cite sources inline, with file and line numbers.
+
+## License notices
+
+libnx's and SDL's licenses ask for their notices to go with code taken from them. The patched crates under `patches/` carry their own license files.
+
+### libnx
+
+For the link script in `aarch64-nintendo-horizon.json`, and the declarations transcribed from libnx's headers.
+
+```text
+Copyright 2017-2018 libnx Authors
+
+Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+```
+
+### SDL
+
+For the audio renderer setup in cpal's Horizon hosts.
+
+```text
+Simple DirectMedia Layer
+Copyright (C) 1997-2018 Sam Lantinga <slouken@libsdl.org>
+
+This software is provided 'as-is', without any express or implied
+warranty.  In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgment in the product documentation would be
+   appreciated but is not required.
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+3. This notice may not be removed or altered from any source distribution.
+```
