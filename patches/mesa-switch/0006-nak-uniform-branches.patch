@@ -1,0 +1,95 @@
+bevy-horizon: NAK_DEBUG=ubra, plain branches for uniform ifs before Volta
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at d4a00ea0ab3f59afb967cc5d779e4263d237bd77, after 0001 to 0005. scripts/build_nvk.sh applies
+it; this text before the first "diff --git" line is ignored by git apply.
+
+Before SM70, from_nir.rs puts an SSY before every if and a SYNC at the end of each side, so the
+warp's threads come back together after it. A warp whose threads all take the same side never
+splits, so there is nothing to bring back together. nak_nir.c runs NIR's divergence analysis
+for every SM, and from SM70 nak_nir_lower_cf uses it to give such ifs plain branches.
+NAK_DEBUG=ubra does the same before SM70: an if whose condition is not divergent gets a
+predicated BRA and no SSY or SYNC. Loops keep their PBK and PCNT.
+
+On Skate 3's world fragment shader (SM53, with xbar,sink,remat and the game's bounds checks),
+NAK_DEBUG=stats went from 3570 instructions to 3558 (static cycles 22261 to 22200), and with
+SKATE_WORLD_PAGE_ARRAY from 2295 to 2283. Bevy 0.18.1's PBR fragment shader went from 2679 to
+2649. No shader failed to compile on the PC (nakhost, SM53, debug build with assertions). Not
+yet run on hardware; off unless set.
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 33e3bf2..13ad3ce 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -33,6 +33,7 @@ enum DebugFlags {
+     Final,
+     Sink,
+     Remat,
++    UBra,
+ }
+ 
+ pub struct Debug {
+@@ -64,6 +65,7 @@ impl Debug {
+                 "final" => flags |= 1 << DebugFlags::Final as u8,
+                 "sink" => flags |= 1 << DebugFlags::Sink as u8,
+                 "remat" => flags |= 1 << DebugFlags::Remat as u8,
++                "ubra" => flags |= 1 << DebugFlags::UBra as u8,
+                 unk => eprintln!("Unknown NAK_DEBUG flag \"{}\"", unk),
+             }
+         }
+@@ -121,6 +123,10 @@ pub trait GetDebugFlags {
+     fn remat(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::Remat as u8) != 0
+     }
++
++    fn ubra(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::UBra as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+diff --git a/src/nouveau/compiler/nak/from_nir.rs b/src/nouveau/compiler/nak/from_nir.rs
+index 88518a5..492ce40 100644
+--- a/src/nouveau/compiler/nak/from_nir.rs
++++ b/src/nouveau/compiler/nak/from_nir.rs
+@@ -4453,11 +4453,13 @@ impl<'a> ShaderFromNir<'a> {
+ 
+         if self.sm.sm() < 70 {
+             if let Some(ni) = nb.following_if() {
+-                let fb = ni.following_block();
+-                b.push_op(OpSSy {
+-                    target: self.get_block_label(fb),
+-                });
+-                self.push_crs(fb, SyncType::Sync);
++                if self.if_needs_sync(ni) {
++                    let fb = ni.following_block();
++                    b.push_op(OpSSy {
++                        target: self.get_block_label(fb),
++                    });
++                    self.push_crs(fb, SyncType::Sync);
++                }
+             } else if let Some(nl) = nb.following_loop() {
+                 let fb = nl.following_block();
+                 b.push_op(OpPBk {
+@@ -4583,12 +4585,20 @@ impl<'a> ShaderFromNir<'a> {
+         self.parse_cf_list(ssa_alloc, phi_map, ni.iter_then_list());
+         self.parse_cf_list(ssa_alloc, phi_map, ni.iter_else_list());
+ 
+-        if self.sm.sm() < 70 {
++        if self.sm.sm() < 70 && self.if_needs_sync(ni) {
+             let next_block = ni.cf_node.next().unwrap().as_block().unwrap();
+             self.pop_crs(next_block, SyncType::Sync);
+         }
+     }
+ 
++    /// Before Volta, whether an if needs SSY/SYNC to bring its threads back
++    /// together. With NAK_DEBUG=ubra, an if whose condition is the same in
++    /// every active thread (NIR's divergence analysis) can't split the warp,
++    /// so it branches with plain BRAs and leaves the CRS stack alone.
++    fn if_needs_sync(&self, ni: &nir_if) -> bool {
++        !DEBUG.ubra() || ni.condition.as_def().divergent
++    }
++
+     fn parse_loop(
+         &mut self,
+         ssa_alloc: &mut SSAValueAllocator,

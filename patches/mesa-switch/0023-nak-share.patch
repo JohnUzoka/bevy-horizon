@@ -1,0 +1,515 @@
+bevy-horizon: let loads of one kind share a scoreboard (NAK_DEBUG=share)
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 606441c9, after 0001-0022. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+Maxwell has six scoreboards for variable-latency operations. A texture fetch or memory load
+usually takes two: one that its sources have been read, one that its result has been written.
+When all six are taken, NAK makes the next one wait for the oldest, so a run of loads whose
+results are used after the run has only about three in flight. In sk8's cluster test the 4th,
+5th and 6th of 24 texel reads wait for the results of the 1st, 2nd and 3rd.
+
+A scoreboard is a counter, though, and a wait on it covers everything it holds. Mesa's older
+Maxwell compiler relies on that: when it runs out it puts the operation on scoreboard 5 anyway
+(insertBarriers() in nv50_ir_emit_gm107.cpp), and its DEPBAR.LE has a 6-bit count. maxas found
+that memory loads, which go out in order, share a scoreboard reliably, and that S2Rs, which can
+be processed out of order, don't.
+
+With NAK_DEBUG=share, a texture fetch or memory load that finds no free scoreboard (in the
+cross-block pass, NAK_DEBUG=xbar) takes one held only by operations of its kind (texture
+fetches, or loads from the same memory space) for the same purpose (reading or writing), at
+most eight of them. Of those it takes the one first waited on latest. Anything else still
+waits for the oldest. xbar_verify() checks the result under the counter model; if the check
+fails, NAK keeps the old barriers and prints "NAK xbar: kept legacy barriers".
+
+Compiled on the host with the Switch flags, sk8's cluster test kernels go from 165-231 waits to
+148-194 with the same instructions, and a static count of loads in flight when each is issued
+roughly doubles (1.4 to 2.6 in the old kernel, 2.2 to 4.4 in the new one). The triangle cull
+goes from 1.3 to 2.7; the world shader barely changes (1.41 to 1.49).
+
+Only the GPU can show whether this is right, because Ryujinx ignores the scheduling control
+codes. So it is off by default, in Switch builds too. Four unit tests cover runs of loads, the
+cap of eight, reads and writes kept apart, and different kinds kept apart.
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 9e250da..2cdf204 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -40,9 +40,10 @@ enum DebugFlags {
+     PLat,
+     OFold,
+     WgBar,
++    Share,
+ }
+ 
+-const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 18] = [
++const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 19] = [
+     ("panic", DebugFlags::Panic),
+     ("print", DebugFlags::Print),
+     ("serial", DebugFlags::Serial),
+@@ -61,6 +62,7 @@ const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 18] = [
+     ("plat", DebugFlags::PLat),
+     ("ofold", DebugFlags::OFold),
+     ("wgbar", DebugFlags::WgBar),
++    ("share", DebugFlags::Share),
+ ];
+ 
+ /// The flags NAK_DEBUG starts from. Switch builds (meson sets
+@@ -193,6 +195,10 @@ pub trait GetDebugFlags {
+     fn wgbar(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::WgBar as u8) != 0
+     }
++
++    fn share(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::Share as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+diff --git a/src/nouveau/compiler/nak/calc_instr_deps.rs b/src/nouveau/compiler/nak/calc_instr_deps.rs
+index 7f6365f..36e4d55 100644
+--- a/src/nouveau/compiler/nak/calc_instr_deps.rs
++++ b/src/nouveau/compiler/nak/calc_instr_deps.rs
+@@ -773,6 +773,47 @@ fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
+ // the BRK.  The result is checked by xbar_verify(), an independent hazard
+ // check over the whole CFG.  The caller keeps assign_barriers()'s result if
+ // the check fails, or if it rejects assign_barriers()'s own result.
++//
++// NAK_DEBUG=share changes what happens when all six scoreboards are taken.
++// Without it, the new operation waits for the oldest, as assign_barriers()
++// does.  A texture fetch or memory load usually needs two, one for reading
++// its sources and one for writing its result, so a run of loads whose
++// results are used after the run, such as a min over a block of texels,
++// has only three in flight: from the fourth on, each waits for the result of
++// the one three before it.  With share, a texture fetch or memory load takes
++// a scoreboard held only by operations of its kind (texture fetches, or
++// loads from the same memory space) for the same purpose (reading or
++// writing), at most XBAR_SHARE_MAX of them.  Of those it takes the one first
++// waited on latest, so it has the longest time in flight before a wait
++// covers it.  The others still wait for the oldest.  This relies on the
++// first property above and on loads of one kind going out in order: maxas
++// found Maxwell's memory loads share a scoreboard reliably and S2Rs, which
++// can be processed out of order, don't.
++
++/// The kind of operation that may share a scoreboard with others of its
++/// kind under NAK_DEBUG=share: texture fetches, and loads from each memory
++/// space.
++fn xbar_share_class(op: &Op) -> Option<u8> {
++    match op {
++        Op::Tex(_)
++        | Op::Tld(_)
++        | Op::Tld4(_)
++        | Op::Tmml(_)
++        | Op::Txd(_)
++        | Op::Txq(_) => Some(0),
++        Op::Ld(ld) => Some(match ld.access.space {
++            MemSpace::Global(_) => 1,
++            MemSpace::Local => 2,
++            MemSpace::Shared => 3,
++        }),
++        _ => None,
++    }
++}
++
++/// The most deps one scoreboard holds under NAK_DEBUG=share.  maxas
++/// measured a warp's queue of global loads at about eight, so more on one
++/// scoreboard would mostly wait in that queue.
++const XBAR_SHARE_MAX: usize = 8;
+ 
+ /// Scoreboarded accesses to one register that may still be in flight,
+ /// merged over all forward paths (sorted dep indices).
+@@ -814,14 +855,24 @@ struct XbarDeps {
+     waited: Vec<bool>,
+     instr_deps: FxHashMap<(usize, usize), (usize, usize)>,
+     instr_waits: FxHashMap<(usize, usize), Vec<usize>>,
++    /// For NAK_DEBUG=share, each dep's xbar_share_class() times two, plus
++    /// one for a write.  Deps with the same key may share a scoreboard.
++    share_key: Vec<Option<u8>>,
+ }
+ 
+ impl XbarDeps {
+-    fn add_instr(&mut self, bi: usize, ip: usize) -> (usize, usize) {
++    fn add_instr(
++        &mut self,
++        bi: usize,
++        ip: usize,
++        class: Option<u8>,
++    ) -> (usize, usize) {
+         let rd = self.read_dep.len();
+         let wr = rd + 1;
+         self.read_dep.extend([None, Some(rd)]);
+         self.waited.extend([false, false]);
++        self.share_key
++            .extend([class.map(|c| c * 2), class.map(|c| c * 2 + 1)]);
+         self.instr_deps.insert((bi, ip), (rd, wr));
+         (rd, wr)
+     }
+@@ -908,7 +959,8 @@ fn xbar_calc_waits(
+                     waits.append(&mut u.writes);
+                 });
+                 if sm.op_needs_scoreboard(&instr.op) {
+-                    let (rd, wr) = deps.add_instr(bi, ip);
++                    let (rd, wr) =
++                        deps.add_instr(bi, ip, xbar_share_class(&instr.op));
+                     let mut has_src = false;
+                     let mut has_dst = false;
+                     st.uses.for_each_instr_src_mut(instr, |_, u| {
+@@ -990,13 +1042,15 @@ impl XbarBarState {
+         }
+     }
+ 
+-    /// Pick a scoreboard that is free on every path, or wait on the one
+-    /// holding the oldest dep.
++    /// Pick a scoreboard that is free on every path, one that `dep` can
++    /// share, or wait on the one holding the oldest dep.
+     fn alloc(
+         &mut self,
+         plan: &mut XbarPlan,
+         other: Option<u8>,
++        dep: usize,
+         read_dep: &[Option<usize>],
++        share: Option<&XbarShare>,
+     ) -> u8 {
+         let mut oldest: Option<u8> = None;
+         for b in 0..6_u8 {
+@@ -1011,11 +1065,68 @@ impl XbarBarState {
+                 oldest = Some(b);
+             }
+         }
++        if let Some(b) = share.and_then(|s| self.shareable(s, other, dep)) {
++            return b;
++        }
+         let b = oldest.unwrap();
+         plan.wt_bar_mask |= 1 << b;
+         self.wait(1 << b, read_dep);
+         b
+     }
++
++    /// Of the scoreboards holding only deps with `dep`'s share key, and
++    /// fewer than XBAR_SHARE_MAX, the one first waited on latest.  Called
++    /// when none is free, so each one considered holds a dep.
++    fn shareable(
++        &self,
++        share: &XbarShare,
++        other: Option<u8>,
++        dep: usize,
++    ) -> Option<u8> {
++        let key = share.key[dep]?;
++        let mut best: Option<(u8, usize)> = None;
++        for b in 0..6_u8 {
++            let bar = &self.bars[usize::from(b)];
++            if Some(b) == other
++                || bar.len() >= XBAR_SHARE_MAX
++                || bar.iter().any(|d| share.key[*d] != Some(key))
++            {
++                continue;
++            }
++            let need = bar.iter().map(|d| share.first_wait[*d]).min().unwrap();
++            if best.is_none_or(|(_, n)| need > n) {
++                best = Some((b, need));
++            }
++        }
++        best.map(|(b, _)| b)
++    }
++}
++
++/// What NAK_DEBUG=share needs to pick a scoreboard to share
++struct XbarShare<'a> {
++    key: &'a [Option<u8>],
++    /// Where each dep is first waited on, counting instructions in block
++    /// order
++    first_wait: Vec<usize>,
++}
++
++impl<'a> XbarShare<'a> {
++    fn new(f: &Function, deps: &'a XbarDeps) -> Self {
++        let mut first_wait = vec![usize::MAX; deps.read_dep.len()];
++        let mut at = 0;
++        for (bi, b) in f.blocks.iter().enumerate() {
++            for ip in 0..b.instrs.len() {
++                for &d in deps.instr_waits(bi, ip) {
++                    first_wait[d] = first_wait[d].min(at);
++                }
++                at += 1;
++            }
++        }
++        XbarShare {
++            key: &deps.share_key,
++            first_wait,
++        }
++    }
+ }
+ 
+ /// Pass 2: scoreboard numbers and wait masks.
+@@ -1024,7 +1135,9 @@ fn xbar_assign_bars(
+     sm: &ShaderModelInfo,
+     deps: &XbarDeps,
+     keep_brk: bool,
++    share: bool,
+ ) -> Vec<Vec<XbarPlan>> {
++    let share = share.then(|| XbarShare::new(f, deps));
+     let mut plans: Vec<Vec<XbarPlan>> = f
+         .blocks
+         .iter()
+@@ -1060,13 +1173,25 @@ fn xbar_assign_bars(
+             if sm.op_needs_scoreboard(&instr.op) {
+                 let (rd, wr) = deps.instr_deps[&(bi, ip)];
+                 if deps.waited[rd] {
+-                    let b = st.alloc(plan, None, &deps.read_dep);
++                    let b = st.alloc(
++                        plan,
++                        None,
++                        rd,
++                        &deps.read_dep,
++                        share.as_ref(),
++                    );
+                     st.bars[usize::from(b)].push(rd);
+                     plan.rd_bar = Some(b);
+                 }
+                 if deps.waited[wr] {
+                     let rd_bar = plan.rd_bar;
+-                    let b = st.alloc(plan, rd_bar, &deps.read_dep);
++                    let b = st.alloc(
++                        plan,
++                        rd_bar,
++                        wr,
++                        &deps.read_dep,
++                        share.as_ref(),
++                    );
+                     st.bars[usize::from(b)].push(wr);
+                     plan.wr_bar = Some(b);
+                 }
+@@ -1290,6 +1415,7 @@ fn assign_barriers_xbar(
+     f: &mut Function,
+     sm: &ShaderModelInfo,
+     keep_brk: bool,
++    share: bool,
+ ) -> Result<(), String> {
+     let saved: Vec<Vec<(u8, bool, u8, u8)>> = f
+         .blocks
+@@ -1311,7 +1437,7 @@ fn assign_barriers_xbar(
+ 
+     xbar_check_cfg(f)?;
+     let deps = xbar_calc_waits(f, sm, keep_brk);
+-    let plans = xbar_assign_bars(f, sm, &deps, keep_brk);
++    let plans = xbar_assign_bars(f, sm, &deps, keep_brk, share);
+     xbar_verify(f, sm, &plans)?;
+ 
+     for (bi, b) in f.blocks.iter_mut().enumerate() {
+@@ -1697,9 +1823,12 @@ impl Shader<'_> {
+             let mut min_num_static_cycles = 0u64;
+             for f in &mut self.functions {
+                 if xbar {
+-                    if let Err(e) =
+-                        assign_barriers_xbar(f, self.sm, DEBUG.xbrk())
+-                    {
++                    if let Err(e) = assign_barriers_xbar(
++                        f,
++                        self.sm,
++                        DEBUG.xbrk(),
++                        DEBUG.share(),
++                    ) {
+                         eprintln!("NAK xbar: kept legacy barriers: {e}");
+                     }
+                 } else {
+@@ -1904,7 +2033,7 @@ mod tests {
+         xbar_verify(&legacy, &sm, &xbar_plans_from_deps(&legacy)).unwrap();
+ 
+         let mut f = xbar_if_else();
+-        assign_barriers_xbar(&mut f, &sm, false).unwrap();
++        assign_barriers_xbar(&mut f, &sm, false, false).unwrap();
+         // Neither SYNC waits
+         assert_eq!(xbar_mask(&f, 1, 1), 0);
+         assert_eq!(xbar_mask(&f, 2, 1), 0);
+@@ -1922,7 +2051,7 @@ mod tests {
+     fn test_xbar_verify_rejects_missing_waits() {
+         let sm = xbar_sm();
+         let mut f = xbar_if_else();
+-        assign_barriers_xbar(&mut f, &sm, false).unwrap();
++        assign_barriers_xbar(&mut f, &sm, false, false).unwrap();
+         let plans = xbar_plans_from_deps(&f);
+ 
+         let mut no_raw = plans.clone();
+@@ -1969,7 +2098,7 @@ mod tests {
+                 ),
+             ]
+         });
+-        assign_barriers_xbar(&mut f, &sm, false).unwrap();
++        assign_barriers_xbar(&mut f, &sm, false, false).unwrap();
+         assert_eq!(xbar_mask(&f, 1, 1), 0);
+         // The rcp after the join can't reuse the scoreboard that the
+         // then-side rcp may still hold, so r6 = r4 doesn't wait for it.
+@@ -1992,7 +2121,7 @@ mod tests {
+                 (vec![xbar_mov(3, 1), Instr::new(OpExit {})], vec![]),
+             ]
+         });
+-        assign_barriers_xbar(&mut f, &sm, false).unwrap();
++        assign_barriers_xbar(&mut f, &sm, false, false).unwrap();
+         assert_eq!(xbar_mask(&f, 1, 0), xbar_bit(&f, 0, 0, true));
+         assert_eq!(xbar_mask(&f, 1, 2), xbar_bit(&f, 1, 1, true));
+     }
+@@ -2013,7 +2142,7 @@ mod tests {
+         let mut legacy = build();
+         assign_barriers(&mut legacy, &sm);
+         let mut f = build();
+-        assign_barriers_xbar(&mut f, &sm, false).unwrap();
++        assign_barriers_xbar(&mut f, &sm, false, false).unwrap();
+         for (a, b) in legacy.blocks[0].instrs.iter().zip(&f.blocks[0].instrs) {
+             assert_eq!(a.deps.wt_bar_mask, b.deps.wt_bar_mask, "{b}");
+             assert_eq!(a.deps.rd_bar(), b.deps.rd_bar(), "{b}");
+@@ -2053,12 +2182,12 @@ mod tests {
+         let sm = xbar_sm();
+ 
+         let mut f = xbar_break_loop();
+-        assign_barriers_xbar(&mut f, &sm, false).unwrap();
++        assign_barriers_xbar(&mut f, &sm, false, false).unwrap();
+         assert_ne!(xbar_mask(&f, 2, 1) & xbar_bit(&f, 2, 0, true), 0);
+         xbar_verify(&f, &sm, &xbar_plans_from_deps(&f)).unwrap();
+ 
+         let mut f = xbar_break_loop();
+-        assign_barriers_xbar(&mut f, &sm, true).unwrap();
++        assign_barriers_xbar(&mut f, &sm, true, false).unwrap();
+         // The BRK doesn't wait for the rcp; r3 = r1 after the loop does.
+         assert_eq!(xbar_mask(&f, 2, 1), 0);
+         assert_eq!(xbar_mask(&f, 3, 0), xbar_bit(&f, 2, 0, true));
+@@ -2092,10 +2221,138 @@ mod tests {
+                 ),
+             ]
+         });
+-        assign_barriers_xbar(&mut f, &sm, true).unwrap();
++        assign_barriers_xbar(&mut f, &sm, true, false).unwrap();
+         assert_eq!(xbar_mask(&f, 2, 1), 0);
+         assert_eq!(xbar_mask(&f, 3, 0), xbar_bit(&f, 2, 0, true));
+         assert_ne!(xbar_mask(&f, 4, 1) & xbar_bit(&f, 4, 0, true), 0);
+         xbar_verify(&f, &sm, &xbar_plans_from_deps(&f)).unwrap();
+     }
++
++    fn xbar_ld(dst: usize, addr: usize, space: MemSpace) -> Instr {
++        Instr::new(OpLd {
++            dst: reg_gpr(dst..dst + 1).into(),
++            addr: reg_gpr(addr..addr + 1).into(),
++            uniform_addr: Src::ZERO,
++            pred: true.into(),
++            offset: 0,
++            stride: OffsetStride::X1,
++            access: MemAccess {
++                mem_type: MemType::B32,
++                space,
++                order: MemOrder::Weak,
++                eviction_priority: MemEvictionPriority::Normal,
++            },
++        })
++    }
++
++    const XBAR_GLOBAL: MemSpace = MemSpace::Global(MemAddrType::A64);
++
++    // n loads from [r0] into r10.., then a use of each, in order
++    fn xbar_load_run(n: usize) -> Function {
++        xbar_function(1, |_| {
++            let mut instrs: Vec<Instr> =
++                (0..n).map(|i| xbar_ld(10 + i, 0, XBAR_GLOBAL)).collect();
++            instrs.extend((0..n).map(|i| xbar_mov(100 + i, 10 + i)));
++            instrs.push(Instr::new(OpExit {}));
++            vec![(instrs, vec![])]
++        })
++    }
++
++    #[test]
++    fn test_xbar_share_load_run() {
++        let sm = xbar_sm();
++
++        // Without share, the seventh load waits for the first
++        let mut f = xbar_load_run(8);
++        assign_barriers_xbar(&mut f, &sm, false, false).unwrap();
++        assert_eq!(xbar_mask(&f, 0, 6), xbar_bit(&f, 0, 0, true));
++
++        let mut f = xbar_load_run(8);
++        assign_barriers_xbar(&mut f, &sm, false, true).unwrap();
++        for ip in 0..8 {
++            assert_eq!(xbar_mask(&f, 0, ip), 0, "{}", f.blocks[0].instrs[ip]);
++        }
++        // The seventh and eighth share the sixth's scoreboard, the one
++        // first waited on latest, and the use of the sixth's result covers
++        // all three.
++        assert_eq!(xbar_bit(&f, 0, 6, true), xbar_bit(&f, 0, 5, true));
++        assert_eq!(xbar_bit(&f, 0, 7, true), xbar_bit(&f, 0, 5, true));
++        assert_eq!(xbar_mask(&f, 0, 13), xbar_bit(&f, 0, 5, true));
++        assert_eq!(xbar_mask(&f, 0, 14), 0);
++        assert_eq!(xbar_mask(&f, 0, 15), 0);
++        xbar_verify(&f, &sm, &xbar_plans_from_deps(&f)).unwrap();
++    }
++
++    #[test]
++    fn test_xbar_share_max() {
++        // Six scoreboards hold 48 loads at most; the 49th waits
++        let sm = xbar_sm();
++        let n = 6 * XBAR_SHARE_MAX + 1;
++        let mut f = xbar_load_run(n);
++        assign_barriers_xbar(&mut f, &sm, false, true).unwrap();
++        for ip in 0..n - 1 {
++            assert_eq!(xbar_mask(&f, 0, ip), 0, "{}", f.blocks[0].instrs[ip]);
++        }
++        assert_ne!(xbar_mask(&f, 0, n - 1), 0);
++        for b in 0..6 {
++            let held = (0..n - 1)
++                .filter(|&ip| f.blocks[0].instrs[ip].deps.wr_bar() == Some(b))
++                .count();
++            assert_eq!(held, XBAR_SHARE_MAX);
++        }
++        xbar_verify(&f, &sm, &xbar_plans_from_deps(&f)).unwrap();
++    }
++
++    #[test]
++    fn test_xbar_share_reads_and_writes_apart() {
++        // r10..r13 = ld [r0..r3]; r0..r3 = r9; r20..r23 = r10..r13
++        let sm = xbar_sm();
++        let build = || {
++            xbar_function(1, |_| {
++                let mut instrs: Vec<Instr> =
++                    (0..4).map(|i| xbar_ld(10 + i, i, XBAR_GLOBAL)).collect();
++                instrs.extend((0..4).map(|i| xbar_mov(i, 9)));
++                instrs.extend((0..4).map(|i| xbar_mov(20 + i, 10 + i)));
++                instrs.push(Instr::new(OpExit {}));
++                vec![(instrs, vec![])]
++            })
++        };
++
++        let mut f = build();
++        assign_barriers_xbar(&mut f, &sm, false, false).unwrap();
++        assert_ne!(xbar_mask(&f, 0, 3), 0);
++
++        let mut f = build();
++        assign_barriers_xbar(&mut f, &sm, false, true).unwrap();
++        assert_eq!(xbar_mask(&f, 0, 3), 0);
++        assert_eq!(xbar_bit(&f, 0, 3, false), xbar_bit(&f, 0, 2, false));
++        assert_eq!(xbar_bit(&f, 0, 3, true), xbar_bit(&f, 0, 2, true));
++        // Overwriting r2 waits for both loads to read their addresses, and
++        // using r12 for both to write; r3 and r13 then need no wait.
++        assert_eq!(xbar_mask(&f, 0, 6), xbar_bit(&f, 0, 2, false));
++        assert_eq!(xbar_mask(&f, 0, 7), 0);
++        assert_eq!(xbar_mask(&f, 0, 10), xbar_bit(&f, 0, 2, true));
++        assert_eq!(xbar_mask(&f, 0, 11), 0);
++        xbar_verify(&f, &sm, &xbar_plans_from_deps(&f)).unwrap();
++    }
++
++    #[test]
++    fn test_xbar_share_keeps_kinds_apart() {
++        // Six global loads in flight, then a shared-memory load and an rcp:
++        // neither may share the global loads' scoreboards.
++        let sm = xbar_sm();
++        let mut f = xbar_function(1, |_| {
++            let mut instrs: Vec<Instr> =
++                (0..6).map(|i| xbar_ld(10 + i, 0, XBAR_GLOBAL)).collect();
++            instrs.push(xbar_ld(16, 0, MemSpace::Shared));
++            instrs.push(xbar_mufu(17, 0));
++            instrs.extend((0..8).map(|i| xbar_mov(20 + i, 10 + i)));
++            instrs.push(Instr::new(OpExit {}));
++            vec![(instrs, vec![])]
++        });
++        assign_barriers_xbar(&mut f, &sm, false, true).unwrap();
++        assert_eq!(xbar_mask(&f, 0, 6), xbar_bit(&f, 0, 0, true));
++        assert_eq!(xbar_mask(&f, 0, 7), xbar_bit(&f, 0, 1, true));
++        xbar_verify(&f, &sm, &xbar_plans_from_deps(&f)).unwrap();
++    }
+ }

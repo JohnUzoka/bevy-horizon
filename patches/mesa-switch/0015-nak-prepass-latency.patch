@@ -1,0 +1,96 @@
+bevy-horizon: let NAK's scheduler before register allocation wait out latencies (NAK_DEBUG=plat)
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 606441c9, after 0001-0014. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+NAK's scheduler before register allocation (opt_instr_sched_prepass.rs, added in Mesa's
+b55b8da0, "nak: Add a prepass instruction scheduler") places each block's instructions from the
+bottom up. When it places one, it works out the earliest cycle at which each instruction feeding
+it may go (the placed one's cycle plus the latency between them) and keeps that in instr_info, a
+copy of the dependence graph's labels, so that the graph can be reused when a block is scheduled
+again under another register target. But the instruction is then queued by
+FutureReadyInstr::new, which reads the cycle from the graph's own labels, and this pass never
+sets them. Every instruction is ready as soon as its uses are placed, the latencies go unused,
+and the ready list's order (the longest path to the block's end, then the original order) walks
+each chain of uses to its start. A texture read lands just above the instruction that uses it.
+In Bevy's mesh preprocessing shader, eight depth reads feeding a tree of mins come out as two
+reads, their min, the next two, and so on, so each pair waits for a round trip of its own.
+The scheduler after register allocation sets the graph's labels itself and is unaffected.
+Mesa's main branch had the same code on 11 October 2026.
+
+With NAK_DEBUG=plat the queued instruction takes its cycle from instr_info. The dependence
+graph, the register targets and the switch to scheduling for register pressure are unchanged;
+only when an instruction may be placed changes, so what each shader computes doesn't. NAK_DEBUG
+flags key NVK's shader cache already, so code compiled with and without the flag is cached
+apart. Without the flag nothing changes.
+
+On a PC through nakhost (findings 36), NAK_DEBUG=stats with the flag reports for Skate 3's
+shaders: the eight preprocessing reads all issued before the first min; NAK's static cycle
+estimate down 11-15% for the world's fragment shaders, 18-22% for the depth pyramid's and 21-22%
+for mesh preprocessing; registers and warps per multiprocessor unchanged, but for the world's
+vertex shader, 24 registers to 32 with its warps unchanged at 64. Whether the estimate holds on
+the console's GPU is the question the flag is there to answer.
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 23c7d16..506a1ef 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -36,6 +36,7 @@ enum DebugFlags {
+     UBra,
+     XBrk,
+     LSink,
++    PLat,
+ }
+ 
+ pub struct Debug {
+@@ -70,6 +71,7 @@ impl Debug {
+                 "ubra" => flags |= 1 << DebugFlags::UBra as u8,
+                 "xbrk" => flags |= 1 << DebugFlags::XBrk as u8,
+                 "lsink" => flags |= 1 << DebugFlags::LSink as u8,
++                "plat" => flags |= 1 << DebugFlags::PLat as u8,
+                 unk => eprintln!("Unknown NAK_DEBUG flag \"{}\"", unk),
+             }
+         }
+@@ -139,6 +141,10 @@ pub trait GetDebugFlags {
+     fn lsink(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::LSink as u8) != 0
+     }
++
++    fn plat(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::PLat as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+diff --git a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+index 0680e3e..02d29bb 100644
+--- a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
++++ b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+@@ -579,8 +579,24 @@ impl<'a> GenerateOrder<'a> {
+                 );
+                 dep_instr.num_uses -= 1;
+                 if dep_instr.num_uses <= 0 {
+-                    future_ready_instrs
+-                        .insert(FutureReadyInstr::new(g, edge.head_idx));
++                    // FutureReadyInstr::new reads the graph's label, which
++                    // this pass never updates (the graph is shared between
++                    // attempts), so the ready cycle above would go unused
++                    // and every instruction would be ready at once.
++                    let future_ready_instr = if DEBUG.plat() {
++                        let label = &g.nodes[edge.head_idx].label;
++                        FutureReadyInstr {
++                            ready_cycle: Reverse(
++                                dep_instr
++                                    .ready_cycle
++                                    .saturating_sub(label.exec_latency),
++                            ),
++                            index: edge.head_idx,
++                        }
++                    } else {
++                        FutureReadyInstr::new(g, edge.head_idx)
++                    };
++                    future_ready_instrs.insert(future_ready_instr);
+                 }
+             }
+ 

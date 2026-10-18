@@ -1,0 +1,296 @@
+bevy-horizon: say on stderr whether the Switch's depth passes use ZCULL
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 606441c9, after 0001-0009 (it reports on 0009's switch). scripts/build_nvk.sh applies it;
+this text before the first "diff --git" line is ignored by git apply.
+
+Nothing showed whether NVK uses ZCULL on the Switch. nouveau_horizon_add_zcull_info drops
+nvhost's ZCULL description without a word if it fails a check; an image has somewhere to save
+ZCULL only with the right usage and layout; and a pass uses ZCULL only if its view is the whole
+image. So if changing ZCULL's direction (0009) changed no timing, a run couldn't tell "ZCULL is
+off" from "ZCULL doesn't help". These lines on stderr, which bevy-horizon's log keeps, tell:
+  - nvhost's description, accepted or rejected, with its values (for the first two devices);
+  - for each depth image, the first pass with ZCULL that loads it, the first that clears it and
+    the first of another kind, with the direction and the bytes saved; and the first pass
+    without ZCULL, with the reason, in the order nvk_CmdBeginRendering tests them;
+  - each change of direction from one pass with ZCULL to the next;
+  - the first 8 loads of ZCULL saved with the other direction that 0009 clears instead.
+At most 48 lines besides those 8, so a run's log stays short; a pass pays an atomic read or two.
+
+diff --git a/src/nouveau/horizon/nouveau_horizon_device.c b/src/nouveau/horizon/nouveau_horizon_device.c
+index e319d18..27d677a 100644
+--- a/src/nouveau/horizon/nouveau_horizon_device.c
++++ b/src/nouveau/horizon/nouveau_horizon_device.c
+@@ -12,6 +12,7 @@
+ 
+ #include <assert.h>
+ #include <inttypes.h>
++#include <stdio.h>
+ #include <string.h>
+ 
+ #define NOUVEAU_HORIZON_CLS_ENG3D 0xb197
+@@ -61,6 +62,43 @@ nouveau_horizon_get_gm20b_info(struct nv_device_info *info_out)
+    info_out->nc_atom_size_B = 128;
+ }
+ 
++/* bevy-horizon (patches/mesa-switch/0010): nothing else shows whether
++ * nvhost's ZCULL description passed the checks below, so stderr, which the
++ * game's log keeps, says so for the first two devices.
++ */
++static void
++nouveau_horizon_report_zcull_info(const nvioctl_zcull_info *zcull,
++                                  uint32_t ctxsw_size, bool accepted)
++{
++   static uint32_t reports;
++   if (p_atomic_inc_return(&reports) > 2)
++      return;
++
++   if (zcull == NULL) {
++      fprintf(stderr, "[NVK] ZCULL: nvhost gave no description, so no "
++              "render pass uses ZCULL\n");
++      return;
++   }
++   fprintf(stderr, "[NVK] ZCULL: nvhost's description was %s: "
++           "width_align_pixels %u, height_align_pixels %u, "
++           "pixel_squares_by_aliquots %u, aliquot_total %u, "
++           "region_byte_multiplier %u, region_header_size %u, "
++           "subregion_header_size %u, subregion_width_align_pixels %u, "
++           "subregion_height_align_pixels %u, subregion_count %u, "
++           "context size %u\n",
++           accepted ? "accepted" : "rejected, so no render pass uses ZCULL",
++           (unsigned)zcull->width_align_pixels,
++           (unsigned)zcull->height_align_pixels,
++           (unsigned)zcull->pixel_squares_by_aliquots,
++           (unsigned)zcull->aliquot_total,
++           (unsigned)zcull->region_byte_multiplier,
++           (unsigned)zcull->region_header_size,
++           (unsigned)zcull->subregion_header_size,
++           (unsigned)zcull->subregion_width_align_pixels,
++           (unsigned)zcull->subregion_height_align_pixels,
++           (unsigned)zcull->subregion_count, (unsigned)ctxsw_size);
++}
++
+ void
+ nouveau_horizon_add_zcull_info(struct nv_device_info *info_out)
+ {
+@@ -88,14 +126,18 @@ nouveau_horizon_add_zcull_info(struct nv_device_info *info_out)
+        zcull->subregion_height_align_pixels > UINT16_MAX ||
+        zcull->region_byte_multiplier == 0 ||
+        (zcull->region_byte_multiplier & 3) != 0 ||
+-       ((zcull->region_header_size | zcull->subregion_header_size) & 3) != 0)
++       ((zcull->region_header_size | zcull->subregion_header_size) & 3) != 0) {
++      nouveau_horizon_report_zcull_info(zcull, ctxsw_size, false);
+       return;
++   }
+ 
+    const uint64_t max_size_B =
+       (uint64_t)zcull->aliquot_total * zcull->region_byte_multiplier +
+       zcull->region_header_size + zcull->subregion_header_size;
+-   if (max_size_B > UINT32_MAX)
++   if (max_size_B > UINT32_MAX) {
++      nouveau_horizon_report_zcull_info(zcull, ctxsw_size, false);
+       return;
++   }
+ 
+    info_out->zcull_info = (struct nv_zcull_device_info) {
+       .width_align_pixels = zcull->width_align_pixels,
+@@ -115,6 +157,7 @@ nouveau_horizon_add_zcull_info(struct nv_device_info *info_out)
+       .ctxsw_align = 0x1000,
+    };
+    info_out->has_zcull_info = true;
++   nouveau_horizon_report_zcull_info(zcull, ctxsw_size, true);
+ }
+ 
+ static uint32_t
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 528a46f..d7fbec7 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -40,6 +40,8 @@
+ #include "drf.h"
+ 
+ #ifdef HAVE_SWITCH_PLATFORM
++#include <stdio.h>
++
+ #include "util/u_atomic.h"
+ 
+ /* bevy-horizon's measurement switches (patches/mesa-switch/0008): settings a
+@@ -1274,6 +1276,143 @@ nvk_get_zcull_image(const struct nvk_rendering_state *render)
+    return (struct nvk_image *)iview->vk.image;
+ }
+ 
++#ifdef HAVE_SWITCH_PLATFORM
++/* bevy-horizon (patches/mesa-switch/0010): nothing else shows whether a
++ * depth pass uses ZCULL, so stderr, which the game's log keeps, says so a
++ * few times a run.  For each depth image: the first pass with ZCULL that
++ * loads it, the first that clears it and the first of another kind, and
++ * the first pass without ZCULL and why.  Then each change of direction:
++ * 48 lines in all.  And the first 8 loads a change turns into clears.
++ */
++static int32_t nvk_switch_zcull_lines = 48;
++static int32_t nvk_switch_zcull_guard_lines = 8;
++static uint32_t nvk_switch_zcull_dir_seen = UINT32_MAX;
++
++static const char *
++nvk_switch_zdir_name(uint32_t zdir)
++{
++   return zdir == NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_GREATER ?
++          "GREATER" : "LESS";
++}
++
++static const char *
++nvk_switch_load_op_name(VkAttachmentLoadOp load_op)
++{
++   switch (load_op) {
++   case VK_ATTACHMENT_LOAD_OP_LOAD:
++      return "loads";
++   case VK_ATTACHMENT_LOAD_OP_CLEAR:
++      return "clears";
++   case VK_ATTACHMENT_LOAD_OP_DONT_CARE:
++      return "discards";
++   default:
++      return "ignores";
++   }
++}
++
++/* True for the caller that sets bit in *bits. */
++static bool
++nvk_switch_zcull_first(uint32_t *bits, uint32_t bit)
++{
++   uint32_t old = p_atomic_read(bits);
++   while (!(old & bit)) {
++      const uint32_t seen = p_atomic_cmpxchg(bits, old, old | bit);
++      if (seen == old)
++         return true;
++      old = seen;
++   }
++   return false;
++}
++
++static void
++nvk_switch_zcull_report(const struct nvk_physical_device *pdev,
++                        const struct nvk_rendering_state *render,
++                        const struct nvk_image *zcull_image,
++                        bool use_zcull, uint32_t zdir,
++                        VkAttachmentLoadOp load_op)
++{
++   struct nvk_image *image =
++      (struct nvk_image *)render->depth_att.iview->vk.image;
++   const struct nvk_zcull_plane *plane = &image->zcull;
++
++   if (use_zcull && p_atomic_read(&nvk_switch_zcull_dir_seen) != zdir) {
++      const uint32_t prev = p_atomic_xchg(&nvk_switch_zcull_dir_seen, zdir);
++      if (prev != UINT32_MAX && prev != zdir &&
++          p_atomic_dec_return(&nvk_switch_zcull_lines) >= 0)
++         fprintf(stderr, "[NVK] ZCULL: passes now use %s, not %s\n",
++                 nvk_switch_zdir_name(zdir), nvk_switch_zdir_name(prev));
++   }
++
++   const uint32_t kind = !use_zcull ? 1u << 3 :
++      load_op == VK_ATTACHMENT_LOAD_OP_LOAD ? 1u << 0 :
++      load_op == VK_ATTACHMENT_LOAD_OP_CLEAR ? 1u << 1 : 1u << 2;
++   if (!nvk_switch_zcull_first(&image->zcull.reported, kind) ||
++       p_atomic_dec_return(&nvk_switch_zcull_lines) < 0)
++      return;
++
++   if (use_zcull && plane->addr != 0) {
++      fprintf(stderr, "[NVK] ZCULL on, %s: a %ux%u pass %s a %ux%u depth "
++              "image, whose saved ZCULL is %u bytes\n",
++              nvk_switch_zdir_name(zdir),
++              render->area.extent.width, render->area.extent.height,
++              nvk_switch_load_op_name(load_op),
++              image->vk.extent.width, image->vk.extent.height,
++              plane->nil.size_B);
++   } else if (use_zcull) {
++      fprintf(stderr, "[NVK] ZCULL on, %s: a %ux%u pass %s a %ux%u depth "
++              "image, which has nowhere to save ZCULL, so it lasts the "
++              "pass\n",
++              nvk_switch_zdir_name(zdir),
++              render->area.extent.width, render->area.extent.height,
++              nvk_switch_load_op_name(load_op),
++              image->vk.extent.width, image->vk.extent.height);
++   } else {
++      /* In the order nvk_CmdBeginRendering tests them. */
++      const char *why =
++         !pdev->info.has_zcull_info ?
++            "nvhost's ZCULL description was rejected" :
++         zcull_image == NULL ?
++            "the view isn't the whole image (layered, multiview, linear, "
++            "or not level 0 and layer 0)" :
++         plane->addr == 0 && !plane->transient_eligible ?
++            "the image has nowhere to save ZCULL and can't use it within "
++            "a pass" :
++         plane->addr == 0 && load_op != VK_ATTACHMENT_LOAD_OP_CLEAR ?
++            "the image has nowhere to save ZCULL and the pass doesn't "
++            "clear it" :
++         nvk_switch_tune(NVK_SWITCH_TUNE_ZCULL) == 0 ?
++            "the zcull switch is 0" : "no reason found";
++      fprintf(stderr, "[NVK] ZCULL off: a %ux%u pass %s a %ux%u depth "
++              "image (%u levels, %u layers, usage 0x%x, saved ZCULL %u "
++              "bytes%s): %s\n",
++              render->area.extent.width, render->area.extent.height,
++              nvk_switch_load_op_name(load_op),
++              image->vk.extent.width, image->vk.extent.height,
++              image->vk.mip_levels, image->vk.array_layers,
++              (unsigned)image->vk.usage, plane->nil.size_B,
++              plane->nil.size_B > 0 && plane->addr == 0 ? ", unbound" : "",
++              why);
++   }
++}
++
++/* A load of ZCULL saved with the other direction, cleared instead. */
++static void
++nvk_switch_zcull_report_guard(const struct nvk_rendering_state *render,
++                              uint32_t zdir, float depth)
++{
++   if (p_atomic_dec_return(&nvk_switch_zcull_guard_lines) < 0)
++      return;
++   fprintf(stderr, "[NVK] ZCULL: a %ux%u pass would load ZCULL saved with "
++           "%s; it uses %s, so it clears it to %.1f instead\n",
++           render->area.extent.width, render->area.extent.height,
++           nvk_switch_zdir_name(
++              zdir == NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_GREATER ?
++              NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_LESS :
++              NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_GREATER),
++           nvk_switch_zdir_name(zdir), depth);
++}
++#endif
++
+ static uint32_t
+ nvk_vk_format_to_zcull_format(VkFormat format) {
+    switch (format) {
+@@ -1637,6 +1776,11 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+    const uint32_t zdir = NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_LESS;
+ #endif
+    render->zcull_enabled = use_zcull;
++#ifdef HAVE_SWITCH_PLATFORM
++   if (render->depth_att.iview != NULL)
++      nvk_switch_zcull_report(pdev, render, zcull_image, use_zcull, zdir,
++                              pRenderingInfo->pDepthAttachment->loadOp);
++#endif
+ 
+    if (use_zcull) {
+       uint32_t start_count = nv_push_dw_count(p);
+@@ -1842,6 +1986,7 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+             load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+             depth = zdir == NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_GREATER ?
+                     0.0f : 1.0f;
++            nvk_switch_zcull_report_guard(render, zdir, depth);
+          }
+          if (load_op != VK_ATTACHMENT_LOAD_OP_LOAD)
+             p_atomic_set(&zcull_plane->zdir, zdir);
+diff --git a/src/nouveau/vulkan/nvk_image.h b/src/nouveau/vulkan/nvk_image.h
+index c00eb33..f546e97 100644
+--- a/src/nouveau/vulkan/nvk_image.h
++++ b/src/nouveau/vulkan/nvk_image.h
+@@ -100,6 +100,10 @@ struct nvk_zcull_plane {
+     * read and written with p_atomic_*.
+     */
+    uint32_t zdir;
++   /* The kinds of pass on this image the Switch's ZCULL report has printed
++    * (patches/mesa-switch/0010), one bit each; p_atomic_* too.
++    */
++   uint32_t reported;
+ };
+ 
+ struct nvk_image {

@@ -58,7 +58,9 @@
 
 #[cfg_attr(all(unix, not(target_os = "horizon")), path = "unix.rs")]
 #[cfg_attr(windows, path = "windows.rs")]
-#[cfg_attr(not(any(all(unix, not(target_os = "horizon")), windows)), path = "stub.rs")]
+// bevy-horizon: heap-backed maps (see horizon.rs) instead of memmap2's stub, which fails them all.
+#[cfg_attr(target_os = "horizon", path = "horizon.rs")]
+#[cfg_attr(not(any(unix, windows)), path = "stub.rs")]
 mod os;
 use crate::os::{file_len, MmapInner};
 

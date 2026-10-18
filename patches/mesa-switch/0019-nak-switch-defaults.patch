@@ -1,0 +1,199 @@
+bevy-horizon: turn on NAK_DEBUG's measured flags by default in Switch builds
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 606441c9, after 0001-0018. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+This series' NAK_DEBUG flags xbar, sink, remat, xbrk, lsink and plat (patches 0004, 0005, 0007,
+0011 and 0015) change how NAK compiles for Maxwell and older GPUs, and each made Skate 3's
+frames faster on a Switch Lite (findings 21, 22, 30, 33 and 38). Switch builds
+now start with all six on, and "-name" in NAK_DEBUG turns one off, so NAK_DEBUG=-plat,-lsink
+turns off two. ubra (patch 0006) stays off, since it was never measured. Other builds start
+with none on, as upstream does, and NAK_DEBUG works there as before, except that "-name" turns
+a flag off instead of being reported as unknown, and empty items are skipped.
+
+meson sets the Rust cfg nak_switch_defaults for horizon builds: NAK is compiled for
+aarch64-unknown-linux-gnu on the Switch too, so target_os can't tell the builds apart. NAK reads
+NAK_DEBUG once, when NVK creates its compiler, and a Switch build then prints the flags in
+effect on stderr. The flags key NVK's shader cache (nak_debug_flags, in nvk_shader.c), so
+shaders compiled before and after this change are cached apart.
+
+Two tests in api.rs check the flag table against DebugFlags and how "name" and "-name" apply.
+On a PC, with patch 0016, they pass, as do NAK's other 16 tests that meson runs.
+
+diff --git a/src/nouveau/compiler/meson.build b/src/nouveau/compiler/meson.build
+index 8d81232..6269aad 100644
+--- a/src/nouveau/compiler/meson.build
++++ b/src/nouveau/compiler/meson.build
+@@ -92,16 +92,22 @@ _libnak_ir_proc_rs = rust.proc_macro(
+   rust_args : rust_global_args,
+ )
+ 
++_libnak_rs_args = [
++  nouveau_rust_args,
++  # Otherwise, rustc trips up on -pthread
++  '-Clink-arg=-Wno-unused-command-line-argument',
++]
++# bevy-horizon: Switch builds turn some NAK_DEBUG flags on by default (api.rs)
++if host_machine.system() == 'horizon'
++  _libnak_rs_args += '--cfg=nak_switch_defaults'
++endif
++
+ _libnak_rs = static_library(
+   'nak_rs',
+   files('nak/lib.rs'),
+   gnu_symbol_visibility : 'hidden',
+   rust_abi : 'c',
+-  rust_args : [
+-    nouveau_rust_args,
+-    # Otherwise, rustc trips up on -pthread
+-    '-Clink-arg=-Wno-unused-command-line-argument',
+-  ],
++  rust_args : _libnak_rs_args,
+   dependencies : [
+     dep_paste,
+     dep_rustc_hash,
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 506a1ef..e8bf761 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -20,6 +20,7 @@ use std::panic;
+ use std::sync::OnceLock;
+ 
+ #[repr(u8)]
++#[derive(Clone, Copy)]
+ enum DebugFlags {
+     Panic,
+     Print,
+@@ -39,42 +40,76 @@ enum DebugFlags {
+     PLat,
+ }
+ 
++const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 16] = [
++    ("panic", DebugFlags::Panic),
++    ("print", DebugFlags::Print),
++    ("serial", DebugFlags::Serial),
++    ("spill", DebugFlags::Spill),
++    ("annotate", DebugFlags::Annotate),
++    ("nougpr", DebugFlags::NoUgpr),
++    ("cycles", DebugFlags::Cycles),
++    ("stats", DebugFlags::Stats),
++    ("xbar", DebugFlags::XBar),
++    ("final", DebugFlags::Final),
++    ("sink", DebugFlags::Sink),
++    ("remat", DebugFlags::Remat),
++    ("ubra", DebugFlags::UBra),
++    ("xbrk", DebugFlags::XBrk),
++    ("lsink", DebugFlags::LSink),
++    ("plat", DebugFlags::PLat),
++];
++
++/// The flags NAK_DEBUG starts from. Switch builds (meson sets
++/// nak_switch_defaults for horizon) start from the ones measured faster on the
++/// console; other builds start from none.
++#[cfg(nak_switch_defaults)]
++const DEFAULT_DEBUG_FLAGS: &str = "xbar,sink,remat,xbrk,lsink,plat";
++#[cfg(not(nak_switch_defaults))]
++const DEFAULT_DEBUG_FLAGS: &str = "";
++
+ pub struct Debug {
+     flags: u32,
+ }
+ 
+ impl Debug {
+-    fn new() -> Debug {
+-        let debug_var = "NAK_DEBUG";
+-        let debug_str = match env::var(debug_var) {
+-            Ok(s) => s,
+-            Err(_) => {
+-                return Debug { flags: 0 };
++    /// Applies a comma-separated list of flag names to `flags`: "name" turns
++    /// a flag on and "-name" turns it off.
++    fn apply(mut flags: u32, list: &str) -> u32 {
++        for item in list.split(',') {
++            let item = item.trim();
++            if item.is_empty() {
++                continue;
+             }
+-        };
+-
+-        let mut flags = 0;
+-        for flag in debug_str.split(',') {
+-            match flag.trim() {
+-                "panic" => flags |= 1 << DebugFlags::Panic as u8,
+-                "print" => flags |= 1 << DebugFlags::Print as u8,
+-                "serial" => flags |= 1 << DebugFlags::Serial as u8,
+-                "spill" => flags |= 1 << DebugFlags::Spill as u8,
+-                "annotate" => flags |= 1 << DebugFlags::Annotate as u8,
+-                "nougpr" => flags |= 1 << DebugFlags::NoUgpr as u8,
+-                "cycles" => flags |= 1 << DebugFlags::Cycles as u8,
+-                "stats" => flags |= 1 << DebugFlags::Stats as u8,
+-                "xbar" => flags |= 1 << DebugFlags::XBar as u8,
+-                "final" => flags |= 1 << DebugFlags::Final as u8,
+-                "sink" => flags |= 1 << DebugFlags::Sink as u8,
+-                "remat" => flags |= 1 << DebugFlags::Remat as u8,
+-                "ubra" => flags |= 1 << DebugFlags::UBra as u8,
+-                "xbrk" => flags |= 1 << DebugFlags::XBrk as u8,
+-                "lsink" => flags |= 1 << DebugFlags::LSink as u8,
+-                "plat" => flags |= 1 << DebugFlags::PLat as u8,
+-                unk => eprintln!("Unknown NAK_DEBUG flag \"{}\"", unk),
++            let (off, name) = match item.strip_prefix('-') {
++                Some(name) => (true, name),
++                None => (false, item),
++            };
++            match DEBUG_FLAG_NAMES.iter().find(|(n, _)| *n == name) {
++                Some(&(_, flag)) if off => flags &= !(1 << flag as u8),
++                Some(&(_, flag)) => flags |= 1 << flag as u8,
++                None => eprintln!("Unknown NAK_DEBUG flag \"{}\"", item),
+             }
+         }
++        flags
++    }
++
++    fn new() -> Debug {
++        let mut flags = Debug::apply(0, DEFAULT_DEBUG_FLAGS);
++        if let Ok(debug_str) = env::var("NAK_DEBUG") {
++            flags = Debug::apply(flags, &debug_str);
++        }
++        if !DEFAULT_DEBUG_FLAGS.is_empty() {
++            let on: Vec<&str> = DEBUG_FLAG_NAMES
++                .iter()
++                .filter(|(_, flag)| flags & (1 << *flag as u8) != 0)
++                .map(|(name, _)| *name)
++                .collect();
++            eprintln!(
++                "NAK_DEBUG in effect: {} (Switch defaults {}; \"-name\" turns one off)",
++                if on.is_empty() { "none".to_string() } else { on.join(",") },
++                DEFAULT_DEBUG_FLAGS,
++            );
++        }
+         Debug { flags: flags }
+     }
+ }
+@@ -785,3 +820,26 @@ pub extern "C" fn nak_compile_shader(
+         panic::catch_unwind(compile).unwrap_or(std::ptr::null_mut())
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn debug_flag_names_in_enum_order() {
++        for (i, (_, flag)) in DEBUG_FLAG_NAMES.iter().enumerate() {
++            assert_eq!(*flag as usize, i);
++        }
++    }
++
++    #[test]
++    fn debug_flags_on_and_off() {
++        let xbar = 1 << DebugFlags::XBar as u8;
++        let plat = 1 << DebugFlags::PLat as u8;
++        assert_eq!(Debug::apply(0, ""), 0);
++        assert_eq!(Debug::apply(0, " xbar, plat,"), xbar | plat);
++        assert_eq!(Debug::apply(xbar | plat, "-plat"), xbar);
++        assert_eq!(Debug::apply(xbar, "-plat,,stats,-stats"), xbar);
++        assert_eq!(Debug::apply(0, "-xbar,nonsense"), 0);
++    }
++}

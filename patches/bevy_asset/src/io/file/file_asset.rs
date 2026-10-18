@@ -3,18 +3,18 @@ use crate::io::{
     Reader, ReaderNotSeekableError, SeekableReader, Writer,
 };
 use async_fs::{read_dir, File};
-#[cfg(not(any(target_os = "windows", target_os = "horizon")))]
+#[cfg(not(target_os = "windows"))]
 use async_io::Timer;
-#[cfg(not(any(target_os = "windows", target_os = "horizon")))]
+#[cfg(not(target_os = "windows"))]
 use async_lock::{Semaphore, SemaphoreGuard};
 use futures_lite::StreamExt;
 
 use alloc::{borrow::ToOwned, boxed::Box};
-#[cfg(any(target_os = "windows", target_os = "horizon"))]
+#[cfg(target_os = "windows")]
 use core::marker::PhantomData;
-#[cfg(not(any(target_os = "windows", target_os = "horizon")))]
+#[cfg(not(target_os = "windows"))]
 use core::time::Duration;
-#[cfg(not(any(target_os = "windows", target_os = "horizon")))]
+#[cfg(not(target_os = "windows"))]
 use futures_util::{future, pin_mut};
 use std::path::Path;
 
@@ -31,10 +31,10 @@ impl Reader for File {
 // linux & android: 1024
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 static OPEN_FILE_LIMITER: Semaphore = Semaphore::new(128);
-#[cfg(not(any(target_os = "macos", target_os = "ios", any(target_os = "windows", target_os = "horizon"))))]
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
 static OPEN_FILE_LIMITER: Semaphore = Semaphore::new(512);
 
-#[cfg(not(any(target_os = "windows", target_os = "horizon")))]
+#[cfg(not(target_os = "windows"))]
 async fn maybe_get_semaphore<'a>() -> Option<SemaphoreGuard<'a>> {
     let guard_future = OPEN_FILE_LIMITER.acquire();
     let timeout_future = Timer::after(Duration::from_millis(500));
@@ -49,9 +49,9 @@ async fn maybe_get_semaphore<'a>() -> Option<SemaphoreGuard<'a>> {
 
 struct GuardedFile<'a> {
     file: File,
-    #[cfg(not(any(target_os = "windows", target_os = "horizon")))]
+    #[cfg(not(target_os = "windows"))]
     _guard: Option<SemaphoreGuard<'a>>,
-    #[cfg(any(target_os = "windows", target_os = "horizon"))]
+    #[cfg(target_os = "windows")]
     _lifetime: PhantomData<&'a ()>,
 }
 
@@ -73,7 +73,7 @@ impl<'a> Reader for GuardedFile<'a> {
 
 impl AssetReader for FileAssetReader {
     async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
-        #[cfg(not(any(target_os = "windows", target_os = "horizon")))]
+        #[cfg(not(target_os = "windows"))]
         let _guard = maybe_get_semaphore().await;
 
         let full_path = self.root_path.join(path);
@@ -88,15 +88,15 @@ impl AssetReader for FileAssetReader {
             })
             .map(|file| GuardedFile {
                 file,
-                #[cfg(not(any(target_os = "windows", target_os = "horizon")))]
+                #[cfg(not(target_os = "windows"))]
                 _guard,
-                #[cfg(any(target_os = "windows", target_os = "horizon"))]
+                #[cfg(target_os = "windows")]
                 _lifetime: PhantomData,
             })
     }
 
     async fn read_meta<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
-        #[cfg(not(any(target_os = "windows", target_os = "horizon")))]
+        #[cfg(not(target_os = "windows"))]
         let _guard = maybe_get_semaphore().await;
 
         let meta_path = get_meta_path(path);
@@ -112,9 +112,9 @@ impl AssetReader for FileAssetReader {
             })
             .map(|file| GuardedFile {
                 file,
-                #[cfg(not(any(target_os = "windows", target_os = "horizon")))]
+                #[cfg(not(target_os = "windows"))]
                 _guard,
-                #[cfg(any(target_os = "windows", target_os = "horizon"))]
+                #[cfg(target_os = "windows")]
                 _lifetime: PhantomData,
             })
     }

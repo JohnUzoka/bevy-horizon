@@ -1,0 +1,33 @@
+# The [patch] table for a game on Bevy 0.18 (wgpu 27). Cargo reads it only when asked:
+# scripts/build_game.sh passes `--config .cargo/config.toml --config .cargo/bevy-0.18.toml`, so the
+# game's own Cargo.toml needs no Switch patches and its desktop builds don't change.
+# Paths are relative to this repository: cargo resolves a config file's paths from the parent of
+# the directory holding it (doc.rust-lang.org/cargo/reference/config.html#config-relative-paths).
+# What each patch does: the comments in Cargo.toml, whose table is the Bevy 0.19 one.
+#
+# A patch replaces only crates.io versions it's semver-compatible with, so a game's Cargo.lock has to
+# lock the patch's version; build_game.sh runs `cargo update --precise` for the ones that differ
+# (libc 0.2.189 -> 0.2.190 in Skate's lock, for example) and checks the result.
+
+[patch.crates-io]
+bevy_asset = { path = "patches/bevy-0.18/bevy_asset" }
+bevy_tasks = { path = "patches/bevy-0.18/bevy_tasks" }
+# Bevy 0.18's bevy_audio plays through rodio 0.20.1 and cpal 0.15.3, which the 0.17.3 patch in
+# Cargo.toml's table (Bevy 0.19's) can't replace. This is cpal 0.15.3 with the same Horizon host on
+# libnx's audio renderer (docs/input-and-audio.md); its build.rs links libnx.
+cpal = { path = "patches/bevy-0.18/cpal" }
+wgpu = { path = "patches/bevy-0.18/wgpu" }
+wgpu-core = { path = "patches/bevy-0.18/wgpu-core" }
+wgpu-core-deps-windows-linux-android = { path = "patches/bevy-0.18/wgpu-core-deps-windows-linux-android" }
+wgpu-hal = { path = "patches/bevy-0.18/wgpu-hal" }
+# Not tied to a Bevy version. Cargo.toml's table has more (getrandom 0.2, polling, ring, rustix)
+# that Skate doesn't build for the Switch; a game that does adds them to a copy of this file.
+# `cargo tree --target` (docs/porting-a-bevy-game.md) shows which crates a game builds.
+getrandom = { path = "patches/getrandom" }
+# Bevy's automatic reflect registration (`reflect_auto_register`, part of its default features)
+# collects types with inventory, which had no Horizon constructor section. glTF scenes need it:
+# Bevy 0.18 spawns them by reflection and no longer registers its own components by hand.
+inventory = { path = "patches/inventory" }
+lua-src = { path = "patches/lua-src" }
+memmap2 = { path = "patches/memmap2" }
+raw-window-handle = { path = "patches/raw-window-handle" }

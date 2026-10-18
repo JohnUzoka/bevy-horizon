@@ -1,0 +1,97 @@
+bevy-horizon: keep a one-warp workgroup's barriers, for emulators (NAK_DEBUG=wgbar)
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 606441c9, after 0001-0021. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+When a compute shader's workgroup is one warp (32 threads or fewer), NAK turns its workgroup
+barriers into subgroup ones and then drops their execution part, because it keeps the warp
+converged and a warp's threads run together. So no BAR.SYNC is emitted, only the memory barrier
+if there is one. On the GPU that is right.
+
+Ryujinx translates the Maxwell shader for the host, where a guest warp becomes a workgroup of
+32 host invocations. On llvmpipe (lavapipe), whose subgroups are 8 wide, those run as four
+subgroups of 8 that wait for each other only at a host barrier. With none, the first 8 threads
+run the shader to its end before the next 8 start, and whatever the threads hand each other
+through workgroup memory comes out wrong.
+
+With NAK_DEBUG=wgbar, NAK keeps such a barrier's execution scope, so it emits BAR.SYNC as it
+does for a workgroup of more than one warp, and Ryujinx emits a host barrier for it. It is off
+by default, in Switch builds too, and is only for running in Ryujinx.
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 9f524e1..9e250da 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -39,9 +39,10 @@ enum DebugFlags {
+     LSink,
+     PLat,
+     OFold,
++    WgBar,
+ }
+ 
+-const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 17] = [
++const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 18] = [
+     ("panic", DebugFlags::Panic),
+     ("print", DebugFlags::Print),
+     ("serial", DebugFlags::Serial),
+@@ -59,6 +60,7 @@ const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 17] = [
+     ("lsink", DebugFlags::LSink),
+     ("plat", DebugFlags::PLat),
+     ("ofold", DebugFlags::OFold),
++    ("wgbar", DebugFlags::WgBar),
+ ];
+ 
+ /// The flags NAK_DEBUG starts from. Switch builds (meson sets
+@@ -187,6 +189,10 @@ pub trait GetDebugFlags {
+     fn ofold(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::OFold as u8) != 0
+     }
++
++    fn wgbar(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::WgBar as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+@@ -274,6 +280,11 @@ pub extern "C" fn nak_debug_ofold() -> bool {
+     DEBUG.ofold()
+ }
+ 
++#[no_mangle]
++pub extern "C" fn nak_debug_wgbar() -> bool {
++    DEBUG.wgbar()
++}
++
+ fn nir_options(dev: &nv_device_info) -> nir_shader_compiler_options {
+     nir_shader_compiler_options {
+         lower_fdiv: true,
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+index befcad3..74fb8c0 100644
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -855,8 +855,11 @@ nak_nir_remove_barrier_intrin(nir_builder *b, nir_intrinsic_instr *barrier,
+    assert(exec_scope <= SCOPE_WORKGROUP &&
+           "Control barrier with scope > WORKGROUP");
+ 
++   /* NAK_DEBUG=wgbar keeps the barrier of a one-warp workgroup, for emulators
++    * that run a warp's threads as more than one host subgroup.
++    */
+    if (exec_scope == SCOPE_WORKGROUP &&
+-       nak_nir_workgroup_has_one_subgroup(b->shader))
++       nak_nir_workgroup_has_one_subgroup(b->shader) && !nak_debug_wgbar())
+       exec_scope = SCOPE_SUBGROUP;
+ 
+    /* Because we're guaranteeing maximal convergence via warp barriers,
+diff --git a/src/nouveau/compiler/nak_private.h b/src/nouveau/compiler/nak_private.h
+index 7d3b199..a915a98 100644
+--- a/src/nouveau/compiler/nak_private.h
++++ b/src/nouveau/compiler/nak_private.h
+@@ -20,6 +20,7 @@ bool nak_debug_sink(void);
+ bool nak_debug_remat(void);
+ bool nak_debug_lsink(void);
+ bool nak_debug_ofold(void);
++bool nak_debug_wgbar(void);
+ 
+ struct nak_compiler {
+    uint8_t sm;

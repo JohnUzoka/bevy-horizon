@@ -1,0 +1,61 @@
+[package]
+name = "switch_captest"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Capability test for Bevy games on Nintendo Switch: platform, Bevy runtime, input, audio, GPU"
+publish = false
+
+[features]
+default = ["native", "gpu"]
+# Crates IW4L and Skate use that build native code or need platform support. Each one can be
+# turned off on its own if it doesn't build (docs/testing.md lists which ones did).
+native = ["zstd", "flate2", "zip", "lua", "ring", "tokio", "symphonia", "bcdec", "image"]
+zstd = ["dep:zstd"]
+flate2 = ["dep:flate2"]
+zip = ["dep:zip"]
+lua = ["dep:mlua"]
+ring = ["dep:ring"]
+tokio = ["dep:tokio"]
+symphonia = ["dep:symphonia"]
+bcdec = ["dep:bcdec_rs"]
+image = ["dep:image"]
+# IW4L's networking stack: QUIC (quinn) over tokio's UDP, with rustls and ring.
+quinn = ["tokio", "dep:quinn", "dep:rustls", "tokio/net"]
+# EGL + OpenGL ES through devkitPro's Mesa (nouveau), the stack a wgpu GL backend would sit on.
+gpu = []
+
+[dependencies]
+bevy = { version = "0.19", default-features = false, features = [
+    "std",
+    "async_executor",
+    "multi_threaded",
+    "bevy_asset",
+    "bevy_log",
+    "gamepad",
+    "bevy_audio",
+    "wav",
+    "bevy_image",
+    "png",
+] }
+bevy_horizon = { path = "../../crates/bevy_horizon" }
+# Only for the AppLifecycle and WindowFocused messages bevy_horizon sends; bevy's own bevy_window
+# feature stays off, so DefaultPlugins keeps its ScheduleRunnerPlugin and opens no window.
+bevy_window = { version = "0.19", default-features = false }
+cpal = "0.17"
+getrandom = "0.4"
+libc = "0.2"
+memmap2 = "0.9"
+
+# The versions IW4L and Skate lock.
+zstd = { version = "=0.13.3", optional = true }
+flate2 = { version = "1.1", optional = true, default-features = false, features = ["zlib-rs"] }
+zip = { version = "6", optional = true, default-features = false, features = ["deflate"] }
+mlua = { version = "=0.12.1", optional = true, features = ["lua54", "vendored", "send"] }
+ring = { version = "0.17.14", optional = true }
+tokio = { version = "1.47", optional = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+symphonia = { version = "0.5", optional = true, default-features = false, features = ["mp3", "pcm", "wav", "adpcm"] }
+bcdec_rs = { version = "0.2", optional = true }
+image = { version = "=0.25.10", optional = true, default-features = false, features = ["png", "jpeg"] }
+quinn = { version = "0.11.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23.31", optional = true, default-features = false, features = ["ring", "std"] }

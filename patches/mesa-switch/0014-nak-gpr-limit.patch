@@ -1,0 +1,284 @@
+bevy-horizon: let NAK cap a shader's registers, by its entry point's name or NAK_GPR_LIMIT
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 606441c9, after 0001-0013. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+How many warps a Maxwell multiprocessor keeps in flight depends on how many registers each
+thread uses. The Skate 3 world's fragment shader uses 56, which NAK_DEBUG=stats reports as room
+for 36 warps; capped at 48 it reports 40, and register allocation spills what doesn't fit.
+Whether the extra warps are worth the spills is a question for the console's GPU.
+
+NAK_GPR_LIMIT=n caps every shader at n registers, a multiple of 8 from 24 to 248, and keys
+NVK's shader cache with it. A shader whose entry point's name ends in "_gpr" and such a number,
+such as "fragment_gpr48", is compiled under that cap, so one run of an application can compare
+a shader with and without it: the entry point's name is part of the pipeline's hash, so the two
+are cached apart. With both, the lower cap applies. NAK_DEBUG=stats lines end with the cap
+applied ("cap=", 0 for none). With neither, nothing changes.
+
+The cap reaches register allocation and the scheduler that runs before it with the shader model
+(ShaderModelInfo), which each compile makes for itself, so shaders compiled at once on several
+threads keep their own. That also keeps NAK's own code free of thread-locals. On the Switch NAK
+is built for aarch64 Linux, whose thread-locals are read through TPIDR_EL0, a register libnx
+never sets; they work only in programs that set it themselves, as bevy-horizon does. mesa-switch's
+C code reaches its thread pointer through libnx instead (-mtp=soft, switch_cross_file.txt).
+
+NAK's own NAK_STATS lines never reach the Switch's log, so on the Switch NVK says on stderr, for
+the first 32 shaders whose entry point's name has "_gpr" in it, what NAK compiled: instructions,
+registers, warps per multiprocessor, and spills and fills to local memory. That shows the cap
+took effect.
+
+diff --git a/src/nouveau/compiler/nak.h b/src/nouveau/compiler/nak.h
+index c53f3bc..dcce15e 100644
+--- a/src/nouveau/compiler/nak.h
++++ b/src/nouveau/compiler/nak.h
+@@ -27,6 +27,9 @@ void nak_compiler_destroy(struct nak_compiler *nak);
+ 
+ uint64_t nak_debug_flags(const struct nak_compiler *nak);
+ 
++/* NAK_GPR_LIMIT, or 0 when unset. */
++uint32_t nak_debug_gpr_limit(const struct nak_compiler *nak);
++
+ const struct nir_shader_compiler_options *
+ nak_nir_options(const struct nak_compiler *nak);
+ 
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 288ca79..23c7d16 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -143,6 +143,53 @@ pub trait GetDebugFlags {
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+ 
++static GPR_LIMIT: OnceLock<Option<u32>> = OnceLock::new();
++
++fn valid_gpr_limit(n: u32) -> bool {
++    n >= 24 && n <= 248 && n % 8 == 0
++}
++
++/// `NAK_GPR_LIMIT=n` caps the GPRs any shader may use at n, a multiple of 8
++/// from 24 to 248; register allocation spills what does not fit. Fewer
++/// registers let more warps share a multiprocessor, at the spills' cost.
++pub fn env_gpr_limit() -> Option<u32> {
++    *GPR_LIMIT.get_or_init(|| {
++        let n: u32 = env::var("NAK_GPR_LIMIT").ok()?.trim().parse().ok()?;
++        if valid_gpr_limit(n) {
++            Some(n)
++        } else {
++            eprintln!("NAK_GPR_LIMIT={n} ignored: not a multiple of 8 from 24 to 248");
++            None
++        }
++    })
++}
++
++/// A shader whose entry point's name ends in `_gpr` and a cap, such as
++/// `fragment_gpr48`, is compiled under that cap, so one application can
++/// compile the same shader with and without one. The entry point's name is
++/// part of the pipeline's hash, so their binaries are cached apart.
++fn entry_gpr_limit(nir: &nir_shader) -> Option<u32> {
++    let entry = nir.iter_functions().find(|f| f.is_entrypoint)?;
++    if entry.name.is_null() {
++        return None;
++    }
++    let name = unsafe { CStr::from_ptr(entry.name) }.to_str().ok()?;
++    let n: u32 = name.rsplit_once("_gpr")?.1.parse().ok()?;
++    valid_gpr_limit(n).then_some(n)
++}
++
++/// The cap on `nir`: the lower of `NAK_GPR_LIMIT` and its entry point's, if
++/// either. It goes to the passes with the shader model
++/// (`ShaderModelInfo::with_gpr_limit`), so each compile carries its own,
++/// rather than in a thread-local: on the Switch this crate is built for Linux,
++/// whose thread-locals read `TPIDR_EL0`, a register libnx never sets.
++fn gpr_limit(nir: &nir_shader) -> Option<u32> {
++    match (entry_gpr_limit(nir), env_gpr_limit()) {
++        (Some(a), Some(b)) => Some(a.min(b)),
++        (a, b) => a.or(b),
++    }
++}
++
+ impl GetDebugFlags for OnceLock<Debug> {
+     fn debug_flags(&self) -> u32 {
+         self.get_or_init(Debug::new).flags
+@@ -286,6 +333,11 @@ pub extern "C" fn nak_debug_flags(_nak: *const nak_compiler) -> u64 {
+     DEBUG.debug_flags().into()
+ }
+ 
++#[no_mangle]
++pub extern "C" fn nak_debug_gpr_limit(_nak: *const nak_compiler) -> u32 {
++    env_gpr_limit().unwrap_or(0)
++}
++
+ #[no_mangle]
+ pub extern "C" fn nak_nir_options(
+     nak: *const nak_compiler,
+@@ -574,7 +626,8 @@ fn nak_compile_shader_internal(
+         Some(unsafe { &*fs_key })
+     };
+ 
+-    let sm = ShaderModelInfo::new(nak.sm, nak.warps_per_sm);
++    let sm = ShaderModelInfo::new(nak.sm, nak.warps_per_sm)
++        .with_gpr_limit(gpr_limit(nir));
+     let mut s = nak_shader_from_nir(nak, nir, &sm, has_task_shader);
+ 
+     if DEBUG.print() {
+@@ -678,7 +731,7 @@ fn nak_compile_shader_internal(
+                  gprs={} slm={} spills_mem={} fills_mem={} spills_reg={} \
+                  fills_reg={} tex={tex} txd={txd} tld={tld} ld={ld} ipa={ipa} \
+                  bra={bra} waits={waits} bra_waits={bra_waits} \
+-                 source={:02x}{:02x}{:02x}{:02x} name={}",
++                 source={:02x}{:02x}{:02x}{:02x} name={} cap={}",
+                 stage.to_string_lossy(),
+                 info.num_instrs,
+                 info.num_static_cycles,
+@@ -694,6 +747,7 @@ fn nak_compile_shader_internal(
+                 hash[2],
+                 hash[3],
+                 name,
++                sm.gpr_limit().unwrap_or(0),
+             );
+         }
+     }
+diff --git a/src/nouveau/compiler/nak/assign_regs.rs b/src/nouveau/compiler/nak/assign_regs.rs
+index 82de401..76afa20 100644
+--- a/src/nouveau/compiler/nak/assign_regs.rs
++++ b/src/nouveau/compiler/nak/assign_regs.rs
+@@ -1478,6 +1478,9 @@ impl Shader<'_> {
+         }
+ 
+         let hw_reserved_gprs = self.sm.hw_reserved_gprs();
++        if let Some(limit) = self.sm.gpr_limit() {
++            max_gprs = min(max_gprs, limit - hw_reserved_gprs);
++        }
+         if let ShaderStageInfo::Compute(cs_info) = &self.info.stage {
+             max_gprs = min(
+                 max_gprs,
+diff --git a/src/nouveau/compiler/nak/ir.rs b/src/nouveau/compiler/nak/ir.rs
+index fcace31..d5222bd 100644
+--- a/src/nouveau/compiler/nak/ir.rs
++++ b/src/nouveau/compiler/nak/ir.rs
+@@ -9728,11 +9728,29 @@ pub trait ShaderModel {
+ pub struct ShaderModelInfo {
+     sm: u8,
+     warps_per_sm: u8,
++    gpr_limit: Option<u32>,
+ }
+ 
+ impl ShaderModelInfo {
+     pub fn new(sm: u8, warps_per_sm: u8) -> Self {
+-        ShaderModelInfo { sm, warps_per_sm }
++        ShaderModelInfo {
++            sm,
++            warps_per_sm,
++            gpr_limit: None,
++        }
++    }
++
++    /// The same model, for a shader whose registers are capped at `limit`
++    /// (api.rs `gpr_limit`).
++    pub fn with_gpr_limit(self, limit: Option<u32>) -> Self {
++        ShaderModelInfo {
++            gpr_limit: limit,
++            ..self
++        }
++    }
++
++    pub fn gpr_limit(&self) -> Option<u32> {
++        self.gpr_limit
+     }
+ }
+ 
+diff --git a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+index e086742..0680e3e 100644
+--- a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
++++ b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+@@ -1056,6 +1056,12 @@ impl Shader<'_> {
+                 .unwrap(),
+             );
+         }
++        if let Some(limit) = self.sm.gpr_limit() {
++            max_regs[RegFile::GPR] = min(
++                max_regs[RegFile::GPR],
++                (limit - self.sm.hw_reserved_gprs()).try_into().unwrap(),
++            );
++        }
+         max_regs[RegFile::GPR] -= SW_RESERVED_GPRS;
+ 
+         for f in &mut self.functions {
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index e631049..2601a6a 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -25,6 +25,7 @@
+ #include "compiler/spirv/nir_spirv.h"
+ 
+ #include "util/mesa-blake3.h"
++#include "util/u_atomic.h"
+ #include "util/u_debug.h"
+ 
+ #include "cla097.h"
+@@ -76,13 +77,17 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
+    bool no_cbufs = pdev->debug_flags & NVK_DEBUG_NO_CBUF;
+    bool use_edb_buffer_views = nvk_use_edb_buffer_views(pdev);
+    uint64_t nak_flags = nak_debug_flags(pdev->nak);
++   /* NAK_GPR_LIMIT changes the code, so it keys the shader cache too. */
++   uint64_t nak_gpr_limit = nak_debug_gpr_limit(pdev->nak);
+ 
+    assert(nak_flags <= UINT16_MAX);
++   assert(nak_gpr_limit <= UINT8_MAX);
+ 
+    return (no_cbufs ? 1 << 12 : 0)
+       | (use_edb_buffer_views ? 1 << 13 : 0)
+       | (instance->drirc.misc.ssbo_align_4b ? 1 << 14 : 0)
+       | (UINT64_C(10) << 16) /* Compiler ABI revision. */
++      | (nak_gpr_limit << 24)
+       | (nak_flags << 48);
+ }
+ 
+@@ -543,6 +548,36 @@ nvk_shader_dump(struct nvk_shader *shader)
+ }
+ #endif
+ 
++#ifdef __SWITCH__
++/* Says on stderr, for the first 32 shaders whose entry point's name asks NAK
++ * for a register cap (such as fragment_gpr48), what NAK compiled, so a run on
++ * a Switch shows the cap took effect. NAK's own NAK_STATS lines never reach
++ * the Switch's log.
++ */
++static void
++nvk_switch_report_gpr_cap(nir_shader *nir, const struct nak_shader_info *info)
++{
++   const char *name = NULL;
++   nir_foreach_function(func, nir) {
++      if (func->is_entrypoint)
++         name = func->name;
++   }
++   if (name == NULL || strstr(name, "_gpr") == NULL)
++      return;
++
++   static uint32_t reported;
++   if (p_atomic_inc_return(&reported) > 32)
++      return;
++
++   fprintf(stderr, "[NVK] register cap: %s compiled to %u instructions in %u "
++           "registers, %u warps per SM, %u spills and %u fills to %u bytes "
++           "of local memory\n",
++           name, info->num_instrs, info->num_gprs, info->max_warps_per_sm,
++           info->num_spills_to_mem, info->num_fills_from_mem,
++           info->slm_size);
++}
++#endif
++
+ static VkResult
+ nvk_compile_nir(struct nvk_device *dev, nir_shader *nir,
+                 VkShaderCreateFlagsEXT shader_flags,
+@@ -570,6 +605,9 @@ nvk_compile_nir(struct nvk_device *dev, nir_shader *nir,
+       return vk_errorf(pdev, VK_ERROR_UNKNOWN, "Internal compiler error in NAK");
+ 
+    shader->info = shader->nak->info;
++#ifdef __SWITCH__
++   nvk_switch_report_gpr_cap(nir, &shader->info);
++#endif
+    shader->asm_str = shader->nak->asm_str;
+    shader->code_ptr = shader->nak->code;
+    shader->code_size = shader->nak->code_size;

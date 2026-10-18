@@ -16,11 +16,20 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     DEVKITPRO=/opt/devkitpro \
     DEVKITARM=/opt/devkitpro/devkitA64
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly && \
-    rustup component add rust-src rust-std llvm-tools-preview
-
-# Install cargo-nx and elf2nro for packaging .nro homebrew
-RUN cargo install cargo-nx || true
+# The nightly is pinned to the one the documented builds used; --build-arg RUST_NIGHTLY=nightly
+# takes the latest. A dated toolchain is renamed to plain "nightly": -Z build-std compiles std
+# from the sysroot, so its path (/usr/local/rustup/toolchains/nightly-x86_64-unknown-linux-gnu)
+# is in every binary's debug info, and keeping it lets a rebuild match an earlier one byte for byte.
+ARG RUST_NIGHTLY=nightly-2026-10-04
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+        --default-toolchain "$RUST_NIGHTLY" --component rust-src,llvm-tools-preview && \
+    if [ "$RUST_NIGHTLY" != nightly ]; then \
+        mv "$RUSTUP_HOME/toolchains/$RUST_NIGHTLY-x86_64-unknown-linux-gnu" \
+           "$RUSTUP_HOME/toolchains/nightly-x86_64-unknown-linux-gnu" && \
+        rm -f "$RUSTUP_HOME/update-hashes/$RUST_NIGHTLY-x86_64-unknown-linux-gnu" && \
+        rustup default nightly; \
+    fi && \
+    rustc -vV
 
 WORKDIR /workspace
 CMD ["/bin/bash"]

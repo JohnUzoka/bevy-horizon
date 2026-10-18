@@ -1,0 +1,102 @@
+bevy-horizon: clear the result of the MME's multiply before Turing
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 606441c9, after 0001-0017. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+Before Turing, the MME builder multiplies by shifting and adding:
+mme_fermi_umul_32x32_32_to_free_srcs and mme_fermi_umul_32x64_64_to_free_srcs add y, shifted,
+into dst for each set bit of x. Neither clears dst first. Their callers
+(mme_mul_32x32_32_free_srcs, mme_umul_32x32_64_free_srcs, mme_umul_32x64_64_free_srcs and the
+MUL case of mme_fermi_build_alu) pass a register fresh from the allocator, which hands out the
+lowest free one, so dst starts from whatever the macro last left there. NVK multiplies on these
+GPUs only in nvk_mme_dispatch_indirect, to count an indirect dispatch's compute invocations, so
+only pipeline-statistics queries see it and nothing drawn depends on it. On the Switch, Bevy's
+late mesh preprocessing, an indirect dispatch, read about 1.12e13 invocations a frame in every
+one of Skate 3's reports from perf10 to perf19.
+
+Mesa's tests miss it because the Fermi simulator starts every register at zero and the tests
+multiply straight after loading their inputs. They now leave small values in the next four free
+registers first. Without the fix, mul_32x32_32, umul_32x32_64 and umul_32x64_64 then fail on the
+Fermi simulator (0 times 0 gives 3 or 4); with it, all 13 builder tests pass. NVK's
+dispatch-indirect macro for MAXWELL_B, run in the same simulator by a harness outside this
+patch, counted 549755817216 invocations for 25x1x1 groups of 64 instead of 1600, and was wrong
+in all five cases tried; with the fix all five are right. Clearing dst adds five instructions to
+that macro: NVK's macros for MAXWELL_B, patch 0012's included, go from 1201 to 1206 of the
+MME's 2048 words. Mesa's main branch had the same code on 11 October 2026.
+
+diff --git a/src/nouveau/mme/mme_fermi_builder.c b/src/nouveau/mme/mme_fermi_builder.c
+index 2888e2a..2a6a2ff 100644
+--- a/src/nouveau/mme/mme_fermi_builder.c
++++ b/src/nouveau/mme/mme_fermi_builder.c
+@@ -349,6 +349,10 @@ mme_fermi_umul_32x32_32_to_free_srcs(struct mme_builder *b,
+                                      struct mme_value x,
+                                      struct mme_value y)
+ {
++   /* dst is a sum of shifted copies of y, and a register from the allocator
++    * may still hold a value from the macro's earlier work.
++    */
++   mme_mov_to(b, dst, mme_zero());
+    mme_while (b, ine, x, mme_zero()) {
+       struct mme_value lsb = mme_and(b, x, mme_imm(1));
+       mme_if (b, ine, lsb, mme_zero()) {
+@@ -368,6 +372,9 @@ mme_fermi_umul_32x64_64_to_free_srcs(struct mme_builder *b,
+                                      struct mme_value x,
+                                      struct mme_value64 y)
+ {
++   /* As above, dst starts at zero. */
++   mme_mov_to(b, dst.lo, mme_zero());
++   mme_mov_to(b, dst.hi, mme_zero());
+    mme_while (b, ine, x, mme_zero()) {
+       struct mme_value lsb = mme_and(b, x, mme_imm(1));
+       mme_if (b, ine, lsb, mme_zero()) {
+diff --git a/src/nouveau/mme/tests/mme_builder_test.cpp b/src/nouveau/mme/tests/mme_builder_test.cpp
+index 6c9afd4..9bb57ae 100644
+--- a/src/nouveau/mme/tests/mme_builder_test.cpp
++++ b/src/nouveau/mme/tests/mme_builder_test.cpp
+@@ -205,6 +205,21 @@ static const uint32_t mul_cases[] = {
+    0xfffe0000,
+ };
+ 
++/* The Fermi simulator starts with every register at zero, but a macro's
++ * earlier work leaves values in the registers it frees, and the builder hands
++ * those out again.  This leaves small values in the next ones, so a result
++ * that is added to without being cleared first comes out wrong.
++ */
++static void
++dirty_free_regs(mme_builder *b)
++{
++   mme_value regs[4];
++   for (uint32_t i = 0; i < ARRAY_SIZE(regs); i++)
++      regs[i] = mme_mov(b, mme_imm(i + 3));
++   for (uint32_t i = 0; i < ARRAY_SIZE(regs); i++)
++      mme_free_reg(b, regs[i]);
++}
++
+ TEST_F(mme_builder_test, mul_32x32_32)
+ {
+    for (auto sim : sims) {
+@@ -213,6 +228,7 @@ TEST_F(mme_builder_test, mul_32x32_32)
+ 
+       mme_value x = mme_load(&b);
+       mme_value y = mme_load(&b);
++      dirty_free_regs(&b);
+ 
+       sim->mme_store_data(&b, 0, mme_mul_32x32_32_free_srcs(&b, x, y));
+ 
+@@ -239,6 +255,7 @@ TEST_F(mme_builder_test, umul_32x32_64)
+ 
+       mme_value x = mme_load(&b);
+       mme_value y = mme_load(&b);
++      dirty_free_regs(&b);
+ 
+       struct mme_value64 d = mme_umul_32x32_64_free_srcs(&b, x, y);
+ 
+@@ -273,6 +290,7 @@ TEST_F(mme_builder_test, umul_32x64_64)
+       struct mme_value64 y;
+       y.lo = mme_load(&b);
+       y.hi = mme_load(&b);
++      dirty_free_regs(&b);
+ 
+       struct mme_value64 d = mme_umul_32x64_64_free_srcs(&b, x, y);
+ 

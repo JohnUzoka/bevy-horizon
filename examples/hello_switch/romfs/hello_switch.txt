@@ -1,0 +1,1 @@
+bevy-horizon: hello_switch packed this file into its NRO as romfs:/hello_switch.txt.

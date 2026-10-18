@@ -1,0 +1,33 @@
+# The [patch] table for a game on Bevy 0.19 (wgpu 29), read only when asked:
+# `BEVY=0.19 scripts/build_game.sh ...` passes `--config .cargo/config.toml --config .cargo/bevy-0.19.toml`,
+# so the game's own Cargo.toml needs no Switch patches and its desktop builds don't change.
+# Paths are relative to this repository: cargo resolves a config file's paths from the parent of
+# the directory holding it (doc.rust-lang.org/cargo/reference/config.html#config-relative-paths).
+# The same patches as this workspace's Cargo.toml, which says what each does, plus inventory.
+# A patch for a crate the game doesn't build only makes cargo warn that it "was not used".
+#
+# A patch replaces only crates.io versions it's semver-compatible with, so a game's Cargo.lock has to
+# lock the patch's version; build_game.sh runs `cargo update --precise` for the ones that differ.
+
+[patch.crates-io]
+bevy_asset = { path = "patches/bevy_asset" }
+bevy_tasks = { path = "patches/bevy_tasks" }
+cpal = { path = "patches/cpal" }
+getrandom = { path = "patches/getrandom" }
+getrandom02 = { path = "patches/getrandom-0.2", package = "getrandom" }
+# Bevy's automatic reflect registration (`reflect_auto_register`, part of its default features)
+# collects types with inventory, which had no Horizon constructor section. Bevy registers many of
+# its own types only that way (bevy_transform 0.19.1 makes no register_type call), and whatever
+# finds components by reflection, as Bevy 0.18's scene spawning does, needs them registered.
+# This workspace's examples leave that feature off, so its Cargo.toml doesn't patch inventory.
+inventory = { path = "patches/inventory" }
+lua-src = { path = "patches/lua-src" }
+memmap2 = { path = "patches/memmap2" }
+polling = { path = "patches/polling" }
+raw-window-handle = { path = "patches/raw-window-handle" }
+ring = { path = "patches/ring" }
+rustix = { path = "patches/rustix" }
+wgpu = { path = "patches/wgpu" }
+wgpu-core = { path = "patches/wgpu-core" }
+wgpu-core-deps-windows-linux-android = { path = "patches/wgpu-core-deps-windows-linux-android" }
+wgpu-hal = { path = "patches/wgpu-hal" }

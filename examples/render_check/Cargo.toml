@@ -1,0 +1,33 @@
+[package]
+name = "render_check"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Shows which of Bevy's 3D render paths draw on the Switch, and checks its own screenshot"
+
+# The same Bevy and bevy_horizon features as hello_switch, so the two share every compiled
+# dependency and building this one only compiles this crate.
+[dependencies]
+bevy = { version = "0.19", default-features = false, features = [
+    "bevy_window",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_ui_render",
+    "default_font",
+    "png",
+    "tonemapping_luts",
+    "ktx2",
+    "zstd_rust",
+] }
+bevy_horizon = { path = "../../crates/bevy_horizon", features = ["vulkan", "fps_overlay", "render"] }
+
+# For the debug messenger self-test, which asks NVK a question directly. Neither adds a feature
+# Bevy and wgpu-hal don't already turn on, so nothing else is rebuilt for this crate.
+[target.'cfg(target_os = "horizon")'.dependencies]
+ash = { version = "0.38", default-features = false, features = ["debug", "std"] }
+wgpu = { version = "29", default-features = false }

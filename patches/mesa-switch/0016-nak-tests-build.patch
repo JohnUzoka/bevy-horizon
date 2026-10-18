@@ -1,0 +1,33 @@
+bevy-horizon: let NAK's unit tests build again on a PC
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 606441c9, after 0001-0015. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+mesa-switch comments out the #include <xf86drm.h> in nak_bindings.h (d4a00ea, "Merge
+NaGaa95/mesa-switch main: Mesa 26.2.3, NVK and NAK fixes, shared shader cache"). Only
+hw_runner.rs, which NAK's tests use to run shaders on a GPU, needs it, so the library still
+builds, but NAK's test binary stops at 14 errors, the first "cannot find type drmDevicePtr".
+The include is back behind __has_include: a PC build with libdrm compiles the tests again, and
+the Switch build, whose image has no xf86drm.h, generates the same nak_bindings.rs as before.
+
+With the whole series applied, NAK's tests build and pass on a PC (nak-host, Mesa's
+builddir-test): 18 run, none fail, and the 53 in hw_tests:: and nvdisasm_tests:: are skipped,
+as meson's test() skips them.
+
+diff --git a/src/nouveau/compiler/nak_bindings.h b/src/nouveau/compiler/nak_bindings.h
+index 7a77c4c..b2602b1 100644
+--- a/src/nouveau/compiler/nak_bindings.h
++++ b/src/nouveau/compiler/nak_bindings.h
+@@ -9,7 +9,10 @@
+ #include "nouveau_context.h"
+ #include "nouveau_device.h"
+ 
+-// #include <xf86drm.h>
++#if __has_include(<xf86drm.h>)
++/* Only NAK's hardware tests use it, and the Switch has no libdrm. */
++#include <xf86drm.h>
++#endif
+ #include "drm-uapi/nouveau_drm.h"
+ 
+ #define DRM_RS_IOCTL(FOO) \

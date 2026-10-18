@@ -2,11 +2,20 @@
 resolver = "3"
 members = [
     "crates/bevy_horizon",
+    "examples/breakout",
     "examples/hello_switch",
+    "examples/render_check",
+    "examples/switch_captest",
     "patches/bevy_asset",
+    "patches/bevy_tasks",
     "patches/cpal",
+    "patches/getrandom",
+    "patches/libc",
     "patches/memmap2",
+    "patches/polling",
 ]
+# Members get every feature resolved for Cargo.lock, and rustix's `rustc-dep-of-std` can't be.
+exclude = ["patches/rustix"]
 
 [workspace.package]
 edition = "2024"
@@ -15,6 +24,38 @@ repository = "https://github.com/JohnUzoka/bevy-horizon"
 
 [patch.crates-io]
 bevy_asset = { path = "patches/bevy_asset" }
+# Bevy's global task pools never join their threads (bevyengine/bevy#9477); the patch adds a shutdown
+# that bevy_horizon runs at exit, so their stacks stop locking the heap the loader reuses. It also
+# sizes the pools from the process's core mask, since std's available_parallelism fails on Horizon.
+bevy_tasks = { path = "patches/bevy_tasks" }
+# The same patch for Bevy 0.18 games (bevy_horizon's `bevy_0_18` feature). patches/bevy-0.18/ holds
+# the 0.18 versions of every Bevy, wgpu and cpal patch here; a game on 0.18 lists those in its own
+# [patch] (docs/porting-a-bevy-game.md). Only bevy_tasks is needed here, for bevy_horizon itself.
+bevy_tasks_018 = { path = "patches/bevy-0.18/bevy_tasks", package = "bevy_tasks" }
+# Audio: a Horizon host on libnx's audio renderer (docs/input-and-audio.md); its build.rs links
+# libnx. Bevy 0.18's is patches/bevy-0.18/cpal, the same host on cpal 0.15.3.
 cpal = { path = "patches/cpal" }
+getrandom = { path = "patches/getrandom" }
+# ring 0.17 still uses getrandom 0.2, which only knows the 3DS. A renamed key patches a second version.
+getrandom02 = { path = "patches/getrandom-0.2", package = "getrandom" }
+libc = { path = "patches/libc" }
+lua-src = { path = "patches/lua-src" }
 memmap2 = { path = "patches/memmap2" }
+polling = { path = "patches/polling" }
+# Vulkan through NVK (mesa-switch): raw-window-handle gains Horizon handles holding libnx's NWindow;
+# wgpu-hal makes a VK_NN_vi_surface from them and calls the statically linked driver's
+# vkGetInstanceProcAddr, since Horizon has no dynamic loader; wgpu and
+# wgpu-core-deps-windows-linux-android only add Horizon to their Vulkan platform lists. wgpu-core
+# also drops indirect-call validation in release builds, as Bevy does without DX12. For diagnosis
+# on hardware, wgpu-hal always registers a VK_EXT_debug_utils messenger on Horizon, so NVK's
+# reasons for its errors reach log.txt, and logs the VkResult behind an "unexpected" error, and
+# wgpu-core logs which of its calls lost the device (docs/rendering.md).
+raw-window-handle = { path = "patches/raw-window-handle" }
+# ring knows 32-bit ARM Horizon (the 3DS) but not AArch64, so it built no assembly for the Switch.
+ring = { path = "patches/ring" }
+rustix = { path = "patches/rustix" }
+wgpu = { path = "patches/wgpu" }
+wgpu-core = { path = "patches/wgpu-core" }
+wgpu-core-deps-windows-linux-android = { path = "patches/wgpu-core-deps-windows-linux-android" }
+wgpu-hal = { path = "patches/wgpu-hal" }
 

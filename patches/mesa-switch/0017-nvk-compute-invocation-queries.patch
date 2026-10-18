@@ -1,0 +1,67 @@
+bevy-horizon: count compute invocations in statistics queries that count graphics work too
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 606441c9, after 0001-0016. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+Mesa's a10c12e6 ("nvk: Only increment CS counters when query is active in CmdDispatchBase", by
+Mary Guillemard, mesa/mesa!42732), which mesa-switch carries, made a direct dispatch add its
+compute invocations only while cmd->state.cs.active_compute_invocations_query is set. Two cases
+leave it clear while a query that counts them is active:
+
+- A pipeline-statistics pool that counts compute invocations and any graphics statistic.
+  nvk_cmd_set_statistics_counters sets the flag only in the else of
+  "statistics_counter_mask != 0", and compute invocations have no bit in that mask, so such a
+  pool reads 0 compute invocations for every direct dispatch, on every GPU NVK supports. Bevy's
+  RenderDiagnosticsPlugin times each pass with one such pool, every statistic in it
+  (bevy_render 0.18.1, diagnostic/internal.rs). Skate 3's per-pass figures drop zeros, so its
+  direct dispatches' compute invocations went missing from them without a sign.
+- vkCmdExecuteCommands clears cmd->state.cs, the flag with it, so the primary's dispatches after
+  it stop counting while the query is still active. wgpu records no secondary command buffers,
+  so Bevy doesn't reach this one.
+
+The flag is now set whatever else the pool counts, and vkCmdExecuteCommands keeps it. Indirect
+dispatches add their invocations in a macro without checking the flag, so they were never
+affected. Mesa's main branch had the same code on 11 October 2026.
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index 60ae745..85cb5bc 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -699,8 +699,15 @@ nvk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+     * dirty tracking, we may miss the fact that a secondary has messed with
+     * GPU state if we don't invalidate all our internal tracking.
+    */
++   /* A query begun in the primary is still active after the secondaries, so
++    * its dispatches must keep adding compute invocations.
++    */
++   const bool active_compute_invocations_query =
++      cmd->state.cs.active_compute_invocations_query;
+    nvk_cmd_invalidate_graphics_state(cmd);
+    nvk_cmd_invalidate_compute_state(cmd);
++   cmd->state.cs.active_compute_invocations_query =
++      active_compute_invocations_query;
+ }
+ 
+ enum nvk_barrier {
+diff --git a/src/nouveau/vulkan/nvk_query_pool.c b/src/nouveau/vulkan/nvk_query_pool.c
+index ceda24f..74d8c58 100644
+--- a/src/nouveau/vulkan/nvk_query_pool.c
++++ b/src/nouveau/vulkan/nvk_query_pool.c
+@@ -670,9 +670,13 @@ nvk_cmd_set_statistics_counters(struct nvk_cmd_buffer *cmd,
+          P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SET_STATISTICS_COUNTERS));
+          P_INLINE_DATA(p, enable);
+          P_INLINE_DATA(p, pool->statistics_counter_mask);
+-      } else if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS &&
+-                 pool->vk.pipeline_statistics &
+-                    VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT) {
++      }
++      /* Compute invocations have no bit in statistics_counter_mask, so this
++       * is set whatever graphics statistics the pool also counts.
++       */
++      if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS &&
++          pool->vk.pipeline_statistics &
++             VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT) {
+          cmd->state.cs.active_compute_invocations_query = enable;
+       }
+       break;

@@ -1,9 +1,15 @@
 #[cfg(feature = "file_watcher")]
 mod file_watcher;
 
-#[cfg(feature = "multi_threaded")]
+// [bevy-horizon patch] Horizon reads and writes files with the synchronous implementation, even
+// with `multi_threaded`. The async one goes through async-fs, whose `blocking::Unblock` allocates
+// an 8 MiB pipe for each file being read (blocking 1.7.0 `src/lib.rs`) and runs the reads on
+// blocking's own pool, which adds threads (2 MiB stacks, from the heap) while reads queue up, to
+// 500 by default. Skate 3's first run (on Ryujinx) started 43 threads while loading, then failed an
+// 8 MiB allocation, the size of one pipe.
+#[cfg(all(feature = "multi_threaded", not(target_os = "horizon")))]
 mod file_asset;
-#[cfg(not(feature = "multi_threaded"))]
+#[cfg(any(not(feature = "multi_threaded"), target_os = "horizon"))]
 pub(crate) mod sync_file_asset;
 
 #[cfg(feature = "file_watcher")]
@@ -28,6 +34,22 @@ pub(crate) fn get_base_path() -> PathBuf {
     }
 }
 
+/// `get_base_path().join(path)`, except that on Horizon a path naming a device (`sdmc:/...`,
+/// `romfs:/...`) is used as it is. Such a path is absolute there, but Rust's `Path` counts only a
+/// leading `/` as absolute, so `join` appended it to the base instead
+/// (`sdmc:/switch/game/sdmc:/switch/game/assets`). [bevy-horizon patch]
+pub(crate) fn under_base_path(path: &Path) -> PathBuf {
+    #[cfg(target_os = "horizon")]
+    if path
+        .to_str()
+        .and_then(|path| path.split_once(":/"))
+        .is_some_and(|(device, _)| !device.is_empty() && !device.contains('/'))
+    {
+        return path.to_owned();
+    }
+    get_base_path().join(path)
+}
+
 /// I/O implementation for the local filesystem.
 ///
 /// This asset I/O is fully featured but it's not available on `android` and `wasm` targets.
@@ -41,7 +63,7 @@ impl FileAssetReader {
     ///
     /// See `get_base_path` below.
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
-        let root_path = Self::get_base_path().join(path.as_ref());
+        let root_path = under_base_path(path.as_ref());
         debug!(
             "Asset Server using {} as its base path.",
             root_path.display()
@@ -74,7 +96,7 @@ impl FileAssetWriter {
     /// Creates a new [`FileAssetWriter`] at a path relative to the executable's directory, optionally
     /// watching for changes.
     pub fn new<P: AsRef<Path> + core::fmt::Debug>(path: P, create_root: bool) -> Self {
-        let root_path = get_base_path().join(path.as_ref());
+        let root_path = under_base_path(path.as_ref());
         if create_root && let Err(e) = std::fs::create_dir_all(&root_path) {
             error!(
                 "Failed to create root directory {} for file asset writer: {}",

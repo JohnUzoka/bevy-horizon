@@ -1,0 +1,1013 @@
+bevy-horizon: NAK_DEBUG=xbar, scoreboards that stay in flight across forward branches (SM50-SM6x)
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at d4a00ea0ab3f59afb967cc5d779e4263d237bd77, after 0001 to 0003. scripts/build_nvk.sh applies
+it; this text before the first "diff --git" line is ignored by git apply.
+
+On Maxwell and Pascal, NAK's assign_barriers() (calc_instr_deps.rs) waits on every outstanding
+scoreboard at every branch, including the SYNC that ends each arm of an if/else or switch. A
+fragment shader that samples a texture or loads from a buffer inside such an arm waits out the
+whole latency of that load before it leaves the arm, so loads in different arms never overlap.
+
+With NAK_DEBUG=xbar, assign_barriers_xbar() instead leaves scoreboards in flight across a BRA or
+SYNC that only goes forward, and waits where the result is used, as it already does inside a
+block. Loops (back-edges), BRK, CONT and EXIT still wait on everything. It relies on two things:
+a scoreboard counts outstanding operations, so several can share one (nv50_ir's GM107 emitter
+shares SB5 the same way), and an operation issued under a divergent mask writes only the lanes
+that issued it, so the other side of the branch can't see its result early.
+
+It is opt-in because it has only run under Ryujinx, which ignores scoreboards, so nothing yet
+shows that it is right on hardware. Every shader's result is checked by xbar_verify(), a hazard
+check over the whole CFG that doesn't share code with either pass. If that check fails, or
+rejects assign_barriers()'s own result, the shader keeps assign_barriers()'s result and NAK
+prints "NAK xbar: kept legacy barriers: <reason>". NVK's shader cache key includes the NAK_DEBUG
+flags, so shaders built with and without xbar are cached separately.
+
+NAK_DEBUG=stats also gains waits= (instructions that wait on a scoreboard) and bra_waits=
+(branches among them), which show the difference. NAK_DEBUG=final prints each shader's final IR
+once, between "NAK_FINAL begin" and "NAK_FINAL end" lines, with the scoreboards every instruction
+sets (rd:, wr:) and waits on (wt=); "print" shows the same after every pass, which takes minutes
+for a large shader on the Switch's CPU. The unit tests at the end of
+calc_instr_deps.rs build CFGs by hand and check both the passes and the verifier.
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 44d40fd..f4a6784 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -29,6 +29,8 @@ enum DebugFlags {
+     NoUgpr,
+     Cycles,
+     Stats,
++    XBar,
++    Final,
+ }
+ 
+ pub struct Debug {
+@@ -56,6 +58,8 @@ impl Debug {
+                 "nougpr" => flags |= 1 << DebugFlags::NoUgpr as u8,
+                 "cycles" => flags |= 1 << DebugFlags::Cycles as u8,
+                 "stats" => flags |= 1 << DebugFlags::Stats as u8,
++                "xbar" => flags |= 1 << DebugFlags::XBar as u8,
++                "final" => flags |= 1 << DebugFlags::Final as u8,
+                 unk => eprintln!("Unknown NAK_DEBUG flag \"{}\"", unk),
+             }
+         }
+@@ -97,6 +101,14 @@ pub trait GetDebugFlags {
+     fn stats(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::Stats as u8) != 0
+     }
++
++    fn xbar(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::XBar as u8) != 0
++    }
++
++    fn final_ir(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::Final as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+@@ -554,15 +566,24 @@ fn nak_compile_shader_internal(
+     // NAK_DEBUG=stats: one line per shader, without the IR that "print" also
+     // writes, which on a slow CPU makes a large shader take minutes to build.
+     let mut op_counts = [0u32; 6];
++    let mut wait_counts = [0u32; 2];
+     if DEBUG.stats() {
+-        s.for_each_instr(&mut |i| match &i.op {
+-            Op::Tex(_) => op_counts[0] += 1,
+-            Op::Txd(_) => op_counts[1] += 1,
+-            Op::Tld(_) | Op::Tld4(_) => op_counts[2] += 1,
+-            Op::Ld(_) | Op::Ldc(_) => op_counts[3] += 1,
+-            Op::Ipa(_) => op_counts[4] += 1,
+-            Op::Bra(_) => op_counts[5] += 1,
+-            _ => {}
++        s.for_each_instr(&mut |i| {
++            if i.deps.wt_bar_mask != 0 {
++                wait_counts[0] += 1;
++                if i.is_branch() {
++                    wait_counts[1] += 1;
++                }
++            }
++            match &i.op {
++                Op::Tex(_) => op_counts[0] += 1,
++                Op::Txd(_) => op_counts[1] += 1,
++                Op::Tld(_) | Op::Tld4(_) => op_counts[2] += 1,
++                Op::Ld(_) | Op::Ldc(_) => op_counts[3] += 1,
++                Op::Ipa(_) => op_counts[4] += 1,
++                Op::Bra(_) => op_counts[5] += 1,
++                _ => {}
++            }
+         });
+     }
+ 
+@@ -573,7 +594,7 @@ fn nak_compile_shader_internal(
+ 
+     let code = sm.encode_shader(&s);
+     let bin = Box::new(ShaderBin::new(&sm, &s.info, fs_key, code, &asm));
+-    if DEBUG.stats() {
++    if DEBUG.stats() || DEBUG.final_ir() {
+         let info = &bin.bin.info;
+         let stage = unsafe {
+             CStr::from_ptr(_mesa_shader_stage_to_string(info.stage as u32))
+@@ -584,28 +605,52 @@ fn nak_compile_shader_internal(
+             unsafe { CStr::from_ptr(nir.info.name) }.to_string_lossy()
+         };
+         let hash = &nir.info.source_blake3;
+-        let [tex, txd, tld, ld, ipa, bra] = op_counts;
+-        eprintln!(
+-            "NAK_STATS stage={} instrs={} static_cycles={} max_warps={} \
+-             gprs={} slm={} spills_mem={} fills_mem={} spills_reg={} \
+-             fills_reg={} tex={tex} txd={txd} tld={tld} ld={ld} ipa={ipa} \
+-             bra={bra} source={:02x}{:02x}{:02x}{:02x} name={}",
+-            stage.to_string_lossy(),
+-            info.num_instrs,
+-            info.num_static_cycles,
+-            info.max_warps_per_sm,
+-            info.num_gprs,
+-            info.slm_size,
+-            info.num_spills_to_mem,
+-            info.num_fills_from_mem,
+-            info.num_spills_to_reg,
+-            info.num_fills_from_reg,
+-            hash[0],
+-            hash[1],
+-            hash[2],
+-            hash[3],
+-            name,
+-        );
++        // NAK_DEBUG=final: the shader as encoded, each instruction with the
++        // scoreboards it sets (rd:, wr:) and waits on (wt=), and none of the
++        // passes before it that "print" also writes. Formatted first and
++        // written in one call, so that other threads' lines stay outside it.
++        if DEBUG.final_ir() {
++            let text = format!(
++                "NAK_FINAL begin stage={} instrs={} gprs={} \
++                 source={:02x}{:02x}{:02x}{:02x} name={}\n{}NAK_FINAL end",
++                stage.to_string_lossy(),
++                info.num_instrs,
++                info.num_gprs,
++                hash[0],
++                hash[1],
++                hash[2],
++                hash[3],
++                name,
++                s,
++            );
++            eprintln!("{}", text);
++        }
++        if DEBUG.stats() {
++            let [tex, txd, tld, ld, ipa, bra] = op_counts;
++            let [waits, bra_waits] = wait_counts;
++            eprintln!(
++                "NAK_STATS stage={} instrs={} static_cycles={} max_warps={} \
++                 gprs={} slm={} spills_mem={} fills_mem={} spills_reg={} \
++                 fills_reg={} tex={tex} txd={txd} tld={tld} ld={ld} ipa={ipa} \
++                 bra={bra} waits={waits} bra_waits={bra_waits} \
++                 source={:02x}{:02x}{:02x}{:02x} name={}",
++                stage.to_string_lossy(),
++                info.num_instrs,
++                info.num_static_cycles,
++                info.max_warps_per_sm,
++                info.num_gprs,
++                info.slm_size,
++                info.num_spills_to_mem,
++                info.num_fills_from_mem,
++                info.num_spills_to_reg,
++                info.num_fills_from_reg,
++                hash[0],
++                hash[1],
++                hash[2],
++                hash[3],
++                name,
++            );
++        }
+     }
+     Box::into_raw(bin) as *mut nak_shader_bin
+ }
+diff --git a/src/nouveau/compiler/nak/calc_instr_deps.rs b/src/nouveau/compiler/nak/calc_instr_deps.rs
+index c89c335..278f0ce 100644
+--- a/src/nouveau/compiler/nak/calc_instr_deps.rs
++++ b/src/nouveau/compiler/nak/calc_instr_deps.rs
+@@ -744,6 +744,577 @@ fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
+     }
+ }
+ 
++// Cross-block scoreboards for SM50-SM6x (NAK_DEBUG=xbar).
++//
++// assign_barriers() waits on every outstanding scoreboard at every branch,
++// including the SYNC that ends each arm of an if/else.  A fragment shader
++// that samples inside if/else or switch arms therefore pays the full latency
++// of each sample at that arm's SYNC.  This pass keeps scoreboards in flight
++// across forward BRA and SYNC and waits where the result is used.  It relies
++// on two hardware properties:
++//
++//  - Scoreboards count outstanding operations (DEPBAR.LE SBn, k), so two
++//    operations may share one and a wait covers both.  nv50_ir's GM107
++//    emitter shares SB5 when it runs out.
++//  - An operation issued under a divergent mask writes only the lanes that
++//    were active, so the other side of a divergent branch, which may run
++//    straight after a SYNC, can't see its writes before the lanes reconverge.
++//    That's why the analysis only follows CFG edges.
++//
++// Back-edges, BRK, CONT and EXIT still wait on everything, so the forward
++// edges form a DAG that one pass in block order covers exactly.  The result
++// is checked by xbar_verify(), an independent hazard check over the whole
++// CFG.  The caller keeps assign_barriers()'s result if the check fails, or
++// if it rejects assign_barriers()'s own result.
++
++/// Scoreboarded accesses to one register that may still be in flight,
++/// merged over all forward paths (sorted dep indices).
++#[derive(Clone, Default, PartialEq, Eq)]
++struct XbarUse {
++    writes: Vec<usize>,
++    reads: Vec<usize>,
++}
++
++fn xbar_union(a: &mut Vec<usize>, b: &[usize]) {
++    if !b.is_empty() {
++        a.extend_from_slice(b);
++        a.sort_unstable();
++        a.dedup();
++    }
++}
++
++#[derive(Clone, Default)]
++struct XbarDepState {
++    uses: SparseRegTracker<XbarUse>,
++    active: FxHashSet<usize>,
++}
++
++impl XbarDepState {
++    fn merge(&mut self, other: &Self) {
++        self.uses.merge_with(&other.uses, |a, b| {
++            xbar_union(&mut a.writes, &b.writes);
++            xbar_union(&mut a.reads, &b.reads);
++        });
++        self.active.extend(other.active.iter().copied());
++    }
++}
++
++#[derive(Default)]
++struct XbarDeps {
++    /// For a write dep, the read dep of the same instruction
++    read_dep: Vec<Option<usize>>,
++    /// Whether some path waits on the dep
++    waited: Vec<bool>,
++    instr_deps: FxHashMap<(usize, usize), (usize, usize)>,
++    instr_waits: FxHashMap<(usize, usize), Vec<usize>>,
++}
++
++impl XbarDeps {
++    fn add_instr(&mut self, bi: usize, ip: usize) -> (usize, usize) {
++        let rd = self.read_dep.len();
++        let wr = rd + 1;
++        self.read_dep.extend([None, Some(rd)]);
++        self.waited.extend([false, false]);
++        self.instr_deps.insert((bi, ip), (rd, wr));
++        (rd, wr)
++    }
++
++    fn add_waits(
++        &mut self,
++        active: &mut FxHashSet<usize>,
++        bi: usize,
++        ip: usize,
++        mut waits: Vec<usize>,
++    ) {
++        // As in DepGraph::add_waits(), a wait on a write covers the read.
++        for dep in &waits {
++            if let Some(rd) = self.read_dep[*dep] {
++                active.remove(&rd);
++            }
++        }
++        waits.sort_unstable();
++        waits.dedup();
++        waits.retain(|dep| active.remove(dep));
++        for dep in &waits {
++            self.waited[*dep] = true;
++        }
++        if !waits.is_empty() {
++            self.instr_waits.insert((bi, ip), waits);
++        }
++    }
++
++    fn instr_waits(&self, bi: usize, ip: usize) -> &[usize] {
++        self.instr_waits.get(&(bi, ip)).map_or(&[], |w| &w[..])
++    }
++}
++
++/// Whether `instr`, at `ip` in block `bi`, may leave scoreboards in flight:
++/// a BRA or SYNC that ends its block and only goes forward.
++fn xbar_branch_keeps_bars(
++    f: &Function,
++    bi: usize,
++    ip: usize,
++    instr: &Instr,
++) -> bool {
++    matches!(&instr.op, Op::Bra(_) | Op::Sync(_))
++        && ip + 1 == f.blocks[bi].instrs.len()
++        && f.blocks.succ_indices(bi).iter().all(|&s| s > bi)
++}
++
++/// Every edge to an earlier block must leave through a branch, which then
++/// waits on everything.
++fn xbar_check_cfg(f: &Function) -> Result<(), String> {
++    for bi in 0..f.blocks.len() {
++        if f.blocks.succ_indices(bi).iter().any(|&s| s <= bi)
++            && !f.blocks[bi].instrs.last().is_some_and(|i| i.is_branch())
++        {
++            return Err(format!("block {bi} has a back-edge without a branch"));
++        }
++    }
++    Ok(())
++}
++
++/// Pass 1: the deps each instruction waits on.  Mirrors the loop in
++/// assign_barriers(), with per-block state merged at forward joins.
++fn xbar_calc_waits(f: &Function, sm: &ShaderModelInfo) -> XbarDeps {
++    let mut deps = XbarDeps::default();
++    let mut block_in: Vec<Option<XbarDepState>> =
++        (0..f.blocks.len()).map(|_| None).collect();
++
++    for bi in 0..f.blocks.len() {
++        let mut st = block_in[bi].take().unwrap_or_default();
++        for (ip, instr) in f.blocks[bi].instrs.iter().enumerate() {
++            let mut waits = Vec::new();
++            if instr.is_branch() && !xbar_branch_keeps_bars(f, bi, ip, instr) {
++                waits.extend(st.active.iter().copied());
++            } else {
++                st.uses.for_each_instr_pred_mut(instr, |u| {
++                    waits.append(&mut u.writes);
++                });
++                if sm.op_needs_scoreboard(&instr.op) {
++                    let (rd, wr) = deps.add_instr(bi, ip);
++                    let mut has_src = false;
++                    let mut has_dst = false;
++                    st.uses.for_each_instr_src_mut(instr, |_, u| {
++                        has_src = true;
++                        waits.append(&mut u.writes);
++                        if !u.reads.contains(&rd) {
++                            u.reads.push(rd);
++                        }
++                    });
++                    st.uses.for_each_instr_dst_mut(instr, |_, u| {
++                        has_dst = true;
++                        waits.append(&mut u.writes);
++                        waits.extend(u.reads.drain(..).filter(|&d| d != rd));
++                        u.writes.push(wr);
++                    });
++                    if has_src {
++                        st.active.insert(rd);
++                    }
++                    if has_dst {
++                        st.active.insert(wr);
++                    }
++                } else {
++                    st.uses.for_each_instr_src_mut(instr, |_, u| {
++                        waits.append(&mut u.writes);
++                    });
++                    st.uses.for_each_instr_dst_mut(instr, |_, u| {
++                        waits.append(&mut u.writes);
++                        waits.append(&mut u.reads);
++                    });
++                }
++            }
++            deps.add_waits(&mut st.active, bi, ip, waits);
++        }
++
++        for &s in f.blocks.succ_indices(bi) {
++            if s > bi {
++                match &mut block_in[s] {
++                    Some(s_in) => s_in.merge(&st),
++                    None => block_in[s] = Some(st.clone()),
++                }
++            }
++        }
++    }
++    deps
++}
++
++#[derive(Clone, Copy, Default)]
++struct XbarPlan {
++    wt_bar_mask: u8,
++    rd_bar: Option<u8>,
++    wr_bar: Option<u8>,
++}
++
++/// Deps that may hold each scoreboard, merged over all forward paths
++#[derive(Clone, Default)]
++struct XbarBarState {
++    bars: [Vec<usize>; 6],
++}
++
++impl XbarBarState {
++    fn merge(&mut self, other: &Self) {
++        for (a, b) in self.bars.iter_mut().zip(other.bars.iter()) {
++            xbar_union(a, b);
++        }
++    }
++
++    fn wait(&mut self, mask: u8, read_dep: &[Option<usize>]) {
++        let mut done_reads = Vec::new();
++        for (b, bar) in self.bars.iter_mut().enumerate() {
++            if mask & (1 << b) != 0 {
++                done_reads.extend(bar.iter().filter_map(|d| read_dep[*d]));
++                bar.clear();
++            }
++        }
++        if !done_reads.is_empty() {
++            for bar in &mut self.bars {
++                bar.retain(|d| !done_reads.contains(d));
++            }
++        }
++    }
++
++    /// Pick a scoreboard that is free on every path, or wait on the one
++    /// holding the oldest dep.
++    fn alloc(
++        &mut self,
++        plan: &mut XbarPlan,
++        other: Option<u8>,
++        read_dep: &[Option<usize>],
++    ) -> u8 {
++        let mut oldest: Option<u8> = None;
++        for b in 0..6_u8 {
++            if Some(b) == other {
++                continue;
++            }
++            let bar = &self.bars[usize::from(b)];
++            if bar.is_empty() {
++                return b;
++            }
++            if oldest.is_none_or(|o| bar[0] < self.bars[usize::from(o)][0]) {
++                oldest = Some(b);
++            }
++        }
++        let b = oldest.unwrap();
++        plan.wt_bar_mask |= 1 << b;
++        self.wait(1 << b, read_dep);
++        b
++    }
++}
++
++/// Pass 2: scoreboard numbers and wait masks.
++fn xbar_assign_bars(
++    f: &Function,
++    sm: &ShaderModelInfo,
++    deps: &XbarDeps,
++) -> Vec<Vec<XbarPlan>> {
++    let mut plans: Vec<Vec<XbarPlan>> = f
++        .blocks
++        .iter()
++        .map(|b| vec![XbarPlan::default(); b.instrs.len()])
++        .collect();
++    let mut block_in: Vec<Option<XbarBarState>> =
++        (0..f.blocks.len()).map(|_| None).collect();
++
++    for bi in 0..f.blocks.len() {
++        let mut st = block_in[bi].take().unwrap_or_default();
++        for (ip, instr) in f.blocks[bi].instrs.iter().enumerate() {
++            let plan = &mut plans[bi][ip];
++            let mut mask = 0_u8;
++            if instr.is_branch() && !xbar_branch_keeps_bars(f, bi, ip, instr) {
++                for (b, bar) in st.bars.iter().enumerate() {
++                    if !bar.is_empty() {
++                        mask |= 1 << b;
++                    }
++                }
++            } else {
++                let waits = deps.instr_waits(bi, ip);
++                for (b, bar) in st.bars.iter().enumerate() {
++                    if bar.iter().any(|d| waits.binary_search(d).is_ok()) {
++                        mask |= 1 << b;
++                    }
++                }
++            }
++            st.wait(mask, &deps.read_dep);
++            plan.wt_bar_mask = mask;
++
++            if sm.op_needs_scoreboard(&instr.op) {
++                let (rd, wr) = deps.instr_deps[&(bi, ip)];
++                if deps.waited[rd] {
++                    let b = st.alloc(plan, None, &deps.read_dep);
++                    st.bars[usize::from(b)].push(rd);
++                    plan.rd_bar = Some(b);
++                }
++                if deps.waited[wr] {
++                    let rd_bar = plan.rd_bar;
++                    let b = st.alloc(plan, rd_bar, &deps.read_dep);
++                    st.bars[usize::from(b)].push(wr);
++                    plan.wr_bar = Some(b);
++                }
++            }
++        }
++
++        for &s in f.blocks.succ_indices(bi) {
++            if s > bi {
++                match &mut block_in[s] {
++                    Some(s_in) => s_in.merge(&st),
++                    None => block_in[s] = Some(st.clone()),
++                }
++            }
++        }
++    }
++    plans
++}
++
++/// The registers an instruction touches, as a bit set
++#[derive(Clone, Copy, Default)]
++struct XbarRegSet {
++    bits: [u64; 7],
++}
++
++impl XbarRegSet {
++    fn intersects(&self, other: &Self) -> bool {
++        self.bits.iter().zip(other.bits.iter()).any(|(a, b)| a & b != 0)
++    }
++}
++
++impl RegRefIterable<()> for XbarRegSet {
++    fn for_each_ref_mut(&mut self, reg: RegRef, mut f: impl FnMut(&mut ())) {
++        let base = match reg.file() {
++            RegFile::GPR => 0,
++            RegFile::UGPR => 256,
++            RegFile::Pred => 384,
++            RegFile::UPred => 392,
++            RegFile::Carry => 400,
++            RegFile::Bar => return, // Barriers have a HW scoreboard
++            RegFile::Mem => panic!("Not a register"),
++        };
++        for i in reg.idx_range() {
++            let bit = base + usize::try_from(i).unwrap();
++            self.bits[bit / 64] |= 1 << (bit % 64);
++            f(&mut ());
++        }
++    }
++}
++
++struct XbarEvent {
++    bar: Option<u8>,
++    is_write: bool,
++    /// For a write, the read event of the same instruction
++    read_event: Option<usize>,
++    regs: XbarRegSet,
++    at: (usize, usize),
++}
++
++/// Checks that, on every CFG path, no instruction touches a register that a
++/// scoreboarded instruction may still read or write.  A wait on a scoreboard
++/// completes everything on it; finishing a write also finishes the reads of
++/// the same instruction.  Independent of how the plan was made.
++fn xbar_verify(
++    f: &Function,
++    sm: &ShaderModelInfo,
++    plans: &[Vec<XbarPlan>],
++) -> Result<(), String> {
++    let mut events = Vec::new();
++    let mut instr_events = Vec::new();
++    for (bi, b) in f.blocks.iter().enumerate() {
++        let mut block_events = Vec::new();
++        for (ip, instr) in b.instrs.iter().enumerate() {
++            let mut new_events = Vec::new();
++            if sm.op_needs_scoreboard(&instr.op) {
++                let plan = &plans[bi][ip];
++                let mut srcs = XbarRegSet::default();
++                let mut src_count = 0;
++                srcs.for_each_instr_src_mut(instr, |_, _| src_count += 1);
++                let mut dsts = XbarRegSet::default();
++                let mut dst_count = 0;
++                dsts.for_each_instr_dst_mut(instr, |_, _| dst_count += 1);
++                let mut read_event = None;
++                if src_count > 0 {
++                    read_event = Some(events.len());
++                    new_events.push(events.len());
++                    events.push(XbarEvent {
++                        bar: plan.rd_bar,
++                        is_write: false,
++                        read_event: None,
++                        regs: srcs,
++                        at: (bi, ip),
++                    });
++                }
++                if dst_count > 0 {
++                    new_events.push(events.len());
++                    events.push(XbarEvent {
++                        bar: plan.wr_bar,
++                        is_write: true,
++                        read_event,
++                        regs: dsts,
++                        at: (bi, ip),
++                    });
++                }
++            }
++            block_events.push(new_events);
++        }
++        instr_events.push(block_events);
++    }
++
++    let words = events.len().div_ceil(64);
++    let step = |bi: usize,
++                ip: usize,
++                pending: &mut Vec<u64>,
++                check: bool|
++     -> Result<(), String> {
++        let instr = &f.blocks[bi].instrs[ip];
++        let mask = plans[bi][ip].wt_bar_mask;
++        if mask != 0 {
++            for e in 0..events.len() {
++                if pending[e / 64] & (1 << (e % 64)) == 0 {
++                    continue;
++                }
++                let ev = &events[e];
++                if ev.bar.is_some_and(|b| mask & (1 << b) != 0) {
++                    pending[e / 64] &= !(1 << (e % 64));
++                    if let Some(r) = ev.read_event {
++                        pending[r / 64] &= !(1 << (r % 64));
++                    }
++                }
++            }
++        }
++
++        if check {
++            let mut reads = XbarRegSet::default();
++            reads.for_each_instr_pred_mut(instr, |_| ());
++            reads.for_each_instr_src_mut(instr, |_, _| ());
++            let mut writes = XbarRegSet::default();
++            writes.for_each_instr_dst_mut(instr, |_, _| ());
++            for (e, ev) in events.iter().enumerate() {
++                if pending[e / 64] & (1 << (e % 64)) == 0 {
++                    continue;
++                }
++                let hazard = if ev.is_write && ev.regs.intersects(&reads) {
++                    "read after write"
++                } else if ev.is_write && ev.regs.intersects(&writes) {
++                    "write after write"
++                } else if !ev.is_write && ev.regs.intersects(&writes) {
++                    "write after read"
++                } else {
++                    continue;
++                };
++                let (pb, pi) = ev.at;
++                return Err(format!(
++                    "{hazard} hazard: block {bi} instr {ip} ({}) and \
++                     block {pb} instr {pi} ({})",
++                    instr, f.blocks[pb].instrs[pi],
++                ));
++            }
++        }
++
++        for &e in &instr_events[bi][ip] {
++            pending[e / 64] |= 1 << (e % 64);
++        }
++        Ok(())
++    };
++
++    let mut state_in = vec![vec![0_u64; words]; f.blocks.len()];
++    let mut state_out = vec![vec![0_u64; words]; f.blocks.len()];
++    ForwardDataflow {
++        cfg: &f.blocks,
++        block_in: &mut state_in[..],
++        block_out: &mut state_out[..],
++        transfer: |bi, block, out, pending_in| {
++            let mut pending = pending_in.clone();
++            for ip in 0..block.instrs.len() {
++                step(bi, ip, &mut pending, false).unwrap();
++            }
++            if *out == pending {
++                false
++            } else {
++                *out = pending;
++                true
++            }
++        },
++        join: |pending_in, pred_out| {
++            for (a, b) in pending_in.iter_mut().zip(pred_out.iter()) {
++                *a |= *b;
++            }
++        },
++    }
++    .solve();
++
++    for (bi, b) in f.blocks.iter().enumerate() {
++        let mut pending = state_in[bi].clone();
++        for ip in 0..b.instrs.len() {
++            step(bi, ip, &mut pending, true)?;
++        }
++    }
++    Ok(())
++}
++
++fn xbar_plans_from_deps(f: &Function) -> Vec<Vec<XbarPlan>> {
++    f.blocks
++        .iter()
++        .map(|b| {
++            b.instrs
++                .iter()
++                .map(|i| XbarPlan {
++                    wt_bar_mask: i.deps.wt_bar_mask,
++                    rd_bar: i.deps.rd_bar(),
++                    wr_bar: i.deps.wr_bar(),
++                })
++                .collect()
++        })
++        .collect()
++}
++
++/// Runs assign_barriers(), then replaces its result with the cross-block
++/// one if both pass xbar_verify().  Returns why it kept the legacy result.
++fn assign_barriers_xbar(
++    f: &mut Function,
++    sm: &ShaderModelInfo,
++) -> Result<(), String> {
++    let saved: Vec<Vec<(u8, bool, u8, u8)>> = f
++        .blocks
++        .iter()
++        .map(|b| {
++            b.instrs
++                .iter()
++                .map(|i| {
++                    let d = &i.deps;
++                    (d.delay, d.yld, d.wt_bar_mask, d.reuse_mask)
++                })
++                .collect()
++        })
++        .collect();
++
++    assign_barriers(f, sm);
++    xbar_verify(f, sm, &xbar_plans_from_deps(f))
++        .map_err(|e| format!("verifier rejected legacy barriers: {e}"))?;
++
++    xbar_check_cfg(f)?;
++    let deps = xbar_calc_waits(f, sm);
++    let plans = xbar_assign_bars(f, sm, &deps);
++    xbar_verify(f, sm, &plans)?;
++
++    for (bi, b) in f.blocks.iter_mut().enumerate() {
++        for (ip, instr) in b.instrs.iter_mut().enumerate() {
++            let (delay, yld, wt_bar_mask, reuse_mask) = saved[bi][ip];
++            let plan = &plans[bi][ip];
++            instr.deps = InstrDeps::new();
++            instr.deps.delay = delay;
++            instr.deps.yld = yld || instr.needs_yield();
++            instr.deps.wt_bar_mask = wt_bar_mask;
++            instr.deps.reuse_mask = reuse_mask;
++            instr.deps.add_wt_bar_mask(plan.wt_bar_mask);
++            if let Some(bar) = plan.rd_bar {
++                instr.deps.set_rd_bar(bar);
++            }
++            if let Some(bar) = plan.wr_bar {
++                instr.deps.set_wr_bar(bar);
++            }
++        }
++    }
++    Ok(())
++}
++
+ #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+ struct RegOrigin {
+     loc: InstrIdx,
+@@ -1101,9 +1672,17 @@ impl Shader<'_> {
+         if DEBUG.serial() {
+             self.assign_deps_serial();
+         } else {
++            let xbar =
++                DEBUG.xbar() && (self.sm.is_maxwell() || self.sm.is_pascal());
+             let mut min_num_static_cycles = 0u64;
+             for f in &mut self.functions {
+-                assign_barriers(f, self.sm);
++                if xbar {
++                    if let Err(e) = assign_barriers_xbar(f, self.sm) {
++                        eprintln!("NAK xbar: kept legacy barriers: {e}");
++                    }
++                } else {
++                    assign_barriers(f, self.sm);
++                }
+                 min_num_static_cycles += calc_delays(f, self.sm);
+             }
+ 
+@@ -1198,4 +1777,225 @@ mod tests {
+             Some(OpTexDepBar::MAX_TEXTURES_LEFT)
+         );
+     }
++
++    use compiler::cfg::CFGBuilder;
++    use rustc_hash::FxBuildHasher;
++
++    fn xbar_mufu(dst: usize, src: usize) -> Instr {
++        Instr::new(OpMuFu {
++            dst: reg_gpr(dst..dst + 1).into(),
++            op: MuFuOp::Rcp,
++            src: reg_gpr(src..src + 1).into(),
++            op_type: FloatType::F32,
++        })
++    }
++
++    fn xbar_mov(dst: usize, src: usize) -> Instr {
++        Instr::new(OpMov {
++            dst: reg_gpr(dst..dst + 1).into(),
++            src: reg_gpr(src..src + 1).into(),
++            quad_lanes: 0xf,
++        })
++    }
++
++    fn xbar_bra(target: Label) -> Instr {
++        Instr::new(OpBra {
++            target,
++            cond: RegRef::new(RegFile::Pred, 0, 1).into(),
++        })
++    }
++
++    /// Builds a function from each block's instructions and successors, in
++    /// that block order.  `build` gets the block labels for branch targets.
++    fn xbar_function(
++        num_blocks: usize,
++        build: impl FnOnce(&[Label]) -> Vec<(Vec<Instr>, Vec<usize>)>,
++    ) -> Function {
++        let mut label_alloc = LabelAllocator::new();
++        let labels: Vec<Label> =
++            (0..num_blocks).map(|_| label_alloc.alloc()).collect();
++        let blocks = build(&labels);
++        assert_eq!(blocks.len(), num_blocks);
++        let mut cfg = CFGBuilder::<_, _, FxBuildHasher>::new();
++        let mut edges = Vec::new();
++        for (bi, (instrs, succs)) in blocks.into_iter().enumerate() {
++            let label = labels[bi];
++            let uniform = false;
++            cfg.add_node(bi, BasicBlock { label, uniform, instrs });
++            edges.extend(succs.into_iter().map(|s| (bi, s)));
++        }
++        for (p, s) in edges {
++            cfg.add_edge(p, s);
++        }
++        Function {
++            ssa_alloc: SSAValueAllocator::new(),
++            phi_alloc: PhiAllocator::new(),
++            blocks: cfg.as_cfg(false),
++        }
++    }
++
++    fn xbar_sm() -> ShaderModelInfo {
++        ShaderModelInfo::new(53, 64)
++    }
++
++    fn xbar_mask(f: &Function, bi: usize, ip: usize) -> u8 {
++        f.blocks[bi].instrs[ip].deps.wt_bar_mask
++    }
++
++    fn xbar_bit(f: &Function, bi: usize, ip: usize, write: bool) -> u8 {
++        let deps = &f.blocks[bi].instrs[ip].deps;
++        let bar = if write { deps.wr_bar() } else { deps.rd_bar() };
++        1 << bar.unwrap()
++    }
++
++    // if (p0) { r1 = rcp(r0) } else { r1 = rcp(r2) }; r0 = r4; r3 = r1
++    fn xbar_if_else() -> Function {
++        xbar_function(4, |l| {
++            vec![
++                (vec![Instr::new(OpSSy { target: l[3] }), xbar_bra(l[2])], {
++                    vec![1, 2]
++                }),
++                (
++                    vec![xbar_mufu(1, 0), Instr::new(OpSync { target: l[3] })],
++                    vec![3],
++                ),
++                (
++                    vec![xbar_mufu(1, 2), Instr::new(OpSync { target: l[3] })],
++                    vec![3],
++                ),
++                (
++                    vec![xbar_mov(0, 4), xbar_mov(3, 1), Instr::new(OpExit {})],
++                    vec![],
++                ),
++            ]
++        })
++    }
++
++    #[test]
++    fn test_xbar_if_else() {
++        let sm = xbar_sm();
++
++        let mut legacy = xbar_if_else();
++        assign_barriers(&mut legacy, &sm);
++        assert_ne!(xbar_mask(&legacy, 1, 1), 0);
++        assert_ne!(xbar_mask(&legacy, 2, 1), 0);
++        xbar_verify(&legacy, &sm, &xbar_plans_from_deps(&legacy)).unwrap();
++
++        let mut f = xbar_if_else();
++        assign_barriers_xbar(&mut f, &sm).unwrap();
++        // Neither SYNC waits
++        assert_eq!(xbar_mask(&f, 1, 1), 0);
++        assert_eq!(xbar_mask(&f, 2, 1), 0);
++        // r0 = r4 waits for the then-side rcp to read r0
++        assert_eq!(xbar_mask(&f, 3, 0), xbar_bit(&f, 1, 0, false));
++        // By r3 = r1, both rcps have written r1
++        let waited = xbar_mask(&f, 3, 0) | xbar_mask(&f, 3, 1);
++        assert_ne!(waited & xbar_bit(&f, 1, 0, true), 0);
++        assert_ne!(waited & xbar_bit(&f, 2, 0, true), 0);
++        assert!(f.blocks[2].instrs[0].deps.rd_bar().is_none());
++        xbar_verify(&f, &sm, &xbar_plans_from_deps(&f)).unwrap();
++    }
++
++    #[test]
++    fn test_xbar_verify_rejects_missing_waits() {
++        let sm = xbar_sm();
++        let mut f = xbar_if_else();
++        assign_barriers_xbar(&mut f, &sm).unwrap();
++        let plans = xbar_plans_from_deps(&f);
++
++        let mut no_raw = plans.clone();
++        no_raw[3][1].wt_bar_mask = 0;
++        let err = xbar_verify(&f, &sm, &no_raw).unwrap_err();
++        assert!(err.starts_with("read after write"), "{err}");
++
++        let mut no_war = plans;
++        no_war[3][0].wt_bar_mask = 0;
++        let err = xbar_verify(&f, &sm, &no_war).unwrap_err();
++        assert!(err.starts_with("write after read"), "{err}");
++
++        // Dropping assign_barriers()'s wait at a SYNC, without waiting after
++        // the join instead, is unsafe.
++        let mut legacy = xbar_if_else();
++        assign_barriers(&mut legacy, &sm);
++        let mut no_sync = xbar_plans_from_deps(&legacy);
++        no_sync[1][1].wt_bar_mask = 0;
++        assert!(xbar_verify(&legacy, &sm, &no_sync).is_err());
++    }
++
++    #[test]
++    fn test_xbar_join_keeps_unrelated_bars() {
++        // if (p0) { r1 = rcp(r0) }; r4 = rcp(r5); r6 = r4; r7 = r1
++        let sm = xbar_sm();
++        let mut f = xbar_function(4, |l| {
++            vec![
++                (vec![Instr::new(OpSSy { target: l[3] }), xbar_bra(l[2])], {
++                    vec![1, 2]
++                }),
++                (
++                    vec![xbar_mufu(1, 0), Instr::new(OpSync { target: l[3] })],
++                    vec![3],
++                ),
++                (vec![Instr::new(OpSync { target: l[3] })], vec![3]),
++                (
++                    vec![
++                        xbar_mufu(4, 5),
++                        xbar_mov(6, 4),
++                        xbar_mov(7, 1),
++                        Instr::new(OpExit {}),
++                    ],
++                    vec![],
++                ),
++            ]
++        });
++        assign_barriers_xbar(&mut f, &sm).unwrap();
++        assert_eq!(xbar_mask(&f, 1, 1), 0);
++        // The rcp after the join can't reuse the scoreboard that the
++        // then-side rcp may still hold, so r6 = r4 doesn't wait for it.
++        assert_ne!(xbar_bit(&f, 3, 0, true), xbar_bit(&f, 1, 0, true));
++        assert_eq!(xbar_mask(&f, 3, 1), xbar_bit(&f, 3, 0, true));
++        assert_eq!(xbar_mask(&f, 3, 2), xbar_bit(&f, 1, 0, true));
++    }
++
++    #[test]
++    fn test_xbar_back_edge_waits() {
++        // r1 = rcp(r0); do { r2 = r1; r1 = rcp(r2) } while (p0); r3 = r1
++        let sm = xbar_sm();
++        let mut f = xbar_function(3, |l| {
++            vec![
++                (vec![xbar_mufu(1, 0)], vec![1]),
++                (
++                    vec![xbar_mov(2, 1), xbar_mufu(1, 2), xbar_bra(l[1])],
++                    vec![2, 1],
++                ),
++                (vec![xbar_mov(3, 1), Instr::new(OpExit {})], vec![]),
++            ]
++        });
++        assign_barriers_xbar(&mut f, &sm).unwrap();
++        assert_eq!(xbar_mask(&f, 1, 0), xbar_bit(&f, 0, 0, true));
++        assert_eq!(xbar_mask(&f, 1, 2), xbar_bit(&f, 1, 1, true));
++    }
++
++    #[test]
++    fn test_xbar_matches_legacy_in_one_block() {
++        // Eight rcps in flight, more than there are scoreboards
++        let build = || {
++            xbar_function(1, |_| {
++                let mut instrs: Vec<Instr> =
++                    (10..18).map(|r| xbar_mufu(r, 0)).collect();
++                instrs.extend((10..18).map(|r| xbar_mov(r + 10, r)));
++                instrs.push(Instr::new(OpExit {}));
++                vec![(instrs, vec![])]
++            })
++        };
++        let sm = xbar_sm();
++        let mut legacy = build();
++        assign_barriers(&mut legacy, &sm);
++        let mut f = build();
++        assign_barriers_xbar(&mut f, &sm).unwrap();
++        for (a, b) in legacy.blocks[0].instrs.iter().zip(&f.blocks[0].instrs) {
++            assert_eq!(a.deps.wt_bar_mask, b.deps.wt_bar_mask, "{b}");
++            assert_eq!(a.deps.rd_bar(), b.deps.rd_bar(), "{b}");
++            assert_eq!(a.deps.wr_bar(), b.deps.wr_bar(), "{b}");
++        }
++    }
+ }

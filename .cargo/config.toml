@@ -1,0 +1,11 @@
+[env]
+CC_aarch64_nintendo_horizon = "aarch64-none-elf-gcc"
+CFLAGS_aarch64_nintendo_horizon = "-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE"
+
+# std is built from source (-Z build-std) as its own Cargo workspace, which doesn't see the
+# [patch] in our Cargo.toml, so it used to get crates.io's libc, whose Horizon types are the 3DS's.
+# A [patch] in a config file applies to every workspace Cargo loads, std's included. std's Cargo.lock
+# still pins crates.io's libc, so scripts/build_example.sh runs `cargo update -p libc` on std's
+# workspace first. Our libc's Horizon types match devkitA64's newlib (doc 12 in the findings).
+[patch.crates-io]
+libc = { path = "patches/libc" }

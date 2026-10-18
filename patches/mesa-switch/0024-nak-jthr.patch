@@ -1,0 +1,126 @@
+bevy-horizon: thread jumps and drop branches to the next block before Volta (NAK_DEBUG=jthr)
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 606441c9, after 0001-0023. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+Before Volta, an if whose threads may split pushes a reconvergence point with SSY and ends each
+side with SYNC. With NAK_DEBUG=ubra (0006), an if whose condition is the same in every thread
+uses plain BRAs instead. from_nir ends every block with a jump, though. From Volta on,
+opt_jump_thread then sends jumps past blocks that only branch on and drops branches to the
+next block; before Volta it never runs, because it can't move a SYNC, BRK or CONT. So with ubra
+the world shader of sk8, a Skate 3 port, keeps 35 BRAs to the next block and 23 blocks that only
+branch on. On Maxwell each control op holds its warp 13 cycles, and NAK puts a 2-cycle NOP
+after it.
+
+With NAK_DEBUG=jthr, jump threading runs before Volta too, after opt_crs. Only a block that
+holds just a BRA or an EXIT is jumped past, and only BRAs are retargeted. SYNC, BRK and CONT keep
+their targets, and rewrite_cfg keeps their edges, so the CRS stack is pushed and popped as
+before and every SSY, PBK and PCNT target stays. from_nir emits a plain BRA only to a block on no
+CRS entry, so a BRA never leaves an SSY or PBK region, and neither does a chain of them. Then,
+whether or not anything was threaded, branches to the next block are dropped, as Mesa's older
+Maxwell compiler does (CodeEmitter::prepareEmission() in nv50_ir_target.cpp).
+
+Compiled on the host with the Switch flags and ubra, sk8's world fragment shaders lose 30-120
+instructions each (2,020 to 1,900 for the one with every feature), its water 4,242 to 4,040, and
+its compute kernels 14-42; registers, warps and spills don't change. In the world shader with
+feature mask 254, control ops go from 119 to 70 (153 without ubra); the 166 fewer instructions
+than without either flag are those ops and their NOPs. Without ubra, jthr drops 1-6 branches per
+shader.
+
+It is off by default, in Switch builds too, until a run on a Switch shows it is faster.
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 2cdf204..b7058c0 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -41,9 +41,10 @@ enum DebugFlags {
+     OFold,
+     WgBar,
+     Share,
++    JThr,
+ }
+ 
+-const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 19] = [
++const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 20] = [
+     ("panic", DebugFlags::Panic),
+     ("print", DebugFlags::Print),
+     ("serial", DebugFlags::Serial),
+@@ -63,6 +64,7 @@ const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 19] = [
+     ("ofold", DebugFlags::OFold),
+     ("wgbar", DebugFlags::WgBar),
+     ("share", DebugFlags::Share),
++    ("jthr", DebugFlags::JThr),
+ ];
+ 
+ /// The flags NAK_DEBUG starts from. Switch builds (meson sets
+@@ -199,6 +201,10 @@ pub trait GetDebugFlags {
+     fn share(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::Share as u8) != 0
+     }
++
++    fn jthr(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::JThr as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+@@ -722,6 +728,9 @@ fn nak_compile_shader_internal(
+         pass!(s, opt_jump_thread);
+     } else {
+         pass!(s, opt_crs);
++        if DEBUG.jthr() {
++            pass!(s, opt_jump_thread_pre_volta);
++        }
+     }
+ 
+     s.remove_annotations();
+diff --git a/src/nouveau/compiler/nak/opt_jump_thread.rs b/src/nouveau/compiler/nak/opt_jump_thread.rs
+index b484fde..8d2f856 100644
+--- a/src/nouveau/compiler/nak/opt_jump_thread.rs
++++ b/src/nouveau/compiler/nak/opt_jump_thread.rs
+@@ -73,7 +73,11 @@ fn jump_thread(func: &mut Function) -> bool {
+         let block_label = func.blocks[i].label;
+         match &func.blocks[i].instrs[..] {
+             [instr] => {
+-                if instr.is_branch_always_taken() {
++                // Before Volta a lone SYNC, BRK or CONT always branches too,
++                // but it pops the CRS stack, so it can't stand in for a BRA.
++                if instr.is_branch_always_taken()
++                    && matches!(instr.op, Op::Bra(_) | Op::Exit(_))
++                {
+                     // Upholds invariant 2 because we updated the branch above
+                     replacements.insert(block_label, clone_branch(&instr.op));
+                 }
+@@ -127,6 +131,12 @@ fn rewrite_cfg(func: &mut Function) {
+                     builder.add_edge(block.label, bra.target);
+                 }
+                 Op::Exit(_) => (),
++                // Before Volta, the jump to the target the CRS stack holds
++                Op::Sync(OpSync { target })
++                | Op::Brk(OpBrk { target })
++                | Op::Cont(OpCont { target }) => {
++                    builder.add_edge(block.label, *target);
++                }
+                 _ => unreachable!(),
+             };
+         }
+@@ -172,4 +182,18 @@ impl Shader<'_> {
+             f.opt_jump_thread();
+         }
+     }
++
++    /// Jump threading before Volta (NAK_DEBUG=jthr), after opt_crs.
++    ///
++    /// With NAK_DEBUG=ubra a uniform if branches with plain BRAs, which leave
++    /// branches to the next block and blocks that only branch on. Only BRAs
++    /// and EXITs move: SYNC, BRK and CONT keep their targets, so the CRS
++    /// stack is pushed and popped as before. Branches to the next block go
++    /// whether or not anything was threaded.
++    pub fn opt_jump_thread_pre_volta(&mut self) {
++        for f in &mut self.functions {
++            jump_thread(f);
++            opt_fall_through(f);
++        }
++    }
+ }

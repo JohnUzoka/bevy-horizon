@@ -1,0 +1,215 @@
+bevy-horizon: NAK_DEBUG=lsink, fragment inputs read inside the large loop that uses them
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 606441c9, after 0001 to 0010. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+0005's NAK_DEBUG=sink interpolates each fragment input where it is first used, but
+nir_opt_sink never moves anything into a loop, and nir_opt_gcm, given NAK's
+hoist_tex_from_loops, lifts every texture instruction out of one. So in a shader whose body is
+one large loop, the inputs and texture size queries it reads stay live across the whole loop,
+back edge included.
+
+NAK_DEBUG=lsink adds nak_nir_sink_inputs_into_loops, run just after sink. A fragment input
+(load_interpolated_input, load_input or load_frag_coord) whose uses all lie inside a loop of 100
+instructions or more that the load is not in moves to the block that dominates them all, or to
+just before a smaller loop inside that one which holds them all. 100 is GCM's own
+MAX_LOOP_INSTRUCTIONS: GCM hoists such work out of smaller loops anyway. lsink also passes
+hoist_tex_from_loops = false to nir_opt_gcm, so texture instructions leave only the smaller
+loops, as ALU does. Each trip then interpolates or queries again, which gives the same value
+wherever it runs (NAK lowers discard to demote), so no output changes.
+
+Skate 3's world fragment shader under SKATE_WORLD_SLOT_WATERFALL is one such loop: each trip
+shades the subgroup's first material. On SM53 with perf14's NAK_DEBUG (xbar,sink,remat,xbrk) it
+needed 64 GPRs, so 32 warps, against 56 GPRs and 36 warps without the loop, though about 55
+values are live at once in either. With lsink it needs 56 and keeps 36 warps: 2134 instructions
+and 15812 static cycles, against 2510 and 25119 without the loop. Every other shader in the
+game's set (world, cutout, water, depth and Bevy's mesh) is within ten instructions of before,
+in the same registers. No shader failed to compile or validate on the PC (nakhost, SM53, debug
+build with assertions and NIR validation). Not yet run on hardware; off unless set. NVK's
+shader cache key includes the NAK_DEBUG flags, so shaders built with and without it are cached
+separately.
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -35,6 +35,7 @@
+     Remat,
+     UBra,
+     XBrk,
++    LSink,
+ }
+ 
+ pub struct Debug {
+@@ -68,6 +69,7 @@
+                 "remat" => flags |= 1 << DebugFlags::Remat as u8,
+                 "ubra" => flags |= 1 << DebugFlags::UBra as u8,
+                 "xbrk" => flags |= 1 << DebugFlags::XBrk as u8,
++                "lsink" => flags |= 1 << DebugFlags::LSink as u8,
+                 unk => eprintln!("Unknown NAK_DEBUG flag \"{}\"", unk),
+             }
+         }
+@@ -133,6 +135,10 @@
+     fn xbrk(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::XBrk as u8) != 0
+     }
++
++    fn lsink(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::LSink as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+@@ -163,6 +169,11 @@
+     DEBUG.remat()
+ }
+ 
++#[no_mangle]
++pub extern "C" fn nak_debug_lsink() -> bool {
++    DEBUG.lsink()
++}
++
+ fn nir_options(dev: &nv_device_info) -> nir_shader_compiler_options {
+     nir_shader_compiler_options {
+         lower_fdiv: true,
+diff --git a/src/nouveau/compiler/nak_private.h b/src/nouveau/compiler/nak_private.h
+--- a/src/nouveau/compiler/nak_private.h
++++ b/src/nouveau/compiler/nak_private.h
+@@ -18,6 +18,7 @@
+ bool nak_debug_no_ugpr(void);
+ bool nak_debug_sink(void);
+ bool nak_debug_remat(void);
++bool nak_debug_lsink(void);
+ 
+ struct nak_compiler {
+    uint8_t sm;
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -237,7 +237,10 @@
+          LOOP_OPT_NOT_IDEMPOTENT(nir, nir_opt_loop_unroll);
+       }
+       LOOP_OPT(nir, nir_opt_remove_phis);
+-      LOOP_OPT_NOT_IDEMPOTENT(nir, nir_opt_gcm, false, true);
++      /* NAK_DEBUG=lsink also keeps texture instructions in large loops:
++       * hoisted, their results are live across the whole loop.
++       */
++      LOOP_OPT_NOT_IDEMPOTENT(nir, nir_opt_gcm, false, !nak_debug_lsink());
+       LOOP_OPT(nir, nir_opt_undef);
+    } while (progress);
+    OPT(nir, nir_lower_undef_to_zero, NULL);
+@@ -1663,6 +1666,105 @@
+    return nir_progress(true, impl, nir_metadata_none);
+ }
+ 
++/* The same threshold as nir_opt_gcm's MAX_LOOP_INSTRUCTIONS: GCM hoists
++ * instructions out of smaller loops again, and leaves them in larger ones.
++ */
++#define NAK_LSINK_MIN_LOOP_INSTRS 100
++
++static bool
++cf_node_is_inside(const nir_cf_node *node, const nir_cf_node *ancestor)
++{
++   for (; node != NULL; node = node->parent) {
++      if (node == ancestor)
++         return true;
++   }
++   return false;
++}
++
++static unsigned
++loop_instr_count(nir_loop *loop)
++{
++   unsigned count = 0;
++   nir_foreach_block_in_cf_node(block, &loop->cf_node)
++      count += exec_list_length(&block->instr_list);
++   return count;
++}
++
++/* NAK_DEBUG=lsink: a fragment input read only inside a large loop is read
++ * there.  nir_opt_sink never sinks into a loop, so such a value stays live
++ * across the whole loop, back edge included, rather than until its last use.
++ * Interpolating it again on each trip costs an IPA; it gives the same value
++ * wherever it runs (discard is a demote here), so this changes no output.
++ */
++static bool
++nak_nir_sink_inputs_into_loops(nir_shader *nir)
++{
++   bool progress = false;
++
++   nir_foreach_function_impl(impl, nir) {
++      bool impl_progress = false;
++      nir_metadata_require(impl, nir_metadata_block_index |
++                                 nir_metadata_dominance |
++                                 nir_metadata_dominance_lca);
++
++      nir_foreach_block_reverse(block, impl) {
++         nir_foreach_instr_reverse_safe(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++
++            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
++            if (intrin->intrinsic != nir_intrinsic_load_interpolated_input &&
++                intrin->intrinsic != nir_intrinsic_load_input &&
++                intrin->intrinsic != nir_intrinsic_load_frag_coord)
++               continue;
++
++            /* nir_src_get_block gives a phi source's predecessor. */
++            nir_block *lca = NULL;
++            nir_foreach_use_including_if(use, &intrin->def)
++               lca = nir_dominance_lca(lca, nir_src_get_block(use));
++            if (lca == NULL || lca == block)
++               continue;
++
++            /* The outermost loop around every use that the load is not in,
++             * and the outermost loop inside that one around them all.
++             */
++            nir_loop *loop = NULL, *inner = NULL;
++            for (nir_cf_node *node = lca->cf_node.parent; node != NULL;
++                 node = node->parent) {
++               if (node->type != nir_cf_node_loop)
++                  continue;
++               if (cf_node_is_inside(&block->cf_node, node))
++                  break;
++               inner = loop;
++               loop = nir_cf_node_as_loop(node);
++            }
++            if (loop == NULL ||
++                loop_instr_count(loop) < NAK_LSINK_MIN_LOOP_INSTRS)
++               continue;
++
++            /* Read once a trip of the large loop, not once a trip of a loop
++             * inside it: just before that one, which dominates every use.
++             */
++            nir_cursor cursor = nir_after_phis(lca);
++            if (inner != NULL) {
++               nir_block *before =
++                  nir_cf_node_as_block(nir_cf_node_prev(&inner->cf_node));
++               cursor = nir_after_block_before_jump(before);
++            }
++
++            nir_instr_remove(instr);
++            nir_instr_insert(cursor, instr);
++            impl_progress = true;
++         }
++      }
++
++      progress |= nir_progress(impl_progress, impl,
++                               nir_metadata_control_flow);
++   }
++
++   return progress;
++}
++
+ void
+ nak_postprocess_nir(nir_shader *nir,
+                     const struct nak_compiler *nak,
+@@ -1829,6 +1931,8 @@
+          OPT(nir, nir_opt_sink, nir_move_load_input | nir_move_load_frag_coord);
+          OPT(nir, nir_opt_move, nir_move_load_input | nir_move_load_frag_coord);
+       }
++      if (nak_debug_lsink() && OPT(nir, nak_nir_sink_inputs_into_loops))
++         OPT(nir, nir_opt_move, nir_move_load_input | nir_move_load_frag_coord);
+       OPT(nir, nak_nir_lower_fs_inputs, nak, fs_key);
+       OPT(nir, nak_nir_lower_fs_outputs);
+       break;

@@ -6,11 +6,68 @@ license = "MIT OR Apache-2.0"
 description = "Nintendo Switch (Horizon OS) runtime plugin for Bevy Engine"
 
 [dependencies]
-bevy_app = { version = "0.19.0", default-features = false }
-bevy_ecs = { version = "0.19.0", default-features = false }
-bevy_input = { version = "0.19.0", default-features = false }
-bevy_window = { version = "0.19.0", default-features = false }
+# Bevy 0.19, with the `bevy_0_19` feature (the default).
+bevy_app = { version = "0.19.0", default-features = false, optional = true }
+bevy_ecs = { version = "0.19.0", default-features = false, optional = true }
+# input.rs uses bevy_input::gamepad; without this it only built when the game enabled bevy/gamepad.
+bevy_input = { version = "0.19.0", default-features = false, features = ["gamepad"], optional = true }
+bevy_window = { version = "0.19.0", default-features = false, optional = true }
+# Patched (patches/bevy_tasks): lifecycle.rs joins the global task pools' threads at exit.
+bevy_tasks = { version = "0.19.1", default-features = false, optional = true }
+# Only with the `fps_overlay` feature: Bevy's own FPS overlay (fps_overlay.rs).
+bevy_dev_tools = { version = "0.19.0", default-features = false, optional = true }
+# Only with the `render` feature: upload pacing (uploads.rs). A game that draws has these already.
+bevy_asset = { version = "0.19.0", default-features = false, optional = true }
+bevy_mesh = { version = "0.19.0", default-features = false, optional = true }
+bevy_render = { version = "0.19.0", default-features = false, optional = true }
+# Bevy 0.18, with the `bevy_0_18` feature, for games still on it. lib.rs gives these the names
+# above, so the rest of the crate is the same for both. bevy_tasks 0.18 is patched too
+# (patches/bevy-0.18/bevy_tasks). `std` (absent on bevy_tasks) gives bevy_math's glam its math backend; a game's Bevy
+# turns it on anyway, but without it bevy_horizon doesn't build on its own.
+bevy_app_018 = { package = "bevy_app", version = "0.18.1", default-features = false, features = ["std"], optional = true }
+bevy_ecs_018 = { package = "bevy_ecs", version = "0.18.1", default-features = false, features = ["std"], optional = true }
+bevy_input_018 = { package = "bevy_input", version = "0.18.1", default-features = false, features = ["gamepad", "std"], optional = true }
+bevy_window_018 = { package = "bevy_window", version = "0.18.1", default-features = false, features = ["std"], optional = true }
+bevy_tasks_018 = { package = "bevy_tasks", version = "0.18.1", default-features = false, optional = true }
+# Only with `render_0_18`, the 0.18 `render`.
+bevy_asset_018 = { package = "bevy_asset", version = "0.18.1", default-features = false, optional = true }
+bevy_mesh_018 = { package = "bevy_mesh", version = "0.18.1", default-features = false, optional = true }
+bevy_render_018 = { package = "bevy_render", version = "0.18.1", default-features = false, optional = true }
 tracing = { version = "0.1", default-features = false }
 
+[features]
+default = ["bevy_0_19"]
+# Which Bevy the game uses; exactly one. A Bevy 0.18 game turns the default off:
+# `bevy_horizon = { ..., default-features = false, features = ["bevy_0_18", "vulkan"] }`.
+bevy_0_19 = ["dep:bevy_app", "dep:bevy_ecs", "dep:bevy_input", "dep:bevy_window", "dep:bevy_tasks"]
+bevy_0_18 = [
+    "dep:bevy_app_018",
+    "dep:bevy_ecs_018",
+    "dep:bevy_input_018",
+    "dep:bevy_window_018",
+    "dep:bevy_tasks_018",
+]
+# Bevy's FPS overlay (bevy_dev_tools), hidden at launch; hold (−) and press (+) to show or hide it.
+# Bevy 0.19 only.
+fps_overlay = ["dep:bevy_dev_tools"]
+# Paces GPU uploads for the Switch, where GPU memory comes out of the game's own malloc heap
+# (uploads.rs): new meshes reach the GPU at most 32 MiB a frame, wgpu's upload copies are freed
+# after each frame that loads, and Bevy's `RenderAssetBytesPerFrame` defaults to 64 MiB. For games
+# that draw with bevy_render. `render` is for Bevy 0.19; a Bevy 0.18 game turns on `render_0_18`.
+render = ["dep:bevy_asset", "dep:bevy_mesh", "dep:bevy_render"]
+render_0_18 = ["dep:bevy_asset_018", "dep:bevy_mesh_018", "dep:bevy_render_018"]
+# Links NVK, mesa-switch's Vulkan driver (nvk/lib/libvulkan_bh.a from scripts/build_nvk.sh and
+# scripts/localize_nvk.sh, or the directory in BEVY_HORIZON_NVK_LIB), so bevy_render can draw
+# through wgpu's Vulkan backend. Without it, wgpu finds no driver; the rest of Bevy still runs.
+vulkan = []
+# Rust's blocks of 256 KiB and up go in the top-down region at the top of the heap, where NVK takes
+# GPU memory from, instead of between malloc's small blocks: the part mmap plays for a desktop
+# malloc, which newlib's lacks (allocator.rs). Freed after loading, they leave runs GPU memory can
+# use, not holes it can't. Blocks of up to 8 KiB stay in a cache when freed, so threads don't all
+# queue for malloc's one lock (allocator/small_blocks.rs; BH_ALLOC_CACHE=0 turns it off). This sets
+# the `#[global_allocator]`, so a game with its own can't use it.
+top_down_alloc = ["vulkan"]
+
 [target.'cfg(target_os = "horizon")'.dependencies]
-# Low-level libnx bindings when targeting Nintendo Switch
+# window.rs: the Horizon handles come from patches/raw-window-handle.
+raw-window-handle = { version = "0.6", default-features = false }

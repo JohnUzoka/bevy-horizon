@@ -1,0 +1,317 @@
+bevy-horizon: NAK_DEBUG=sink and NAK_DEBUG=remat, fewer live registers in fragment shaders
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at d4a00ea0ab3f59afb967cc5d779e4263d237bd77, after 0001 to 0004. scripts/build_nvk.sh applies
+it; this text before the first "diff --git" line is ignored by git apply.
+
+NAK_DEBUG=sink runs nir_opt_sink and nir_opt_move on a fragment shader's inputs just before
+nak_nir_lower_fs_inputs, so each input is interpolated where it is first used rather than at
+the top of the shader. An IPA gives the same value wherever it runs, and NAK lowers discard to
+demote, so moving it changes no output.
+
+NAK_DEBUG=remat adds nak_nir_rematerialize_bools, run after the last nir_opt_cse. A switch
+becomes one "selector == k" compare per case. CSE leaves them all in the switch's block, where
+the default test uses them, so each stays live until its case is reached; Maxwell has seven
+predicates and NAK spills the rest to general registers. The pass clones each compare against a
+constant, and any iand/ior/ixor/inot of them up to three deep, into every other block that uses
+it, so only the selector stays live. nir_opt_rematerialize_compares does this only for compares
+used by nothing but bcsel and if, which a switch's compares are not.
+
+On Skate 3's world fragment shader (SM53), NAK_DEBUG=stats went from 3708 instructions, 64 GPRs
+and 60 spills to 3468 instructions and no spills with remat. With sink as well (and the game
+reading one late vec4 where it is used) it needs 56 GPRs, so 36 warps fit rather than 32. The
+water shader went from 128 GPRs and 168 spills to 112 and none. No shader in the game's set got
+longer or used more registers. Both passes only move or repeat instructions without side
+effects, so every result is unchanged.
+
+Both are opt-in, like xbar. NVK's shader cache key includes the NAK_DEBUG flags, so shaders
+built with and without them are cached separately.
+
+diff --git a/src/nouveau/compiler/meson.build b/src/nouveau/compiler/meson.build
+--- a/src/nouveau/compiler/meson.build
++++ b/src/nouveau/compiler/meson.build
+@@ -30,6 +30,7 @@
+   'nak_nir_lower_tex.c',
+   'nak_nir_lower_vtg_io.c',
+   'nak_nir_mark_lcssa_invariants.c',
++  'nak_nir_rematerialize_bools.c',
+   'nak_nir_rematerialize_load_const.c',
+ )
+ 
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -31,6 +31,8 @@
+     Stats,
+     XBar,
+     Final,
++    Sink,
++    Remat,
+ }
+ 
+ pub struct Debug {
+@@ -60,6 +62,8 @@
+                 "stats" => flags |= 1 << DebugFlags::Stats as u8,
+                 "xbar" => flags |= 1 << DebugFlags::XBar as u8,
+                 "final" => flags |= 1 << DebugFlags::Final as u8,
++                "sink" => flags |= 1 << DebugFlags::Sink as u8,
++                "remat" => flags |= 1 << DebugFlags::Remat as u8,
+                 unk => eprintln!("Unknown NAK_DEBUG flag \"{}\"", unk),
+             }
+         }
+@@ -109,6 +113,14 @@
+     fn final_ir(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::Final as u8) != 0
+     }
++
++    fn sink(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::Sink as u8) != 0
++    }
++
++    fn remat(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::Remat as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+@@ -129,6 +141,16 @@
+     DEBUG.no_ugpr()
+ }
+ 
++#[no_mangle]
++pub extern "C" fn nak_debug_sink() -> bool {
++    DEBUG.sink()
++}
++
++#[no_mangle]
++pub extern "C" fn nak_debug_remat() -> bool {
++    DEBUG.remat()
++}
++
+ fn nir_options(dev: &nv_device_info) -> nir_shader_compiler_options {
+     nir_shader_compiler_options {
+         lower_fdiv: true,
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -1820,6 +1820,15 @@
+           type_size_vec4, nir_lower_io_lower_64bit_to_32_new |
+           nir_lower_io_use_interpolated_input_intrinsics);
+       OPT(nir, nir_opt_constant_folding);
++      /* NAK_DEBUG=sink: interpolate each input where it is first used
++       * instead of at the top of the shader, so it isn't live across work
++       * that doesn't need it.  An IPA gives the same result wherever it
++       * runs (discard is a demote here), so this changes no output.
++       */
++      if (nak_debug_sink()) {
++         OPT(nir, nir_opt_sink, nir_move_load_input | nir_move_load_frag_coord);
++         OPT(nir, nir_opt_move, nir_move_load_input | nir_move_load_frag_coord);
++      }
+       OPT(nir, nak_nir_lower_fs_inputs, nak, fs_key);
+       OPT(nir, nak_nir_lower_fs_outputs);
+       break;
+@@ -1908,6 +1917,13 @@
+       }
+    } while (progress);
+ 
++   /* NAK_DEBUG=remat: clone compares into the blocks that use them, so a
++    * switch keeps its selector live rather than one predicate per case.
++    * Nothing after this point runs CSE, which would merge the clones again.
++    */
++   if (nak_debug_remat() && OPT(nir, nak_nir_rematerialize_bools))
++      OPT(nir, nir_opt_dce);
++
+    OPT(nir, nir_opt_move, nir_move_comparisons | nir_move_load_ubo);
+ 
+    if (nak->sm < 70) {
+diff --git a/src/nouveau/compiler/nak_private.h b/src/nouveau/compiler/nak_private.h
+--- a/src/nouveau/compiler/nak_private.h
++++ b/src/nouveau/compiler/nak_private.h
+@@ -16,6 +16,8 @@
+ 
+ bool nak_should_print_nir(void);
+ bool nak_debug_no_ugpr(void);
++bool nak_debug_sink(void);
++bool nak_debug_remat(void);
+ 
+ struct nak_compiler {
+    uint8_t sm;
+@@ -438,6 +440,7 @@
+    }
+ }
+ 
++bool nak_nir_rematerialize_bools(nir_shader *nir);
+ bool nak_nir_rematerialize_load_const(nir_shader *nir);
+ bool nak_nir_mark_lcssa_invariants(nir_shader *nir);
+ bool nak_nir_lower_non_uniform_ldcx(nir_shader *nir, const struct nak_compiler *nak);
+diff --git a/src/nouveau/compiler/nak_nir_rematerialize_bools.c b/src/nouveau/compiler/nak_nir_rematerialize_bools.c
+new file mode 100644
+--- /dev/null
++++ b/src/nouveau/compiler/nak_nir_rematerialize_bools.c
+@@ -0,0 +1,166 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * Re-materialize cheap booleans in the blocks that use them.  The block walk
++ * follows nak_nir_rematerialize_load_const.c.
++ *
++ * A switch is lowered to one "sel == k" compare per case.  CSE leaves each
++ * compare in the block of the switch, where the default test consumes it,
++ * and the case branches then keep every compare live until they are reached.
++ * Maxwell has seven predicates, so the rest are spilled to general registers.
++ * Cloning the compare into each using block keeps only the selector live.
++ *
++ * Only compares against a constant are cloned, possibly behind a shallow
++ * tree of iand/ior/ixor/inot, so a clone extends at most one value per
++ * leaf.  The results are bit-identical.  No CSE may run after this pass.
++ */
++
++#include "nak_private.h"
++#include "nir_builder.h"
++#include "util/hash_table.h"
++
++#define REMAT_MAX_DEPTH 3
++
++struct remat_ctx {
++   struct hash_table *remap;
++   nir_block *block;
++   nir_builder b;
++   bool progress;
++};
++
++static bool
++is_bool_logic(nir_op op)
++{
++   return op == nir_op_iand || op == nir_op_ior ||
++          op == nir_op_ixor || op == nir_op_inot;
++}
++
++static bool
++is_remat_bool(nir_def *def, unsigned depth)
++{
++   nir_instr *instr = nir_def_instr(def);
++   if (instr->type == nir_instr_type_load_const)
++      return true;
++
++   if (instr->type != nir_instr_type_alu ||
++       def->bit_size != 1 || def->num_components != 1)
++      return false;
++
++   nir_alu_instr *alu = nir_instr_as_alu(instr);
++   const unsigned num_srcs = nir_op_infos[alu->op].num_inputs;
++
++   if (is_bool_logic(alu->op)) {
++      if (depth == 0)
++         return false;
++
++      for (unsigned i = 0; i < num_srcs; i++) {
++         if (!is_remat_bool(alu->src[i].src.ssa, depth - 1))
++            return false;
++      }
++      return true;
++   }
++
++   if (!nir_alu_instr_is_comparison(alu))
++      return false;
++
++   for (unsigned i = 0; i < num_srcs; i++) {
++      if (nir_src_is_const(alu->src[i].src))
++         return true;
++   }
++   return false;
++}
++
++static nir_def *
++remat_clone(struct remat_ctx *ctx, nir_def *def)
++{
++   nir_instr *instr = nir_def_instr(def);
++   if (instr->type == nir_instr_type_load_const)
++      return def;
++
++   struct hash_entry *entry = _mesa_hash_table_search(ctx->remap, def);
++   if (entry != NULL)
++      return entry->data;
++
++   nir_alu_instr *alu = nir_instr_as_alu(instr);
++   nir_def *srcs[NIR_ALU_MAX_INPUTS] = { NULL };
++   const unsigned num_srcs = nir_op_infos[alu->op].num_inputs;
++
++   if (is_bool_logic(alu->op)) {
++      for (unsigned i = 0; i < num_srcs; i++)
++         srcs[i] = remat_clone(ctx, alu->src[i].src.ssa);
++   }
++
++   nir_alu_instr *clone = nir_alu_instr_clone(ctx->b.shader, alu);
++   nir_builder_instr_insert(&ctx->b, &clone->instr);
++
++   for (unsigned i = 0; i < num_srcs; i++) {
++      if (srcs[i] != NULL)
++         nir_src_rewrite(&clone->src[i].src, srcs[i]);
++   }
++
++   _mesa_hash_table_insert(ctx->remap, def, &clone->def);
++   return &clone->def;
++}
++
++static bool
++remat_src(nir_src *src, void *_ctx)
++{
++   struct remat_ctx *ctx = _ctx;
++   nir_def *def = src->ssa;
++
++   if (def->bit_size != 1 || nir_def_block(def) == ctx->block)
++      return true;
++
++   if (nir_def_instr(def)->type != nir_instr_type_alu ||
++       !is_remat_bool(def, REMAT_MAX_DEPTH))
++      return true;
++
++   nir_src_rewrite(src, remat_clone(ctx, def));
++   ctx->progress = true;
++   return true;
++}
++
++static bool
++rematerialize_bools_impl(nir_function_impl *impl)
++{
++   struct remat_ctx ctx = {
++      .remap = _mesa_pointer_hash_table_create(NULL),
++      .b = nir_builder_create(impl),
++   };
++
++   nir_foreach_block(block, impl) {
++      _mesa_hash_table_clear(ctx.remap, NULL);
++      ctx.block = block;
++
++      nir_foreach_instr(instr, block) {
++         if (instr->type == nir_instr_type_phi)
++            continue;
++
++         ctx.b.cursor = nir_before_instr(instr);
++         nir_foreach_src(instr, remat_src, &ctx);
++      }
++
++      nir_if *nif = nir_block_get_following_if(block);
++      if (nif != NULL) {
++         ctx.b.cursor = nir_after_block_before_jump(block);
++         remat_src(&nif->condition, &ctx);
++      }
++   }
++
++   _mesa_hash_table_destroy(ctx.remap, NULL);
++
++   return nir_progress(ctx.progress, impl, nir_metadata_control_flow);
++}
++
++bool
++nak_nir_rematerialize_bools(nir_shader *nir)
++{
++   bool progress = false;
++
++   nir_foreach_function_impl(impl, nir)
++      progress |= rematerialize_bools_impl(impl);
++
++   return progress;
++}

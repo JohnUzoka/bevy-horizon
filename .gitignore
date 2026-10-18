@@ -1,0 +1,6 @@
+/target/
+/nvk/
+/*.nro
+/hbl.elf
+/breakoutlog.txt
+__pycache__/

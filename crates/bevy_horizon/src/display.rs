@@ -22,7 +22,7 @@ impl Plugin for HorizonDisplayPlugin {
 mod applet_ffi {
     use core::ffi::c_int;
 
-    extern "C" {
+    unsafe extern "C" {
         // 0: Handheld, 1: Docked
         pub fn appletGetOperationMode() -> c_int;
     }
@@ -43,8 +43,8 @@ fn monitor_dock_status(
     if *current_mode != new_mode {
         *current_mode = new_mode;
         let (width, height) = match new_mode {
-            HorizonDisplayMode::Docked => (1920.0, 1080.0),
-            HorizonDisplayMode::Handheld => (1280.0, 720.0),
+            HorizonDisplayMode::Docked => (1920, 1080),
+            HorizonDisplayMode::Handheld => (1280, 720),
         };
         tracing::info!("Switch display mode changed to {new_mode:?}: {width}x{height}");
 

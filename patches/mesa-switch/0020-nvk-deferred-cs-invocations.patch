@@ -1,0 +1,135 @@
+bevy-horizon: add a statistics query's direct-dispatch compute invocations when it ends
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 606441c9, after 0001-0019. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+Since 060b133 ("bevy-horizon: count compute invocations in statistics queries that count
+graphics work too"), each direct dispatch inside a pipeline-statistics query that counts
+compute invocations calls NVK_MME_ADD_CS_INVOCATIONS. Before AMPERE_COMPUTE_B that macro is
+called on the 3D class (NV9097), so a run of compute dispatches gets a 3D method between every
+two. A comment in nvk_CmdDispatchIndirect2KHR notes that a 3D-class method there "causes an
+implicit wfi due to the subc switch". On a Switch Lite, with Bevy's RenderDiagnosticsPlugin
+timing each pass in one such query, Skate 3's early mesh preprocessing took 0.24 ms longer and
+its three indirect-parameter passes 0.19 ms longer than before 060b133, for the same work.
+
+A query begun in a command buffer must end in it, so while the query is active a direct
+dispatch now adds its invocations to cmd->state.cs.pending_cs_invocations, and
+vkCmdEndQuery adds the sum with one macro call before it writes the count. Beginning the query
+zeroes the sum, and vkCmdExecuteCommands keeps it as it keeps the flag. Meta compute operations
+save and restore cmd->state.cs whole and count nothing, as before. A dispatch counted for an
+inherited query, in a secondary command buffer, still calls the macro itself, since the query
+ends elsewhere. Indirect dispatches still add theirs in their own macro. The counts don't
+change, only where the adds happen.
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index 85cb5bc..6228ff5 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -704,10 +704,13 @@ nvk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+     */
+    const bool active_compute_invocations_query =
+       cmd->state.cs.active_compute_invocations_query;
++   const uint64_t pending_cs_invocations =
++      cmd->state.cs.pending_cs_invocations;
+    nvk_cmd_invalidate_graphics_state(cmd);
+    nvk_cmd_invalidate_compute_state(cmd);
+    cmd->state.cs.active_compute_invocations_query =
+       active_compute_invocations_query;
++   cmd->state.cs.pending_cs_invocations = pending_cs_invocations;
+ }
+ 
+ enum nvk_barrier {
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 0c6a5fd..9337da4 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -232,6 +232,10 @@ struct nvk_compute_state {
+    struct nvk_descriptor_state descriptors;
+    struct nvk_shader *shader;
+    bool active_compute_invocations_query;
++   /* Direct dispatches' invocations since the query began, added to the
++    * MME's count when it ends.
++    */
++   uint64_t pending_cs_invocations;
+ };
+ 
+ struct nvk_cmd_push {
+@@ -345,6 +349,7 @@ void nvk_cmd_buffer_begin_compute(struct nvk_cmd_buffer *cmd,
+ 
+ void nvk_cmd_invalidate_graphics_state(struct nvk_cmd_buffer *cmd);
+ void nvk_cmd_invalidate_compute_state(struct nvk_cmd_buffer *cmd);
++void nvk_cmd_add_cs_invocations(struct nvk_cmd_buffer *cmd, uint64_t count);
+ 
+ void nvk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd,
+                           uint32_t stage_count,
+diff --git a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+index 0d3d0da..6689846 100644
+--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+@@ -296,6 +296,18 @@ nvk_mme_add_cs_invocations(struct mme_builder *b)
+    nvk_build_mme_add_cs_invocations(b, count);
+ }
+ 
++void
++nvk_cmd_add_cs_invocations(struct nvk_cmd_buffer *cmd, uint64_t count)
++{
++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 3);
++   if (nvk_cmd_buffer_compute_cls(cmd) >= AMPERE_COMPUTE_B)
++      P_1INC(p, NVC7C0, CALL_MME_MACRO(NVK_MME_ADD_CS_INVOCATIONS));
++   else
++      P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_ADD_CS_INVOCATIONS));
++   P_INLINE_DATA(p, count >> 32);
++   P_INLINE_DATA(p, count);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
+                     uint32_t baseGroupX,
+@@ -328,13 +340,15 @@ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
+          (uint64_t)local_size * (uint64_t)groupCountX *
+          (uint64_t)groupCountY * (uint64_t)groupCountZ;
+ 
+-      struct nv_push *p = nvk_cmd_buffer_push(cmd, 3);
+-      if (nvk_cmd_buffer_compute_cls(cmd) >= AMPERE_COMPUTE_B)
+-         P_1INC(p, NVC7C0, CALL_MME_MACRO(NVK_MME_ADD_CS_INVOCATIONS));
+-      else
+-         P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_ADD_CS_INVOCATIONS));
+-      P_INLINE_DATA(p, cs_invocations >> 32);
+-      P_INLINE_DATA(p, cs_invocations);
++      /* A query begun in this command buffer ends in it, so its count can
++       * wait for vkCmdEndQuery.  Before Ampere the macro is a 3D method, and
++       * one between every two dispatches made them slower on the Switch.
++       */
++      if (cmd->state.cs.active_compute_invocations_query) {
++         cmd->state.cs.pending_cs_invocations += cs_invocations;
++      } else {
++         nvk_cmd_add_cs_invocations(cmd, cs_invocations);
++      }
+    }
+ 
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
+diff --git a/src/nouveau/vulkan/nvk_query_pool.c b/src/nouveau/vulkan/nvk_query_pool.c
+index 74d8c58..855f9e0 100644
+--- a/src/nouveau/vulkan/nvk_query_pool.c
++++ b/src/nouveau/vulkan/nvk_query_pool.c
+@@ -678,6 +678,7 @@ nvk_cmd_set_statistics_counters(struct nvk_cmd_buffer *cmd,
+           pool->vk.pipeline_statistics &
+              VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT) {
+          cmd->state.cs.active_compute_invocations_query = enable;
++         cmd->state.cs.pending_cs_invocations = 0;
+       }
+       break;
+    }
+@@ -752,6 +753,11 @@ nvk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer,
+    }
+ 
+    case VK_QUERY_TYPE_PIPELINE_STATISTICS: {
++      if (cmd->state.cs.pending_cs_invocations != 0) {
++         nvk_cmd_add_cs_invocations(cmd, cmd->state.cs.pending_cs_invocations);
++         cmd->state.cs.pending_cs_invocations = 0;
++      }
++
+       uint32_t stat_count = util_bitcount(pool->vk.pipeline_statistics);
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, stat_count * 5);
+ 

@@ -1,0 +1,484 @@
+bevy-horizon: take NVK's GPU backing from the top of the heap, downward
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at d4a00ea0ab3f59afb967cc5d779e4263d237bd77. scripts/build_nvk.sh applies it; this text before
+the first "diff --git" line is ignored by git apply.
+
+NVK on Horizon took every GPU buffer and image with memalign from the malloc heap the game uses.
+Each needs one contiguous run, often 8-104 MiB (gpu-alloc's chunks and dedicated allocations).
+After a game builds and frees its scene data, malloc's free space is hundreds of MiB of holes,
+none big enough, and the next large GPU block fails with VK_ERROR_OUT_OF_HOST_MEMORY while half
+a GiB is free (Skate 3 run sk8f: a 16 MiB block with 508 MiB in holes; bevy-horizon
+docs/platform-notes.md).
+
+This takes backing from the top of the heap downward instead. devkitA64's sbrk (libsysbase
+sbrk.c) never moves the break past fake_heap_end and rereads it on every call, so lowering
+fake_heap_end hands the memory above it to the GPU with no fixed reservation; CPU memory grows up,
+GPU memory down, and neither fragments the other. fake_heap_end only changes under newlib's
+__malloc_lock, which malloc holds around its sbrk calls; blocks freed at the bottom of the region
+go back to sbrk. A bitmap of 64 KiB granules tracks the region, so its bookkeeping never
+allocates. When the region can't grow (it keeps 16 MiB free above the break), blocks come from
+memalign as before. NOUVEAU_HORIZON_TOP_DOWN=false turns it off.
+
+The process's own large allocations can share the region: nouveau_horizon_region_alloc, _free
+and _stats (kept global by scripts/localize_nvk.sh) let bevy_horizon's `top_down_alloc` Rust
+allocator put blocks of 256 KiB and up there. newlib's malloc is built without mmap (_mallocr.c
+sets HAVE_MMAP to 0), so otherwise a game's large blocks sit between its small ones, and once it
+frees them the GPU finds only small holes (Skate 3 run sk8g: a 64 MiB block failed with the region
+at 706 MiB and 503 MiB free in malloc's holes).
+
+diff --git a/src/nouveau/horizon/nouveau_horizon_memory.c b/src/nouveau/horizon/nouveau_horizon_memory.c
+index eefb845..9c28a96 100644
+--- a/src/nouveau/horizon/nouveau_horizon_memory.c
++++ b/src/nouveau/horizon/nouveau_horizon_memory.c
+@@ -13,7 +13,9 @@
+ 
+ #include <assert.h>
+ #include <malloc.h>
++#include <reent.h>
+ #include <string.h>
++#include <unistd.h>
+ 
+ /* Defined with the backing-store cache below; the identity release path
+  * needs it first. */
+@@ -21,6 +23,394 @@ static bool
+ nouveau_horizon_bo_cache_put(struct nouveau_horizon_device *device,
+                              struct nouveau_horizon_memory_identity *identity);
+ 
++/* Top-down GPU backing region.
++ *
++ * Every backing store is one contiguous, 64 KiB-aligned run of the process
++ * heap that lives as long as its Vulkan memory object, and the biggest are
++ * tens of MiB. Taken from memalign, each one needs a malloc hole that fits:
++ * once a game has built and freed its scene data, the CPU heap is hundreds
++ * of MiB of holes, none big enough, and a 16 MiB GPU block fails while half
++ * a GiB is free.
++ *
++ * So backing comes from the top of the heap downward. newlib's malloc grows
++ * the heap upward through sbrk, and devkitA64's sbrk (libsysbase sbrk.c)
++ * refuses to move the break past fake_heap_end, rereading it on every call.
++ * Lowering fake_heap_end therefore hands the memory above it to the GPU
++ * without a fixed reservation: CPU memory grows up from fake_heap_start, GPU
++ * memory grows down from the original fake_heap_end, and neither fragments
++ * the other. Freed blocks at the bottom of the region go back to sbrk by
++ * raising fake_heap_end again. fake_heap_end only changes under newlib's
++ * malloc lock, which malloc holds around every sbrk call it makes.
++ *
++ * The region is one bit per 64 KiB granule, counted down from the top, so
++ * its bookkeeping never allocates. When it can't grow because the CPU heap's
++ * break is too close, blocks come from memalign as they did before.
++ *
++ * The process's own large allocations can share the region through
++ * nouveau_horizon_region_alloc; bevy-horizon's Rust allocator puts blocks of
++ * 256 KiB and up there. newlib's malloc has no mmap (_mallocr.c sets
++ * HAVE_MMAP to 0), so without this a game's large blocks sit between its
++ * small ones, and freeing them after loading leaves holes the GPU can't use.
++ *
++ * NOUVEAU_HORIZON_TOP_DOWN=false turns the region off.
++ */
++extern char *fake_heap_end;
++
++#define NOUVEAU_HORIZON_REGION_GRANULE_B 0x10000ull
++/* 8 GiB of 64 KiB granules, more than any Switch heap. */
++#define NOUVEAU_HORIZON_REGION_MAX_GRANULES (1u << 17)
++/* Room the region always leaves above the CPU heap's break, so a GPU block
++ * never takes the CPU heap's last room to grow. Past this point GPU blocks
++ * share the CPU heap's holes through memalign.
++ */
++#define NOUVEAU_HORIZON_REGION_CPU_RESERVE_B (16ull << 20)
++
++static struct {
++   simple_mtx_t mutex;
++   bool initialized;
++   bool enabled;
++   bool warned;
++   /* fake_heap_end before the region existed, and that rounded down to a
++    * granule. The region is [top - granules * granule, top).
++    */
++   uintptr_t heap_end;
++   uintptr_t top;
++   uint32_t granules;
++   /* Bytes in blocks, GPU and CPU, now and at the most. */
++   uint64_t used_B;
++   uint64_t peak_B;
++   /* GPU blocks the region couldn't place, which came from memalign. */
++   uint64_t fallbacks;
++   uint64_t used[NOUVEAU_HORIZON_REGION_MAX_GRANULES / 64];
++} nouveau_horizon_region = {
++   .mutex = SIMPLE_MTX_INITIALIZER,
++};
++
++static bool
++nouveau_horizon_region_granule_used(uint32_t granule)
++{
++   return (nouveau_horizon_region.used[granule / 64] >> (granule % 64)) & 1;
++}
++
++static void
++nouveau_horizon_region_mark(uint32_t first, uint32_t count, bool used)
++{
++   for (uint32_t granule = first; granule < first + count; granule++) {
++      const uint64_t bit = 1ull << (granule % 64);
++      if (used)
++         nouveau_horizon_region.used[granule / 64] |= bit;
++      else
++         nouveau_horizon_region.used[granule / 64] &= ~bit;
++   }
++}
++
++static uintptr_t
++nouveau_horizon_region_low(void)
++{
++   return nouveau_horizon_region.top -
++          (uintptr_t)nouveau_horizon_region.granules *
++             NOUVEAU_HORIZON_REGION_GRANULE_B;
++}
++
++/* Best fit among the region's free runs, at the high end of the run.
++ * Returns 0 when no run fits.
++ */
++static uintptr_t
++nouveau_horizon_region_find_locked(uint64_t size_B, uint64_t align_B)
++{
++   const uint64_t granule_B = NOUVEAU_HORIZON_REGION_GRANULE_B;
++   const uintptr_t top = nouveau_horizon_region.top;
++   const uint32_t granules = nouveau_horizon_region.granules;
++   uintptr_t best = 0;
++   uint32_t best_run = UINT32_MAX;
++
++   uint32_t granule = 0;
++   while (granule < granules) {
++      if (granule % 64 == 0 && granule + 64 <= granules &&
++          nouveau_horizon_region.used[granule / 64] == UINT64_MAX) {
++         granule += 64;
++         continue;
++      }
++      if (nouveau_horizon_region_granule_used(granule)) {
++         granule++;
++         continue;
++      }
++
++      const uint32_t run_first = granule;
++      while (granule < granules &&
++             !nouveau_horizon_region_granule_used(granule)) {
++         if (granule % 64 == 0 && granule + 64 <= granules &&
++             nouveau_horizon_region.used[granule / 64] == 0)
++            granule += 64;
++         else
++            granule++;
++      }
++      const uint32_t run = granule - run_first;
++      if ((uint64_t)run * granule_B < size_B || run >= best_run)
++         continue;
++
++      /* The run covers [run_low, run_high). */
++      const uintptr_t run_low = top - (uintptr_t)granule * granule_B;
++      const uintptr_t run_high = top - (uintptr_t)run_first * granule_B;
++      const uintptr_t start =
++         (run_high - (uintptr_t)size_B) & ~(uintptr_t)(align_B - 1);
++      if (start >= run_low) {
++         best = start;
++         best_run = run;
++      }
++   }
++   return best;
++}
++
++/* Extend the region down by lowering fake_heap_end. Returns 0 when that
++ * would come within NOUVEAU_HORIZON_REGION_CPU_RESERVE_B of the CPU heap's
++ * break.
++ */
++static uintptr_t
++nouveau_horizon_region_grow_locked(uint64_t size_B, uint64_t align_B,
++                                   uint64_t *room_B_out)
++{
++   const uintptr_t low = nouveau_horizon_region_low();
++   *room_B_out = 0;
++   if (low < size_B)
++      return 0;
++
++   const uintptr_t start =
++      (low - (uintptr_t)size_B) & ~(uintptr_t)(align_B - 1);
++   const uint64_t granules =
++      (nouveau_horizon_region.top - start) / NOUVEAU_HORIZON_REGION_GRANULE_B;
++   if (granules > NOUVEAU_HORIZON_REGION_MAX_GRANULES)
++      return 0;
++
++   bool grown = false;
++   __malloc_lock(_REENT);
++   const uintptr_t brk = (uintptr_t)sbrk(0);
++   if (brk != (uintptr_t)-1 && brk <= low)
++      *room_B_out = low - brk;
++   if (brk != (uintptr_t)-1 && start >= brk &&
++       start - brk >= NOUVEAU_HORIZON_REGION_CPU_RESERVE_B) {
++      fake_heap_end = (char *)start;
++      grown = true;
++   }
++   __malloc_unlock(_REENT);
++   if (!grown)
++      return 0;
++
++   nouveau_horizon_region.granules = (uint32_t)granules;
++   return start;
++}
++
++/* Give unused granules at the bottom of the region back to sbrk. */
++static void
++nouveau_horizon_region_shrink_locked(void)
++{
++   uint32_t granules = nouveau_horizon_region.granules;
++   while (granules > 0 && !nouveau_horizon_region_granule_used(granules - 1))
++      granules--;
++   if (granules == nouveau_horizon_region.granules)
++      return;
++
++   nouveau_horizon_region.granules = granules;
++   const uintptr_t end = granules == 0 ? nouveau_horizon_region.heap_end :
++                                         nouveau_horizon_region_low();
++   __malloc_lock(_REENT);
++   fake_heap_end = (char *)end;
++   __malloc_unlock(_REENT);
++}
++
++/* Places a block in the region: in the free run that fits it most tightly,
++ * or in new room at the region's bottom. Returns 0 when neither works. A GPU
++ * block then comes from memalign, and the first time that happens it's
++ * logged; a CPU block's caller counts its own.
++ */
++static uintptr_t
++nouveau_horizon_region_place(struct nouveau_horizon_device *device,
++                             uint64_t align_B, uint64_t size_B,
++                             bool gpu_block)
++{
++   const uint64_t granule_B = NOUVEAU_HORIZON_REGION_GRANULE_B;
++   bool first_use = false, warn = false;
++   uint64_t room_B = 0, region_B = 0;
++   uintptr_t start = 0, heap_end = 0;
++
++   simple_mtx_lock(&nouveau_horizon_region.mutex);
++   if (!nouveau_horizon_region.initialized) {
++      nouveau_horizon_region.initialized = true;
++      nouveau_horizon_region.enabled =
++         debug_get_bool_option("NOUVEAU_HORIZON_TOP_DOWN", true);
++      __malloc_lock(_REENT);
++      nouveau_horizon_region.heap_end = (uintptr_t)fake_heap_end;
++      __malloc_unlock(_REENT);
++      nouveau_horizon_region.top =
++         nouveau_horizon_region.heap_end & ~(uintptr_t)(granule_B - 1);
++      first_use = true;
++      heap_end = nouveau_horizon_region.heap_end;
++   }
++
++   if (nouveau_horizon_region.enabled && nouveau_horizon_region.top != 0 &&
++       align_B >= granule_B && util_is_power_of_two_nonzero64(align_B) &&
++       size_B != 0 && size_B % granule_B == 0) {
++      start = nouveau_horizon_region_find_locked(size_B, align_B);
++      if (start == 0)
++         start = nouveau_horizon_region_grow_locked(size_B, align_B, &room_B);
++      if (start != 0) {
++         const uint32_t first = (uint32_t)(
++            (nouveau_horizon_region.top - (start + (uintptr_t)size_B)) /
++            granule_B);
++         nouveau_horizon_region_mark(first, (uint32_t)(size_B / granule_B),
++                                     true);
++         nouveau_horizon_region.used_B += size_B;
++         nouveau_horizon_region.peak_B =
++            MAX2(nouveau_horizon_region.peak_B,
++                 nouveau_horizon_region.used_B);
++      } else if (gpu_block) {
++         nouveau_horizon_region.fallbacks++;
++         warn = !nouveau_horizon_region.warned;
++         nouveau_horizon_region.warned = true;
++         region_B = nouveau_horizon_region.top - nouveau_horizon_region_low();
++      }
++   }
++   const bool enabled = nouveau_horizon_region.enabled;
++   simple_mtx_unlock(&nouveau_horizon_region.mutex);
++
++   if (first_use)
++      nouveau_horizon_log(device, NOUVEAU_HORIZON_LOG_INFO,
++                          "GPU backing: top-down region %s, heap end %p",
++                          enabled ? "on" : "off (NOUVEAU_HORIZON_TOP_DOWN)",
++                          (void *)heap_end);
++   if (warn)
++      nouveau_horizon_log(device, NOUVEAU_HORIZON_LOG_WARNING,
++                          "GPU backing: the top-down region (%llu MiB) can't "
++                          "grow: %llu MiB lie between it and the CPU heap, "
++                          "and %llu MiB stay for the CPU. This %llu KiB block, "
++                          "and later ones that don't fit, come from malloc's "
++                          "free space instead",
++                          (unsigned long long)(region_B >> 20),
++                          (unsigned long long)(room_B >> 20),
++                          (unsigned long long)
++                             (NOUVEAU_HORIZON_REGION_CPU_RESERVE_B >> 20),
++                          (unsigned long long)(size_B >> 10));
++
++   return start;
++}
++
++static void *
++nouveau_horizon_backing_alloc(struct nouveau_horizon_device *device,
++                              uint64_t align_B, uint64_t size_B)
++{
++   const uintptr_t start =
++      nouveau_horizon_region_place(device, align_B, size_B, true);
++   if (start != 0)
++      return (void *)start;
++   return memalign((size_t)align_B, (size_t)size_B);
++}
++
++/* Frees a block nouveau_horizon_region_place placed. Returns false, freeing
++ * nothing, when cpu_addr isn't in the region: the block is malloc's.
++ */
++static bool
++nouveau_horizon_region_release(void *cpu_addr, uint64_t size_B)
++{
++   const uint64_t granule_B = NOUVEAU_HORIZON_REGION_GRANULE_B;
++   const uintptr_t addr = (uintptr_t)cpu_addr;
++   simple_mtx_lock(&nouveau_horizon_region.mutex);
++   /* malloc's memory always lies below the break, which never passes
++    * fake_heap_end, the region's low end.
++    */
++   if (nouveau_horizon_region.granules == 0 ||
++       addr < nouveau_horizon_region_low() ||
++       addr >= nouveau_horizon_region.top) {
++      simple_mtx_unlock(&nouveau_horizon_region.mutex);
++      return false;
++   }
++
++   bool valid = size_B != 0 && size_B % granule_B == 0 &&
++                addr % granule_B == 0 &&
++                size_B <= nouveau_horizon_region.top - addr;
++   const uint32_t first = valid ?
++      (uint32_t)((nouveau_horizon_region.top - (addr + (uintptr_t)size_B)) /
++                 granule_B) : 0;
++   const uint32_t count = valid ? (uint32_t)(size_B / granule_B) : 0;
++   for (uint32_t granule = first; valid && granule < first + count; granule++)
++      valid = nouveau_horizon_region_granule_used(granule);
++   if (valid) {
++      nouveau_horizon_region_mark(first, count, false);
++      nouveau_horizon_region.used_B -= size_B;
++      nouveau_horizon_region_shrink_locked();
++   }
++   simple_mtx_unlock(&nouveau_horizon_region.mutex);
++
++   if (!valid)
++      nouveau_horizon_log(NULL, NOUVEAU_HORIZON_LOG_ERROR,
++                          "GPU backing: free of %p (%llu KiB) doesn't match a "
++                          "block in the top-down region; leaking it",
++                          cpu_addr, (unsigned long long)(size_B >> 10));
++   return true;
++}
++
++static void
++nouveau_horizon_backing_free(void *cpu_addr, uint64_t size_B)
++{
++   if (cpu_addr != NULL && !nouveau_horizon_region_release(cpu_addr, size_B))
++      free(cpu_addr);
++}
++
++/* The region for the process's own large allocations, the part mmap plays
++ * for a desktop malloc. bevy-horizon's Rust allocator (bevy_horizon's
++ * `top_down_alloc` feature) calls these. A block rounds up to whole granules,
++ * and freeing it leaves a run that GPU blocks and later large blocks can use.
++ */
++PUBLIC void *
++nouveau_horizon_region_alloc(size_t align, size_t size);
++PUBLIC bool
++nouveau_horizon_region_free(void *ptr, size_t size);
++PUBLIC void
++nouveau_horizon_region_stats(uint64_t *size_B, uint64_t *used_B,
++                             uint64_t *peak_B, uint64_t *gpu_fallbacks);
++
++/* Returns NULL when the region can't place the block; the caller then uses
++ * malloc.
++ */
++PUBLIC void *
++nouveau_horizon_region_alloc(size_t align, size_t size)
++{
++   const uint64_t granule_B = NOUVEAU_HORIZON_REGION_GRANULE_B;
++   if (size == 0 || (uint64_t)size > (1ull << 40) ||
++       !util_is_power_of_two_nonzero64(align))
++      return NULL;
++
++   return (void *)nouveau_horizon_region_place(
++      NULL, MAX2((uint64_t)align, granule_B), align64(size, granule_B), false);
++}
++
++/* Takes the size the block was asked for. Returns false, freeing nothing,
++ * when ptr isn't in the region.
++ */
++PUBLIC bool
++nouveau_horizon_region_free(void *ptr, size_t size)
++{
++   if (ptr == NULL)
++      return true;
++   return nouveau_horizon_region_release(
++      ptr, align64(size, NOUVEAU_HORIZON_REGION_GRANULE_B));
++}
++
++/* The region's extent and the bytes in its blocks, GPU and CPU, now and at
++ * the most, for the app's memory log.
++ */
++PUBLIC void
++nouveau_horizon_region_stats(uint64_t *size_B, uint64_t *used_B,
++                             uint64_t *peak_B, uint64_t *gpu_fallbacks)
++{
++   simple_mtx_lock(&nouveau_horizon_region.mutex);
++   *size_B = (uint64_t)nouveau_horizon_region.granules *
++             NOUVEAU_HORIZON_REGION_GRANULE_B;
++   *used_B = nouveau_horizon_region.used_B;
++   *peak_B = nouveau_horizon_region.peak_B;
++   *gpu_fallbacks = nouveau_horizon_region.fallbacks;
++   simple_mtx_unlock(&nouveau_horizon_region.mutex);
++}
++
+ #define NOUVEAU_HORIZON_MEMORY_IDENTITY_FLAGS                              \
+    NOUVEAU_HORIZON_MEMORY_GPU_CACHED
+ 
+@@ -253,7 +643,7 @@ nouveau_horizon_memory_identity_put(
+        !nouveau_horizon_bo_cache_put(identity->accounting_device, identity)) {
+       nvMapClose(&identity->map);
+       if (!identity->imported)
+-         free(identity->cpu_addr);
++         nouveau_horizon_backing_free(identity->cpu_addr, identity->size_B);
+    }
+ 
+    if (identity->accounting_device != NULL) {
+@@ -293,7 +683,7 @@ nouveau_horizon_bo_cache_entry_free(
+    struct nouveau_horizon_bo_cache_entry *entry)
+ {
+    nvMapClose(&entry->map);
+-   free(entry->cpu_addr);
++   nouveau_horizon_backing_free(entry->cpu_addr, entry->size_B);
+    FREE(entry);
+ }
+ 
+@@ -588,7 +978,8 @@ nouveau_horizon_memory_create(
+        * cached storage cannot prevent recovery.
+        */
+       for (unsigned attempt = 0;; attempt++) {
+-         identity->cpu_addr = memalign((size_t)align_B, (size_t)size_B);
++         identity->cpu_addr =
++            nouveau_horizon_backing_alloc(device, align_B, size_B);
+          if (identity->cpu_addr == NULL) {
+             if (attempt == 0) {
+                nouveau_horizon_device_bo_cache_trim(device);
+@@ -606,7 +997,7 @@ nouveau_horizon_memory_create(
+          if (R_SUCCEEDED(rc))
+             break;
+ 
+-         free(identity->cpu_addr);
++         nouveau_horizon_backing_free(identity->cpu_addr, size_B);
+          identity->cpu_addr = NULL;
+          if (attempt == 0) {
+             nouveau_horizon_device_bo_cache_trim(device);
+@@ -675,7 +1066,7 @@ nouveau_horizon_memory_create(
+       nouveau_horizon_memory_record_create_failure(device);
+       nvMapClose(&identity->map);
+       if (!identity->imported)
+-         free(identity->cpu_addr);
++         nouveau_horizon_backing_free(identity->cpu_addr, size_B);
+       if (identity->accounting_device != NULL)
+          nouveau_horizon_device_put(identity->accounting_device);
+       FREE(identity);

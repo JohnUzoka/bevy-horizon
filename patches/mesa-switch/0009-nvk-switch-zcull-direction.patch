@@ -1,0 +1,141 @@
+bevy-horizon: a switch for ZCULL's direction in NVK
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 606441c9, after 0001-0008 (it adds a switch to 0008's list). scripts/build_nvk.sh applies
+it; this text before the first "diff --git" line is ignored by git apply.
+
+NVK sets SET_ZCULL_DIR_FORMAT's ZDIR to LESS in every render pass. Bevy draws with reversed
+depth (cleared to 0.0, tested GREATER_EQUAL), and with LESS, ZCULL rejects nothing in such a
+pass: olealgoritme's NVK patch for reverse Z (github.com/olealgoritme/conduit,
+guest/nvk-rm/patches-common/0008-nvk-ZCULL-for-DXVK-depth-buffers-and-reverse-Z.patch, at
+c18f809) found that on desktop GPUs, and UnleashedRecomp's Switch port saw it on the Switch
+(github.com/ChanseyIsTheBest/UnleashedRecomp-NX, docs/SWITCH-PERFORMANCE-AUDIT.md "ZCULL", at
+b346e37): turning ZCULL off changed nothing, and ZDIR_GREATER gave -0.17 ms with nothing missing.
+skate3rust's perf13 measured the same: its zcull=0 step changed no pass.
+
+nouveau_horizon_tune switch 4: -1 (the default) or 0 leaves ZDIR_LESS, 1 sets ZDIR_GREATER.
+It is read as each render pass begins, like switch 1 (ZCULL off).
+
+Saved ZCULL data must be loaded with the direction it was built with (olealgoritme's patch
+again), and the switch can change between frames. So each image's ZCULL plane keeps the
+direction it was last cleared with, and a pass that would load data built with the other
+direction clears it instead, to the far value of the pass's direction (0.0 for GREATER, 1.0 for
+LESS; olealgoritme's patch seeds a discarded depth buffer's ZCULL the same way): a bound every
+depth meets, so ZCULL culls nothing until the pass's draws build it up again, whatever the depth
+buffer holds. The game must change the switch only between frames, before a frame's passes are
+recorded (skate3rust's performance.rs sets it from the render world as a frame begins).
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 3abd30e..528a46f 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -60,11 +60,16 @@ enum nvk_switch_tune {
+    NVK_SWITCH_TUNE_ZCULL_SERIALIZATION,
+    /* SET_API_MANDATED_EARLY_Z after each fragment shader's own: 0 or 1. */
+    NVK_SWITCH_TUNE_EARLY_Z,
++   /* SET_ZCULL_DIR_FORMAT's ZDIR (patches/mesa-switch/0009): 0 LESS, which
++    * NVK always sets, or 1 GREATER, for reversed depth (cleared to 0.0 and
++    * tested GREATER or GEQUAL).
++    */
++   NVK_SWITCH_TUNE_ZCULL_DIR,
+    NVK_SWITCH_TUNE_COUNT,
+ };
+ 
+ static int32_t nvk_switch_tune_values[NVK_SWITCH_TUNE_COUNT] = {
+-   -1, -1, -1, -1,
++   -1, -1, -1, -1, -1,
+ };
+ 
+ bool nouveau_horizon_tune(uint32_t knob, int32_t value);
+@@ -87,6 +92,7 @@ nouveau_horizon_tune(uint32_t knob, int32_t value)
+       valid = value == -1 || (value >= 0 && (value & ~0x31) == 0);
+       break;
+    case NVK_SWITCH_TUNE_EARLY_Z:
++   case NVK_SWITCH_TUNE_ZCULL_DIR:
+       valid = value == -1 || value == 0 || value == 1;
+       break;
+    default:
+@@ -1620,6 +1626,15 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+    use_zcull &= zcull_image != NULL &&
+                 (zcull_plane != NULL || zcull_image->zcull.transient_eligible);
+    use_zcull &= nvk_switch_tune(NVK_SWITCH_TUNE_ZCULL) != 0;
++   /* Read once, so the direction set and the one a load is checked against
++    * below are the same.
++    */
++   const uint32_t zdir =
++      nvk_switch_tune(NVK_SWITCH_TUNE_ZCULL_DIR) == 1 ?
++      NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_GREATER :
++      NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_LESS;
++#else
++   const uint32_t zdir = NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_LESS;
+ #endif
+    render->zcull_enabled = use_zcull;
+ 
+@@ -1688,8 +1703,11 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+       P_IMMD(p, NV9097, SET_ZCULL_DIR_FORMAT, {
+          /* I've tried a variety of depthCompareOp values and depth clear
+           * values, but the blob seems to always use ZDIR_LESS
++          *
++          * ZDIR_LESS unless the Switch's ZCULL_DIR switch asks for GREATER
++          * (patches/mesa-switch/0009).
+           */
+-         .zdir = ZDIR_LESS,
++         .zdir = zdir,
+          .zformat = nvk_vk_format_to_zcull_format(fmt),
+       });
+ 
+@@ -1800,11 +1818,35 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+ 
+    if (use_zcull) {
+       /* A resumed pass has no guaranteed snapshot; rebuild without touching depth. */
+-      const VkAttachmentLoadOp load_op =
++      VkAttachmentLoadOp load_op =
+          (render->flags & VK_RENDERING_RESUMING_BIT) ?
+          VK_ATTACHMENT_LOAD_OP_DONT_CARE :
+          pRenderingInfo->pDepthAttachment->loadOp;
+       float depth = 0.0f;
++#ifdef HAVE_SWITCH_PLATFORM
++      /* Saved ZCULL data must be loaded with the direction it was built
++       * with, and the switch can change between frames.  Data built with
++       * the other direction is cleared instead, to the far value of this
++       * pass's direction (0.0 for GREATER, 1.0 for LESS): a bound every
++       * depth meets, so ZCULL culls nothing until this pass's draws build
++       * it up again, whatever the depth buffer holds.  The game changes the
++       * switch only between frames, before a frame's passes are recorded.
++       * A load recorded before its frame's clear (passes record on several
++       * threads) is checked against the previous frame's clear: the same
++       * direction as this frame's if the switch didn't change, and if it
++       * did, the load clears.
++       */
++      if (zcull_plane != NULL) {
++         if (load_op == VK_ATTACHMENT_LOAD_OP_LOAD &&
++             p_atomic_read(&zcull_plane->zdir) != zdir) {
++            load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++            depth = zdir == NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_GREATER ?
++                    0.0f : 1.0f;
++         }
++         if (load_op != VK_ATTACHMENT_LOAD_OP_LOAD)
++            p_atomic_set(&zcull_plane->zdir, zdir);
++      }
++#endif
+       switch (load_op) {
+          case VK_ATTACHMENT_LOAD_OP_CLEAR:
+             depth =
+diff --git a/src/nouveau/vulkan/nvk_image.h b/src/nouveau/vulkan/nvk_image.h
+index 6dd4c3d..c00eb33 100644
+--- a/src/nouveau/vulkan/nvk_image.h
++++ b/src/nouveau/vulkan/nvk_image.h
+@@ -93,6 +93,13 @@ struct nvk_zcull_plane {
+    uint64_t addr;
+    uint64_t plane_offset_B;
+    bool transient_eligible;
++   /* The ZDIR (SET_ZCULL_DIR_FORMAT) the saved data was last cleared with,
++    * LESS (0) until then.  On the Switch the direction can change between
++    * frames (patches/mesa-switch/0009), and data must be loaded with the
++    * direction it was built with.  Command buffers record on any thread:
++    * read and written with p_atomic_*.
++    */
++   uint32_t zdir;
+ };
+ 
+ struct nvk_image {

@@ -8,7 +8,6 @@ description = "Minimal 3D Bevy test application for Nintendo Switch"
 [dependencies]
 bevy = { version = "0.19", default-features = false, features = [
     "bevy_window",
-    "bevy_winit",
     "bevy_render",
     "bevy_core_pipeline",
     "bevy_pbr",
@@ -17,8 +16,14 @@ bevy = { version = "0.19", default-features = false, features = [
     "bevy_text",
     "bevy_ui",
     "bevy_ui_render",
-    "bevy_gilrs",
-    "x11",
+    "default_font",
     "png",
+    # TonyMcMapface, Camera3d's default tonemapper, needs these; Bevy's `3d` feature set brings
+    # them (`3d_api`). Without them Bevy logs an error and samples a 1-texel placeholder LUT.
+    "tonemapping_luts",
+    "ktx2",
+    "zstd_rust",
 ] }
-bevy_horizon = { path = "../../crates/bevy_horizon" }
+# `vulkan` links NVK, so bevy_render draws through wgpu's Vulkan backend.
+# `fps_overlay` adds Bevy's FPS overlay: hold (−) and press (+) to show or hide it.
+bevy_horizon = { path = "../../crates/bevy_horizon", features = ["vulkan", "fps_overlay", "render"] }

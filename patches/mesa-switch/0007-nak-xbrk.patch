@@ -1,0 +1,305 @@
+bevy-horizon: NAK_DEBUG=xbrk, BRKs that leave scoreboards in flight
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at d4a00ea0ab3f59afb967cc5d779e4263d237bd77, after 0001 to 0006. scripts/build_nvk.sh applies
+it; this text before the first "diff --git" line is ignored by git apply.
+
+0004's NAK_DEBUG=xbar keeps scoreboards in flight across forward BRA and SYNC, but every BRK
+still waits on all of them. Before Turing, NVK turns a texture lookup whose descriptor may differ
+across the warp into a loop over the distinct descriptors (nvk_shader.c,
+nir_lower_non_uniform_access), and each pass of it ends in a BRK straight after the texture
+instruction. So each such lookup waits out its own latency before the next can start.
+
+NAK_DEBUG=xbrk, with xbar, lets a BRK that ends its block and goes only forward keep them in
+flight as well, and the wait moves to the first use after the loop. The lanes that break write
+only their own lanes, and so do the lanes still looping: the argument xbar already makes for the
+two sides of a divergent if. CONT, EXIT and a BRK whose target is laid out before it still wait
+on everything, and xbar_verify() checks the result as before.
+
+On Skate 3's world fragment shader (SM53, xbar,sink,remat, SKATE_WORLD_PAGE_ARRAY), the
+instruction count (2295) and static cycles (23749) don't change, since NAK's estimate leaves out
+scoreboard waits. None of its 12 BRKs waits now, where each waited before, and on the path that
+a third of the world takes, a warp on one page has its four lookups in flight at once rather than
+one after another. No shader failed to compile or verify on the PC (nakhost, SM53, debug build
+with assertions), and calc_instr_deps.rs gains two tests (test_xbar_brk and
+test_xbar_brk_backward_waits). Not yet run on hardware; off unless set.
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 13ad3ce..63ac8e9 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -34,6 +34,7 @@ enum DebugFlags {
+     Sink,
+     Remat,
+     UBra,
++    XBrk,
+ }
+ 
+ pub struct Debug {
+@@ -66,6 +67,7 @@ impl Debug {
+                 "sink" => flags |= 1 << DebugFlags::Sink as u8,
+                 "remat" => flags |= 1 << DebugFlags::Remat as u8,
+                 "ubra" => flags |= 1 << DebugFlags::UBra as u8,
++                "xbrk" => flags |= 1 << DebugFlags::XBrk as u8,
+                 unk => eprintln!("Unknown NAK_DEBUG flag \"{}\"", unk),
+             }
+         }
+@@ -127,6 +129,10 @@ pub trait GetDebugFlags {
+     fn ubra(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::UBra as u8) != 0
+     }
++
++    fn xbrk(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::XBrk as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+diff --git a/src/nouveau/compiler/nak/calc_instr_deps.rs b/src/nouveau/compiler/nak/calc_instr_deps.rs
+index 278f0ce..7f6365f 100644
+--- a/src/nouveau/compiler/nak/calc_instr_deps.rs
++++ b/src/nouveau/compiler/nak/calc_instr_deps.rs
+@@ -761,11 +761,18 @@ fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
+ //    straight after a SYNC, can't see its writes before the lanes reconverge.
+ //    That's why the analysis only follows CFG edges.
+ //
+-// Back-edges, BRK, CONT and EXIT still wait on everything, so the forward
+-// edges form a DAG that one pass in block order covers exactly.  The result
+-// is checked by xbar_verify(), an independent hazard check over the whole
+-// CFG.  The caller keeps assign_barriers()'s result if the check fails, or
+-// if it rejects assign_barriers()'s own result.
++// Back-edges, CONT and EXIT still wait on everything, so the forward edges
++// form a DAG that one pass in block order covers exactly.  So does BRK,
++// unless NAK_DEBUG=xbrk is also set.  A BRK leaves its loop for the lanes
++// that take it, and with xbrk it may leave their scoreboards in flight like
++// a forward BRA: the lanes still looping write only their own lanes, as on
++// the other side of a divergent branch, and the BRK's edge goes forward to
++// the loop's exit.  It is what lets a lookup made in a loop, such as the
++// one NVK makes of a texture whose descriptor may differ across the warp,
++// overlap whatever follows the loop rather than wait out its latency at
++// the BRK.  The result is checked by xbar_verify(), an independent hazard
++// check over the whole CFG.  The caller keeps assign_barriers()'s result if
++// the check fails, or if it rejects assign_barriers()'s own result.
+ 
+ /// Scoreboarded accesses to one register that may still be in flight,
+ /// merged over all forward paths (sorted dep indices).
+@@ -849,14 +856,17 @@ impl XbarDeps {
+ }
+ 
+ /// Whether `instr`, at `ip` in block `bi`, may leave scoreboards in flight:
+-/// a BRA or SYNC that ends its block and only goes forward.
++/// a BRA or SYNC, or with `keep_brk` a BRK, that ends its block and only
++/// goes forward.
+ fn xbar_branch_keeps_bars(
+     f: &Function,
+     bi: usize,
+     ip: usize,
+     instr: &Instr,
++    keep_brk: bool,
+ ) -> bool {
+-    matches!(&instr.op, Op::Bra(_) | Op::Sync(_))
++    (matches!(&instr.op, Op::Bra(_) | Op::Sync(_))
++        || keep_brk && matches!(&instr.op, Op::Brk(_)))
+         && ip + 1 == f.blocks[bi].instrs.len()
+         && f.blocks.succ_indices(bi).iter().all(|&s| s > bi)
+ }
+@@ -876,7 +886,11 @@ fn xbar_check_cfg(f: &Function) -> Result<(), String> {
+ 
+ /// Pass 1: the deps each instruction waits on.  Mirrors the loop in
+ /// assign_barriers(), with per-block state merged at forward joins.
+-fn xbar_calc_waits(f: &Function, sm: &ShaderModelInfo) -> XbarDeps {
++fn xbar_calc_waits(
++    f: &Function,
++    sm: &ShaderModelInfo,
++    keep_brk: bool,
++) -> XbarDeps {
+     let mut deps = XbarDeps::default();
+     let mut block_in: Vec<Option<XbarDepState>> =
+         (0..f.blocks.len()).map(|_| None).collect();
+@@ -885,7 +899,9 @@ fn xbar_calc_waits(f: &Function, sm: &ShaderModelInfo) -> XbarDeps {
+         let mut st = block_in[bi].take().unwrap_or_default();
+         for (ip, instr) in f.blocks[bi].instrs.iter().enumerate() {
+             let mut waits = Vec::new();
+-            if instr.is_branch() && !xbar_branch_keeps_bars(f, bi, ip, instr) {
++            if instr.is_branch()
++                && !xbar_branch_keeps_bars(f, bi, ip, instr, keep_brk)
++            {
+                 waits.extend(st.active.iter().copied());
+             } else {
+                 st.uses.for_each_instr_pred_mut(instr, |u| {
+@@ -1007,6 +1023,7 @@ fn xbar_assign_bars(
+     f: &Function,
+     sm: &ShaderModelInfo,
+     deps: &XbarDeps,
++    keep_brk: bool,
+ ) -> Vec<Vec<XbarPlan>> {
+     let mut plans: Vec<Vec<XbarPlan>> = f
+         .blocks
+@@ -1021,7 +1038,9 @@ fn xbar_assign_bars(
+         for (ip, instr) in f.blocks[bi].instrs.iter().enumerate() {
+             let plan = &mut plans[bi][ip];
+             let mut mask = 0_u8;
+-            if instr.is_branch() && !xbar_branch_keeps_bars(f, bi, ip, instr) {
++            if instr.is_branch()
++                && !xbar_branch_keeps_bars(f, bi, ip, instr, keep_brk)
++            {
+                 for (b, bar) in st.bars.iter().enumerate() {
+                     if !bar.is_empty() {
+                         mask |= 1 << b;
+@@ -1270,6 +1289,7 @@ fn xbar_plans_from_deps(f: &Function) -> Vec<Vec<XbarPlan>> {
+ fn assign_barriers_xbar(
+     f: &mut Function,
+     sm: &ShaderModelInfo,
++    keep_brk: bool,
+ ) -> Result<(), String> {
+     let saved: Vec<Vec<(u8, bool, u8, u8)>> = f
+         .blocks
+@@ -1290,8 +1310,8 @@ fn assign_barriers_xbar(
+         .map_err(|e| format!("verifier rejected legacy barriers: {e}"))?;
+ 
+     xbar_check_cfg(f)?;
+-    let deps = xbar_calc_waits(f, sm);
+-    let plans = xbar_assign_bars(f, sm, &deps);
++    let deps = xbar_calc_waits(f, sm, keep_brk);
++    let plans = xbar_assign_bars(f, sm, &deps, keep_brk);
+     xbar_verify(f, sm, &plans)?;
+ 
+     for (bi, b) in f.blocks.iter_mut().enumerate() {
+@@ -1677,7 +1697,9 @@ impl Shader<'_> {
+             let mut min_num_static_cycles = 0u64;
+             for f in &mut self.functions {
+                 if xbar {
+-                    if let Err(e) = assign_barriers_xbar(f, self.sm) {
++                    if let Err(e) =
++                        assign_barriers_xbar(f, self.sm, DEBUG.xbrk())
++                    {
+                         eprintln!("NAK xbar: kept legacy barriers: {e}");
+                     }
+                 } else {
+@@ -1882,7 +1904,7 @@ mod tests {
+         xbar_verify(&legacy, &sm, &xbar_plans_from_deps(&legacy)).unwrap();
+ 
+         let mut f = xbar_if_else();
+-        assign_barriers_xbar(&mut f, &sm).unwrap();
++        assign_barriers_xbar(&mut f, &sm, false).unwrap();
+         // Neither SYNC waits
+         assert_eq!(xbar_mask(&f, 1, 1), 0);
+         assert_eq!(xbar_mask(&f, 2, 1), 0);
+@@ -1900,7 +1922,7 @@ mod tests {
+     fn test_xbar_verify_rejects_missing_waits() {
+         let sm = xbar_sm();
+         let mut f = xbar_if_else();
+-        assign_barriers_xbar(&mut f, &sm).unwrap();
++        assign_barriers_xbar(&mut f, &sm, false).unwrap();
+         let plans = xbar_plans_from_deps(&f);
+ 
+         let mut no_raw = plans.clone();
+@@ -1947,7 +1969,7 @@ mod tests {
+                 ),
+             ]
+         });
+-        assign_barriers_xbar(&mut f, &sm).unwrap();
++        assign_barriers_xbar(&mut f, &sm, false).unwrap();
+         assert_eq!(xbar_mask(&f, 1, 1), 0);
+         // The rcp after the join can't reuse the scoreboard that the
+         // then-side rcp may still hold, so r6 = r4 doesn't wait for it.
+@@ -1970,7 +1992,7 @@ mod tests {
+                 (vec![xbar_mov(3, 1), Instr::new(OpExit {})], vec![]),
+             ]
+         });
+-        assign_barriers_xbar(&mut f, &sm).unwrap();
++        assign_barriers_xbar(&mut f, &sm, false).unwrap();
+         assert_eq!(xbar_mask(&f, 1, 0), xbar_bit(&f, 0, 0, true));
+         assert_eq!(xbar_mask(&f, 1, 2), xbar_bit(&f, 1, 1, true));
+     }
+@@ -1991,11 +2013,89 @@ mod tests {
+         let mut legacy = build();
+         assign_barriers(&mut legacy, &sm);
+         let mut f = build();
+-        assign_barriers_xbar(&mut f, &sm).unwrap();
++        assign_barriers_xbar(&mut f, &sm, false).unwrap();
+         for (a, b) in legacy.blocks[0].instrs.iter().zip(&f.blocks[0].instrs) {
+             assert_eq!(a.deps.wt_bar_mask, b.deps.wt_bar_mask, "{b}");
+             assert_eq!(a.deps.rd_bar(), b.deps.rd_bar(), "{b}");
+             assert_eq!(a.deps.wr_bar(), b.deps.wr_bar(), "{b}");
+         }
+     }
++
++    // The shape of NVK's loop over the descriptors of a non-uniform lookup,
++    // laid out as NAK lays it out, with the loop's exit before its CONT:
++    // loop { r0 = r6; if (p0) { r1 = rcp(r0); break } }; r3 = r1
++    fn xbar_break_loop() -> Function {
++        xbar_function(6, |l| {
++            vec![
++                (vec![Instr::new(OpPBk { target: l[3] })], vec![1]),
++                (
++                    vec![
++                        Instr::new(OpPCnt { target: l[1] }),
++                        xbar_mov(0, 6),
++                        Instr::new(OpSSy { target: l[5] }),
++                        xbar_bra(l[4]),
++                    ],
++                    vec![2, 4],
++                ),
++                (
++                    vec![xbar_mufu(1, 0), Instr::new(OpBrk { target: l[3] })],
++                    vec![3],
++                ),
++                (vec![xbar_mov(3, 1), Instr::new(OpExit {})], vec![]),
++                (vec![Instr::new(OpSync { target: l[5] })], vec![5]),
++                (vec![Instr::new(OpCont { target: l[1] })], vec![1]),
++            ]
++        })
++    }
++
++    #[test]
++    fn test_xbar_brk() {
++        let sm = xbar_sm();
++
++        let mut f = xbar_break_loop();
++        assign_barriers_xbar(&mut f, &sm, false).unwrap();
++        assert_ne!(xbar_mask(&f, 2, 1) & xbar_bit(&f, 2, 0, true), 0);
++        xbar_verify(&f, &sm, &xbar_plans_from_deps(&f)).unwrap();
++
++        let mut f = xbar_break_loop();
++        assign_barriers_xbar(&mut f, &sm, true).unwrap();
++        // The BRK doesn't wait for the rcp; r3 = r1 after the loop does.
++        assert_eq!(xbar_mask(&f, 2, 1), 0);
++        assert_eq!(xbar_mask(&f, 3, 0), xbar_bit(&f, 2, 0, true));
++        // Lanes still in the loop write r0 for themselves while the rcp of
++        // lanes that have left may still be reading theirs.
++        assert_eq!(xbar_mask(&f, 1, 1), 0);
++        xbar_verify(&f, &sm, &xbar_plans_from_deps(&f)).unwrap();
++    }
++
++    #[test]
++    fn test_xbar_brk_backward_waits() {
++        // A loop with two breaks and its exit laid out between them, so the
++        // second BRK goes back and must still wait on everything:
++        // loop { if (p0) { r1 = rcp(r0); break } r1 = rcp(r2); break }; r3 = r1
++        let sm = xbar_sm();
++        let mut f = xbar_function(5, |l| {
++            vec![
++                (vec![Instr::new(OpPBk { target: l[3] })], vec![1]),
++                (
++                    vec![Instr::new(OpPCnt { target: l[1] }), xbar_bra(l[4])],
++                    vec![2, 4],
++                ),
++                (
++                    vec![xbar_mufu(1, 0), Instr::new(OpBrk { target: l[3] })],
++                    vec![3],
++                ),
++                (vec![xbar_mov(3, 1), Instr::new(OpExit {})], vec![]),
++                (
++                    vec![xbar_mufu(1, 2), Instr::new(OpBrk { target: l[3] })],
++                    vec![3],
++                ),
++            ]
++        });
++        assign_barriers_xbar(&mut f, &sm, true).unwrap();
++        assert_eq!(xbar_mask(&f, 2, 1), 0);
++        assert_eq!(xbar_mask(&f, 3, 0), xbar_bit(&f, 2, 0, true));
++        assert_ne!(xbar_mask(&f, 4, 1) & xbar_bit(&f, 4, 0, true), 0);
++        xbar_verify(&f, &sm, &xbar_plans_from_deps(&f)).unwrap();
++    }
+ }
