@@ -24,7 +24,7 @@ Rust has no built-in Switch target, so `aarch64-nintendo-horizon.json`, at the r
 | `features` | `+v8a,+neon,+crypto,+crc` | The CPU features C code also gets, from `.cargo/config.toml`. |
 | `panic-strategy` | `abort` | No unwinding: a panic writes `panic.txt` and ends the app. |
 | `linker`, `linker-flavor` | `rust-lld`, `gnu-lld` | LLD does the final link, not GCC. |
-| `pre-link-args` | `--wrap=threadCreate`, `--wrap=fchmod`, `--wrap=rename`, `--wrap=rmdir`, `--wrap=nwindowConfigureBuffer`, `--wrap=nwindowQueueBuffer`, `--wrap=nwindowReleaseBuffers` | Send these calls through `bevy_horizon` ([New threads](#new-threads), [File calls](#file-calls), [How a frame reaches the screen](rendering.md#how-a-frame-reaches-the-screen)). |
+| `pre-link-args` | `--wrap=threadCreate`, `--wrap=fchmod`, `--wrap=rename`, `--wrap=rmdir`, `--wrap=nwindowConfigureBuffer`, `--wrap=nwindowQueueBuffer`, `--wrap=nwindowReleaseBuffers`, `--wrap=bqDequeueBuffer` | Send these calls through `bevy_horizon` ([New threads](#new-threads), [File calls](#file-calls), [How a frame reaches the screen](rendering.md#how-a-frame-reaches-the-screen)). |
 | `has-thread-local`, `tls-model` | `true`, `local-exec` | [Thread-locals](glossary.md#thread-local-storage) read [TPIDR_EL0](glossary.md#tpidr_el0) directly. |
 | `position-independent-executables`, `relocation-model`, `dynamic-linking` | `true`, `pic`, `true` | The [loader](glossary.md#loader) puts the NRO at any address, and libnx's startup applies the relocations. |
 | `frame-pointer` | `always` | The CPU profiler and crash backtraces walk the frame records. |

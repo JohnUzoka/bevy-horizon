@@ -31,7 +31,8 @@
       "--wrap=rmdir",
       "--wrap=nwindowConfigureBuffer",
       "--wrap=nwindowQueueBuffer",
-      "--wrap=nwindowReleaseBuffers"
+      "--wrap=nwindowReleaseBuffers",
+      "--wrap=bqDequeueBuffer"
     ]
   },
   "relocation-model": "pic",

@@ -292,6 +292,17 @@ pub mod horizon_stubs {
         /// libnx's own `nwindowReleaseBuffers`; `--wrap=nwindowReleaseBuffers` gives it this
         /// name.
         fn __real_nwindowReleaseBuffers(nw: *mut c_void) -> u32;
+        /// libnx's own `bqDequeueBuffer`; `--wrap=bqDequeueBuffer` gives it this name.
+        fn __real_bqDequeueBuffer(
+            binder: *mut c_void,
+            is_async: bool,
+            width: u32,
+            height: u32,
+            format: i32,
+            usage: u32,
+            slot: *mut i32,
+            fence: *mut NvMultiFence,
+        ) -> u32;
     }
 
     /// How many images NVK's Switch WSI gives a swapchain (bevy-horizon's Mesa patch 0025 reads
@@ -322,10 +333,19 @@ pub mod horizon_stubs {
     #[repr(C, align(8))]
     struct Parcel([u8; 0x420]);
 
+    /// libnx's `NvMultiFence` (nvidia/fence.h): up to four sync points, each an id and a value.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct NvMultiFence {
+        num_fences: u32,
+        fences: [[u32; 2]; 4],
+    }
+
     unsafe extern "C" {
         fn bqQuery(binder: *mut c_void, what: i32, value: *mut i32) -> u32;
         /// With no buffer (`buf` null), the slot is no longer preallocated.
         fn bqSetPreallocatedBuffer(binder: *mut c_void, slot: i32, buf: *const c_void) -> u32;
+        fn bqCancelBuffer(binder: *mut c_void, slot: i32, fence: *const NvMultiFence) -> u32;
         fn parcelCreate(parcel: *mut Parcel);
         fn parcelWriteInterfaceToken(parcel: *mut Parcel, token: *const c_char);
         fn parcelWriteInt32(parcel: *mut Parcel, value: i32);
@@ -392,17 +412,171 @@ pub mod horizon_stubs {
     static WINDOW_QUEUED_SLOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     static WINDOW_QUEUED: AtomicU32 = AtomicU32::new(0);
     static WINDOW_LAST_SLOT: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+    /// Whether the current producer's first dequeue has come (`__wrap_bqDequeueBuffer`).
+    static WINDOW_FIRST_DEQUEUED: AtomicBool = AtomicBool::new(false);
     /// Frames after which a producer's slots are logged: early, for a short run, and later.
-    const WINDOW_FRAMES_LOGGED: [u32; 2] = [60, 600];
+    const WINDOW_FRAMES_LOGGED: [u32; 3] = [60, 120, 600];
     /// The slots a swapchain needs going round to keep up with the screen: one on it, one queued
     /// for the next vsync, and one being drawn.
     const SLOTS_TO_KEEP_UP: u32 = 3;
 
+    /// Whether the window's slots are taken and given back before a producer's first frame and
+    /// when its first 60 frames went round too few of them: unless `BH_WINDOW_PROBE=0`.
+    fn window_probe_enabled() -> bool {
+        std::env::var("BH_WINDOW_PROBE").map_or(true, |value| value.trim() != "0")
+    }
+
+    /// libnx's binder results (`LibnxBinderError_*` in result.h, module 349), by name.
+    fn describe_binder_result(rc: u32) -> String {
+        let name = match (rc & 0x1ff == 349).then_some(rc >> 9) {
+            Some(3) => "InvalidOperation",
+            Some(4) => "BadValue",
+            Some(8) => "NoInit",
+            Some(14) => "WouldBlock",
+            _ => return format!("0x{rc:x}"),
+        };
+        format!("{name}, 0x{rc:x}")
+    }
+
+    /// The slots the window's queue gives out now, at most `max`, in the order it gives them
+    /// (`DequeueBuffer` as async, which never waits), each with its fence, and the result that
+    /// stopped it, if one did.
+    ///
+    /// # Safety
+    /// `binder` is a connected window's, whose producer has nothing dequeued and uses it on this
+    /// thread only.
+    unsafe fn take_window_slots(
+        binder: *mut c_void,
+        (width, height, format, usage): (u32, u32, i32, u32),
+        max: u32,
+    ) -> (Vec<(i32, NvMultiFence)>, Option<u32>) {
+        let mut taken = Vec::new();
+        while taken.len() < max as usize {
+            let mut slot = -1;
+            let mut fence = NvMultiFence::default();
+            // SAFETY: the caller's binder; libnx writes the slot and the fence.
+            let rc = unsafe {
+                __real_bqDequeueBuffer(binder, true, width, height, format, usage, &mut slot, &mut fence)
+            };
+            // A refused dequeue says slot -1; any other slot goes back, whatever the result.
+            if (0..64).contains(&slot) {
+                taken.push((slot, fence));
+            }
+            if rc != 0 || !(0..64).contains(&slot) {
+                return (taken, (rc != 0).then_some(rc));
+            }
+        }
+        (taken, None)
+    }
+
+    /// Puts the slots [`take_window_slots`] took back in the window's queue (`CancelBuffer`, each
+    /// with the fence it came with), and returns the first that failed.
+    ///
+    /// # Safety
+    /// As for [`take_window_slots`], with `taken` from it.
+    unsafe fn give_back_window_slots(binder: *mut c_void, taken: &[(i32, NvMultiFence)]) -> Option<(i32, u32)> {
+        let mut failed = None;
+        for (slot, fence) in taken {
+            // SAFETY: the caller's binder, and a slot it took.
+            let rc = unsafe { bqCancelBuffer(binder, *slot, fence) };
+            if rc != 0 && failed.is_none() {
+                failed = Some((*slot, rc));
+            }
+        }
+        failed
+    }
+
+    /// "slots 2, 3" for `taken`, in its order, and how many of them came with a fence.
+    fn describe_taken(taken: &[(i32, NvMultiFence)]) -> String {
+        let slots = taken.iter().map(|(slot, _)| slot.to_string()).collect::<Vec<_>>().join(", ");
+        let fenced = taken
+            .iter()
+            .filter(|(_, fence)| {
+                fence.fences[..fence.num_fences.min(4) as usize].iter().any(|point| (point[0] as i32) >= 0)
+            })
+            .count();
+        match (taken.len(), fenced) {
+            (0, _) => "no slot".to_string(),
+            (1, 0) => format!("slot {slots}"),
+            (1, _) => format!("slot {slots}, with a fence"),
+            (_, 0) => format!("slots {slots}"),
+            (_, fenced) => format!("slots {slots}, {fenced} of them with a fence"),
+        }
+    }
+
+    /// Takes every slot the window's queue gives out and puts each back, then logs them, for
+    /// the producer and `when` it was.
+    ///
+    /// # Safety
+    /// As for [`take_window_slots`].
+    unsafe fn cycle_window_slots(
+        binder: *mut c_void,
+        request: (u32, u32, i32, u32),
+        producer: u32,
+        configured: u64,
+        when: &str,
+    ) {
+        // SAFETY: the caller's contract.
+        let (taken, stopped) = unsafe { take_window_slots(binder, request, configured.count_ones()) };
+        let failed = unsafe { give_back_window_slots(binder, &taken) };
+        let stopped = stopped.map_or(String::new(), |rc| format!(", then {}", describe_binder_result(rc)));
+        let back = match taken.len() {
+            0 => "",
+            1 => "; it went straight back",
+            _ => "; they went straight back",
+        };
+        tracing::info!(
+            "[Window] producer {producer} {when}: the window gave out {}{stopped} (it configured slots {configured:#b}){back}",
+            describe_taken(&taken),
+        );
+        if let Some((slot, rc)) = failed {
+            tracing::warn!("[Window] producer {producer}: giving slot {slot} back failed ({})", describe_binder_result(rc));
+        }
+    }
+
+    /// Before each producer's first frame, takes every slot the window's queue gives out and puts
+    /// it straight back (`DequeueBuffer` as async, then `CancelBuffer`), and logs the slots in the
+    /// order the queue gave them. After the start-up splash's framebuffer had been on the window,
+    /// Skate 3's four-image swapchain went through slots 0 and 1 only, and waited about 27 ms a
+    /// frame for one of them, though the window let it dequeue four (sk8 findings 59 §22); a
+    /// swapchain on a window nothing had used went through all of its slots. Android's queue
+    /// makes a buffer given back free and first in line (its frame number goes to 0). The target
+    /// spec links with `--wrap=bqDequeueBuffer`, which sends libnx's and NVK's dequeues here.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn __wrap_bqDequeueBuffer(
+        binder: *mut c_void,
+        is_async: bool,
+        width: u32,
+        height: u32,
+        format: i32,
+        usage: u32,
+        slot: *mut i32,
+        fence: *mut c_void,
+    ) -> u32 {
+        let configured = WINDOW_CONFIGURED.load(Ordering::Relaxed);
+        if configured != 0
+            && WINDOW_QUEUED.load(Ordering::Relaxed) == 0
+            && !WINDOW_FIRST_DEQUEUED.swap(true, Ordering::Relaxed)
+            && window_probe_enabled()
+        {
+            let producer = WINDOW_PRODUCER.load(Ordering::Relaxed);
+            // SAFETY: a producer's first dequeue: libnx and NVK's WSI both dequeue holding the
+            // window's lock, one buffer at a time, so nothing of it is dequeued.
+            unsafe {
+                cycle_window_slots(binder, (width, height, format, usage), producer, configured, "before its first frame");
+            }
+        }
+        // SAFETY: the caller's arguments, passed on as libnx takes them.
+        unsafe { __real_bqDequeueBuffer(binder, is_async, width, height, format, usage, slot, fence.cast()) }
+    }
+
     /// Counts the slots each producer of the window queues, and logs them with the window's
     /// buffer limit after each of `WINDOW_FRAMES_LOGGED` frames. A swapchain with fewer than
     /// `SLOTS_TO_KEEP_UP` going round waits for the screen to give one back before it can start
-    /// its next frame; when the first count finds that, and the limit below the buffers it
-    /// configured, the limit is raised to them, once (`set_window_buffer_count`).
+    /// its next frame. When the first count finds that, the slots the queue gives out then are
+    /// taken, logged and given back, as before the first frame (`__wrap_bqDequeueBuffer`), and
+    /// with the window's limit below the buffers it configured, the limit is raised to them,
+    /// once (`set_window_buffer_count`).
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn __wrap_nwindowQueueBuffer(
         nw: *mut c_void,
@@ -439,10 +613,23 @@ pub mod horizon_stubs {
                     describe_limit(limit),
                 );
                 let wanted = configured.count_ones() as i32;
-                if frames == WINDOW_FRAMES_LOGGED[0]
-                    && queued.count_ones() < SLOTS_TO_KEEP_UP.min(configured.count_ones())
-                    && limit.is_ok_and(|limit| limit < wanted)
-                {
+                let starved = frames == WINDOW_FRAMES_LOGGED[0]
+                    && queued.count_ones() < SLOTS_TO_KEEP_UP.min(configured.count_ones());
+                if starved && window_probe_enabled() {
+                    let base = nw.cast::<u8>();
+                    // SAFETY: as above; the offsets are the fields libnx dequeues with.
+                    unsafe {
+                        let request = (
+                            base.add(NWINDOW_WIDTH).cast::<u32>().read(),
+                            base.add(NWINDOW_HEIGHT).cast::<u32>().read(),
+                            base.add(NWINDOW_FORMAT).cast::<i32>().read(),
+                            base.add(NWINDOW_USAGE).cast::<u32>().read(),
+                        );
+                        let when = format!("with its first {frames} frames in slots {queued:#b}");
+                        cycle_window_slots(base.add(NWINDOW_BINDER).cast(), request, producer, configured, &when);
+                    }
+                }
+                if starved && limit.is_ok_and(|limit| limit < wanted) {
                     // SAFETY: as above.
                     let rc = unsafe { set_window_buffer_count(nw, wanted) };
                     let limit = unsafe { window_buffer_limit(nw) };
@@ -462,7 +649,10 @@ pub mod horizon_stubs {
     const NWINDOW_MAGIC: u32 = 0x6E69_574E;
     const NWINDOW_SLOTS_CONFIGURED: usize = 48;
     const NWINDOW_CUR_SLOT: usize = 64;
+    const NWINDOW_WIDTH: usize = 68;
+    const NWINDOW_HEIGHT: usize = 72;
     const NWINDOW_FORMAT: usize = 76;
+    const NWINDOW_USAGE: usize = 80;
     const NWINDOW_IS_CONNECTED: usize = 124;
 
     /// libnx takes a window's pixel format from the first buffer configured on it only while the
@@ -508,6 +698,7 @@ pub mod horizon_stubs {
                     WINDOW_CONFIGURED.store(0, Ordering::Relaxed);
                     WINDOW_QUEUED_SLOTS.store(0, Ordering::Relaxed);
                     WINDOW_QUEUED.store(0, Ordering::Relaxed);
+                    WINDOW_FIRST_DEQUEUED.store(false, Ordering::Relaxed);
                 }
             }
         }
