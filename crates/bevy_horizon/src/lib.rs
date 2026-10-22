@@ -69,6 +69,8 @@ pub mod profiler;
 #[cfg(any(feature = "render", feature = "render_0_18"))]
 pub mod uploads;
 #[cfg(target_os = "horizon")]
+pub mod splash;
+#[cfg(target_os = "horizon")]
 pub mod window;
 
 use bevy_app::{App, Plugin};
