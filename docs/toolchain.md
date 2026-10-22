@@ -24,7 +24,7 @@ Rust has no built-in Switch target, so `aarch64-nintendo-horizon.json`, at the r
 | `features` | `+v8a,+neon,+crypto,+crc` | The CPU features C code also gets, from `.cargo/config.toml`. |
 | `panic-strategy` | `abort` | No unwinding: a panic writes `panic.txt` and ends the app. |
 | `linker`, `linker-flavor` | `rust-lld`, `gnu-lld` | LLD does the final link, not GCC. |
-| `pre-link-args` | `--wrap=threadCreate`, `--wrap=fchmod`, `--wrap=rename`, `--wrap=rmdir` | Send these calls through `bevy_horizon` ([New threads](#new-threads), [File calls](#file-calls)). |
+| `pre-link-args` | `--wrap=threadCreate`, `--wrap=fchmod`, `--wrap=rename`, `--wrap=rmdir`, `--wrap=nwindowConfigureBuffer`, `--wrap=nwindowQueueBuffer`, `--wrap=nwindowReleaseBuffers` | Send these calls through `bevy_horizon` ([New threads](#new-threads), [File calls](#file-calls), [How a frame reaches the screen](rendering.md#how-a-frame-reaches-the-screen)). |
 | `has-thread-local`, `tls-model` | `true`, `local-exec` | [Thread-locals](glossary.md#thread-local-storage) read [TPIDR_EL0](glossary.md#tpidr_el0) directly. |
 | `position-independent-executables`, `relocation-model`, `dynamic-linking` | `true`, `pic`, `true` | The [loader](glossary.md#loader) puts the NRO at any address, and libnx's startup applies the relocations. |
 | `frame-pointer` | `always` | The CPU profiler and crash backtraces walk the frame records. |
@@ -106,7 +106,7 @@ rust-lld: error: relocation refers to a symbol in a discarded section: DW.ref.ru
 
 #### The mesa-switch patches
 
-The 24 patches are in `patches/mesa-switch/`, numbered in the order they apply; each one's header says what it changes and why. Lowercase names are `NAK_DEBUG` flags. NVK's reports go to stderr, which is `log.txt`.
+The 25 patches are in `patches/mesa-switch/`, numbered in the order they apply; each one's header says what it changes and why. Lowercase names are `NAK_DEBUG` flags. NVK's reports go to stderr, which is `log.txt`.
 
 - **GPU memory (0001):** NVK takes GPU memory from the top of the heap down ([platform-notes.md](platform-notes.md#nvk-takes-gpu-memory-from-the-top-of-the-heap)).
 - **On by default in Switch builds** (0019 and 0021), each measured faster on the console:
@@ -121,6 +121,7 @@ The 24 patches are in `patches/mesa-switch/`, numbered in the order they apply; 
 - **Register cap (0014):** `NAK_GPR_LIMIT=n`, a multiple of 8 from 24 to 248, caps every shader; NAK ignores any other value and says so. An entry point whose name ends in `_gpr` and a number, such as `fragment_gpr48`, caps one shader.
 - **Switches for `nvk_tune`:** early Z, its hysteresis, ZCULL and ZCULL's serialisation (0008); ZCULL's direction (0009); and skipping [indirect draws](glossary.md#indirect-draw) with no instances, which Bevy's GPU culling issues for every culled batch (0012).
 - **Fixes:** GPU timestamps count the [Tegra X1](glossary.md#tegra-x1)'s 1.6276 ns tick (0002); NAK's unit tests build on a PC (0016); and pipeline-statistics queries, such as Bevy's per-pass statistics, count compute invocations correctly without stalling the GPU between compute passes (0017, 0018 and 0020).
+- **Swapchain images (0025):** a Switch swapchain has as many images as `bh_wsi_switch_image_count` says, from 3 to 8. bevy_horizon defines it: 3, or 4 after a start-up splash, and `BH_SWAPCHAIN_IMAGES` sets it ([How a frame reaches the screen](rendering.md#how-a-frame-reaches-the-screen)). Any other program that links NVK must define it too.
 
 **Setting NAK's options.** `NAK_DEBUG` takes a comma-separated list: `name` turns a flag on and `-name` turns it off, so `NAK_DEBUG=stats,-plat` logs shader statistics and turns `plat` off. NAK prints the flags in effect. It reads `NAK_DEBUG` and `NAK_GPR_LIMIT` once, and both are part of the shader cache's key, so changing them compiles the shaders again. Set them with `std::env::set_var` at the start of `main`, before you build the App.
 

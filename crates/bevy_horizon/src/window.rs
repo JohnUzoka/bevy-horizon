@@ -66,9 +66,9 @@ fn attach_default_nwindow(
     if crate::splash::held() {
         return;
     }
-    crate::splash::close();
-    // After a splash, a display layer of the game's own (`splash::game_window`).
-    let Some(n_window) = NonNull::new(crate::splash::game_window()) else {
+    let after_splash = crate::splash::close();
+    crate::compat::horizon_stubs::set_swapchain_images(after_splash);
+    let Some(n_window) = NonNull::new(unsafe { nwindowGetDefault() }) else {
         tracing::error!("nwindowGetDefault returned null; nothing can be drawn");
         return;
     };
@@ -85,10 +85,5 @@ fn attach_default_nwindow(
         *holder.0.lock().unwrap() = Some(wrapper.clone());
     }
     commands.entity(entity).insert(wrapper);
-    // SAFETY: libnx's default window lives as long as the process.
-    let default = n_window.as_ptr() == unsafe { nwindowGetDefault() };
-    tracing::info!(
-        "primary window attached to {}",
-        if default { "libnx's default NWindow" } else { "an NWindow on a display layer of its own" }
-    );
+    tracing::info!("primary window attached to libnx's default NWindow");
 }

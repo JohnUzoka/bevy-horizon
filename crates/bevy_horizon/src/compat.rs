@@ -289,20 +289,120 @@ pub mod horizon_stubs {
         fn __real_nwindowConfigureBuffer(nw: *mut c_void, slot: i32, buf: *mut c_void) -> u32;
         /// libnx's own `nwindowQueueBuffer`; `--wrap=nwindowQueueBuffer` gives it this name.
         fn __real_nwindowQueueBuffer(nw: *mut c_void, slot: i32, fence: *const c_void) -> u32;
+        /// libnx's own `nwindowReleaseBuffers`; `--wrap=nwindowReleaseBuffers` gives it this
+        /// name.
+        fn __real_nwindowReleaseBuffers(nw: *mut c_void) -> u32;
+    }
+
+    /// How many images NVK's Switch WSI gives a swapchain (bevy-horizon's Mesa patch 0025 reads
+    /// it, clamped to 3-8); [`set_swapchain_images`] sets it.
+    #[unsafe(no_mangle)]
+    #[allow(non_upper_case_globals)]
+    pub static bh_wsi_switch_image_count: AtomicU32 = AtomicU32::new(3);
+
+    /// The images of the swapchains made from here on: `BH_SWAPCHAIN_IMAGES` (3-8) when set, else
+    /// 4 after a start-up splash and 3 without one. After the splash's framebuffer had been on the
+    /// window, Skate 3's three-image swapchain got only two of them back from the screen and ran at
+    /// 20 fps where it ran at 33.7 without the splash (sk8 findings 59 §19); with a fourth image,
+    /// a slot the screen keeps still leaves it three.
+    pub fn set_swapchain_images(after_splash: bool) {
+        let set = std::env::var("BH_SWAPCHAIN_IMAGES").ok().and_then(|images| images.trim().parse::<u32>().ok());
+        let images = set.map_or(if after_splash { 4 } else { 3 }, |images| images.clamp(3, 8));
+        bh_wsi_switch_image_count.store(images, Ordering::Release);
+        if images != 3 {
+            tracing::info!(
+                "[Window] swapchains get {images} images ({})",
+                if set.is_some() { "BH_SWAPCHAIN_IMAGES" } else { "one more after the splash" }
+            );
+        }
+    }
+
+    /// libnx's `Parcel` (display/parcel.h): 0x400 bytes of payload and five fields, 0x420 bytes
+    /// on AArch64; only libnx reads it.
+    #[repr(C, align(8))]
+    struct Parcel([u8; 0x420]);
+
+    unsafe extern "C" {
+        fn bqQuery(binder: *mut c_void, what: i32, value: *mut i32) -> u32;
+        /// With no buffer (`buf` null), the slot is no longer preallocated.
+        fn bqSetPreallocatedBuffer(binder: *mut c_void, slot: i32, buf: *const c_void) -> u32;
+        fn parcelCreate(parcel: *mut Parcel);
+        fn parcelWriteInterfaceToken(parcel: *mut Parcel, token: *const c_char);
+        fn parcelWriteInt32(parcel: *mut Parcel, value: i32);
+        fn parcelReadInt32(parcel: *mut Parcel) -> i32;
+        fn parcelTransact(binder: *mut c_void, code: u32, parcel: *mut Parcel, reply: *mut Parcel) -> u32;
+        fn binderConvertErrorCode(code: i32) -> u32;
+    }
+
+    /// The `Binder` in libnx's `NWindow`, and what is asked of its `IGraphicBufferProducer` here:
+    /// Android's `SET_BUFFER_COUNT` transaction, which libnx has no call for, and the query
+    /// Ryujinx's `NativeWindowAttribute.cs` names `MaxBufferCountAsync`, how many of its slots the
+    /// queue lets the producer dequeue.
+    const NWINDOW_BINDER: usize = 8;
+    const SET_BUFFER_COUNT: u32 = 2;
+    const QUERY_MAX_BUFFER_COUNT: i32 = 12;
+
+    /// How many of its slots the window's queue lets the producer dequeue.
+    ///
+    /// # Safety
+    /// `nw` is a connected libnx `NWindow` that no other thread is using.
+    unsafe fn window_buffer_limit(nw: *mut c_void) -> Result<i32, u32> {
+        let mut limit = 0;
+        // SAFETY: the window's binder, by the caller's contract.
+        match unsafe { bqQuery(nw.cast::<u8>().add(NWINDOW_BINDER).cast(), QUERY_MAX_BUFFER_COUNT, &mut limit) } {
+            0 => Ok(limit),
+            rc => Err(rc),
+        }
+    }
+
+    /// `IGraphicBufferProducer::setBufferCount`: lets the producer dequeue `count` slots. Ryujinx's
+    /// reimplementation of the queue only sets the limit when `count` buffers are preallocated, as
+    /// a swapchain's are, and frees none of them; Android's frees every buffer.
+    ///
+    /// # Safety
+    /// As for [`window_buffer_limit`], with none of the window's buffers dequeued.
+    unsafe fn set_window_buffer_count(nw: *mut c_void, count: i32) -> u32 {
+        let mut parcel = Parcel([0; 0x420]);
+        let mut reply = Parcel([0; 0x420]);
+        // SAFETY: libnx fills and reads both parcels; the binder is the window's.
+        unsafe {
+            parcelCreate(&mut parcel);
+            parcelCreate(&mut reply);
+            parcelWriteInterfaceToken(&mut parcel, c"android.gui.IGraphicBufferProducer".as_ptr());
+            parcelWriteInt32(&mut parcel, count);
+            match parcelTransact(nw.cast::<u8>().add(NWINDOW_BINDER).cast(), SET_BUFFER_COUNT, &mut parcel, &mut reply) {
+                0 => binderConvertErrorCode(parcelReadInt32(&mut reply)),
+                rc => rc,
+            }
+        }
+    }
+
+    fn describe_limit(limit: Result<i32, u32>) -> String {
+        match limit {
+            Ok(limit) => limit.to_string(),
+            Err(rc) => format!("unknown (0x{rc:x})"),
+        }
     }
 
     /// The window's producers in turn (the start-up splash, then NVK's swapchains): the number of
-    /// the current one, the slots it configured, the slots it has queued and how many frames.
+    /// the current one, the slots it configured, the slots it has queued, how many frames, and the
+    /// slot of its last one (-1 before any).
     static WINDOW_PRODUCER: AtomicU32 = AtomicU32::new(0);
     static WINDOW_CONFIGURED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     static WINDOW_QUEUED_SLOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     static WINDOW_QUEUED: AtomicU32 = AtomicU32::new(0);
+    static WINDOW_LAST_SLOT: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
     /// Frames after which a producer's slots are logged: early, for a short run, and later.
     const WINDOW_FRAMES_LOGGED: [u32; 2] = [60, 600];
+    /// The slots a swapchain needs going round to keep up with the screen: one on it, one queued
+    /// for the next vsync, and one being drawn.
+    const SLOTS_TO_KEEP_UP: u32 = 3;
 
-    /// Counts the slots each producer of the window queues, and logs them after each of
-    /// `WINDOW_FRAMES_LOGGED` frames: a swapchain going through fewer buffers than it configured
-    /// waits for the screen to give one back before it can start its next frame.
+    /// Counts the slots each producer of the window queues, and logs them with the window's
+    /// buffer limit after each of `WINDOW_FRAMES_LOGGED` frames. A swapchain with fewer than
+    /// `SLOTS_TO_KEEP_UP` going round waits for the screen to give one back before it can start
+    /// its next frame; when the first count finds that, and the limit below the buffers it
+    /// configured, the limit is raised to them, once (`set_window_buffer_count`).
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn __wrap_nwindowQueueBuffer(
         nw: *mut c_void,
@@ -313,15 +413,45 @@ pub mod horizon_stubs {
         if rc == 0 && (0..64).contains(&slot) {
             let bit = 1u64 << slot;
             let queued = WINDOW_QUEUED_SLOTS.fetch_or(bit, Ordering::Relaxed) | bit;
+            WINDOW_LAST_SLOT.store(slot, Ordering::Relaxed);
             let frames = WINDOW_QUEUED.fetch_add(1, Ordering::Relaxed) + 1;
-            if WINDOW_FRAMES_LOGGED.contains(&frames) {
+            if frames == 1 {
                 let configured = WINDOW_CONFIGURED.load(Ordering::Relaxed);
+                // SAFETY: as below.
+                let limit = unsafe { window_buffer_limit(nw) };
                 tracing::info!(
-                    "[Window] producer {}: its first {frames} frames went through {} of the {} buffers it configured (slots {queued:#b} of {configured:#b})",
+                    "[Window] producer {}'s first frame: it configured {} buffers (slots {configured:#b}); the window lets it dequeue {}",
                     WINDOW_PRODUCER.load(Ordering::Relaxed),
+                    configured.count_ones(),
+                    describe_limit(limit),
+                );
+            }
+            if WINDOW_FRAMES_LOGGED.contains(&frames) {
+                let producer = WINDOW_PRODUCER.load(Ordering::Relaxed);
+                let configured = WINDOW_CONFIGURED.load(Ordering::Relaxed);
+                // SAFETY: the window was just queued to, so it is connected, and only its producer
+                // uses it, on this thread; nothing is dequeued until the producer's next frame.
+                let limit = unsafe { window_buffer_limit(nw) };
+                tracing::info!(
+                    "[Window] producer {producer}: its first {frames} frames went through {} of the {} buffers it configured (slots {queued:#b} of {configured:#b}); the window lets it dequeue {}",
                     queued.count_ones(),
                     configured.count_ones(),
+                    describe_limit(limit),
                 );
+                let wanted = configured.count_ones() as i32;
+                if frames == WINDOW_FRAMES_LOGGED[0]
+                    && queued.count_ones() < SLOTS_TO_KEEP_UP.min(configured.count_ones())
+                    && limit.is_ok_and(|limit| limit < wanted)
+                {
+                    // SAFETY: as above.
+                    let rc = unsafe { set_window_buffer_count(nw, wanted) };
+                    let limit = unsafe { window_buffer_limit(nw) };
+                    if rc == 0 {
+                        tracing::info!("[Window] producer {producer}: asked the window for its {wanted} buffers (SetBufferCount); it lets it dequeue {}", describe_limit(limit));
+                    } else {
+                        tracing::warn!("[Window] producer {producer}: SetBufferCount({wanted}) failed (0x{rc:x}); the window lets it dequeue {}", describe_limit(limit));
+                    }
+                }
             }
         }
         rc
@@ -331,6 +461,7 @@ pub mod horizon_stubs {
     /// read here, from devkitA64's libnx headers (128 bytes on AArch64, 8-aligned).
     const NWINDOW_MAGIC: u32 = 0x6E69_574E;
     const NWINDOW_SLOTS_CONFIGURED: usize = 48;
+    const NWINDOW_CUR_SLOT: usize = 64;
     const NWINDOW_FORMAT: usize = 76;
     const NWINDOW_IS_CONNECTED: usize = 124;
 
@@ -366,7 +497,14 @@ pub mod horizon_stubs {
                 }
                 // A new producer: count its slots from here.
                 if unconfigured {
-                    WINDOW_PRODUCER.fetch_add(1, Ordering::Relaxed);
+                    let producer = WINDOW_PRODUCER.fetch_add(1, Ordering::Relaxed) + 1;
+                    let last = WINDOW_LAST_SLOT.swap(-1, Ordering::Relaxed);
+                    if producer > 1 {
+                        tracing::info!(
+                            "[Window] producer {producer} configures the window; producer {}'s last frame was in slot {last}",
+                            producer - 1
+                        );
+                    }
                     WINDOW_CONFIGURED.store(0, Ordering::Relaxed);
                     WINDOW_QUEUED_SLOTS.store(0, Ordering::Relaxed);
                     WINDOW_QUEUED.store(0, Ordering::Relaxed);
@@ -378,6 +516,58 @@ pub mod horizon_stubs {
             WINDOW_CONFIGURED.fetch_or(1u64 << slot, Ordering::Relaxed);
         }
         rc
+    }
+
+    /// libnx's `nwindowReleaseBuffers` (which `framebufferClose` and NVK's swapchain teardown
+    /// call) cancels a dequeued buffer and disconnects from the window's queue, which leaves the
+    /// producer's buffers registered with it as preallocated. After the start-up splash's
+    /// framebuffer had gone that way, Skate 3's three-image swapchain went through slots 0 and 1
+    /// only, as it would under the queue's default limit of two (sk8 findings 59 §19-20). The
+    /// target spec links with `--wrap=nwindowReleaseBuffers`, which sends calls here: with no
+    /// buffer dequeued, each configured slot is first set to no buffer (`SetPreallocatedBuffer`
+    /// with none). In Ryujinx's reimplementation of the queue, the last of those empties it, and
+    /// the next producer's buffers set its limit as they do on a new window.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn __wrap_nwindowReleaseBuffers(nw: *mut c_void) -> u32 {
+        if !nw.is_null() {
+            let base = nw.cast::<u8>();
+            // SAFETY: as in `__wrap_nwindowConfigureBuffer`; the producer releasing the window is
+            // its only user during the call, and nothing of it is dequeued.
+            unsafe {
+                let configured = base.add(NWINDOW_SLOTS_CONFIGURED).cast::<u64>().read();
+                if base.cast::<u32>().read() == NWINDOW_MAGIC
+                    && base.add(NWINDOW_IS_CONNECTED).read() != 0
+                    && base.add(NWINDOW_CUR_SLOT).cast::<i32>().read() < 0
+                    && configured != 0
+                {
+                    let producer = WINDOW_PRODUCER.load(Ordering::Relaxed);
+                    let before = window_buffer_limit(nw);
+                    let binder = base.add(NWINDOW_BINDER).cast::<c_void>();
+                    let mut failed = None;
+                    for slot in (0..64).filter(|slot| (configured >> slot) & 1 != 0) {
+                        let rc = bqSetPreallocatedBuffer(binder, slot, core::ptr::null());
+                        if rc != 0 && failed.is_none() {
+                            failed = Some((slot, rc));
+                        }
+                    }
+                    let after = window_buffer_limit(nw);
+                    match failed {
+                        None => tracing::info!(
+                            "[Window] producer {producer} unregisters its {} buffers before it disconnects; the window let it dequeue {}, and {} with none registered",
+                            configured.count_ones(),
+                            describe_limit(before),
+                            describe_limit(after),
+                        ),
+                        Some((slot, rc)) => tracing::warn!(
+                            "[Window] producer {producer}: unregistering slot {slot} failed (0x{rc:x}); the window lets it dequeue {} as it disconnects",
+                            describe_limit(after),
+                        ),
+                    }
+                }
+            }
+        }
+        // SAFETY: the caller's window, passed on as libnx takes it.
+        unsafe { __real_nwindowReleaseBuffers(nw) }
     }
 
     /// libnx `ThreadFunc`.
