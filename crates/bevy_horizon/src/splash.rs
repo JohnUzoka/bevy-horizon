@@ -83,7 +83,10 @@ pub fn show(width: u32, height: u32, interval: Duration, mut draw: impl FnMut(Fr
         let priority = unsafe { svcSetThreadPriority(CUR_THREAD_HANDLE, PRIORITY) };
         let mut fb = Framebuffer([0; 128]);
         // SAFETY: libnx creates the framebuffer in `fb`, on the window it made before `main`.
-        let rc = unsafe { framebufferCreate(&mut fb, nwindowGetDefault(), width, height, PIXEL_FORMAT_RGBA_8888, 2) };
+        // Three buffers, as NVK's swapchain has. With two, a game behind it ran at 20 fps where it
+        // had run at 30, as if its swapchain had two as well (sk8 findings 59 §14);
+        // `[Window] producer` lines in log.txt say how many each producer used.
+        let rc = unsafe { framebufferCreate(&mut fb, nwindowGetDefault(), width, height, PIXEL_FORMAT_RGBA_8888, 3) };
         if rc != 0 {
             let _ = made.send(Err(rc));
             return;

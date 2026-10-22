@@ -287,6 +287,43 @@ pub mod horizon_stubs {
         /// libnx's own `nwindowConfigureBuffer`; `--wrap=nwindowConfigureBuffer` gives it this
         /// name.
         fn __real_nwindowConfigureBuffer(nw: *mut c_void, slot: i32, buf: *mut c_void) -> u32;
+        /// libnx's own `nwindowQueueBuffer`; `--wrap=nwindowQueueBuffer` gives it this name.
+        fn __real_nwindowQueueBuffer(nw: *mut c_void, slot: i32, fence: *const c_void) -> u32;
+    }
+
+    /// The window's producers in turn (the start-up splash, then NVK's swapchains): the number of
+    /// the current one, the slots it configured, the slots it has queued and how many frames.
+    static WINDOW_PRODUCER: AtomicU32 = AtomicU32::new(0);
+    static WINDOW_CONFIGURED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static WINDOW_QUEUED_SLOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static WINDOW_QUEUED: AtomicU32 = AtomicU32::new(0);
+    /// Frames after which a producer's slots are logged.
+    const WINDOW_FRAMES_LOGGED: u32 = 300;
+
+    /// Counts the slots each producer of the window queues, and logs them once it has queued
+    /// `WINDOW_FRAMES_LOGGED` frames: a swapchain going through fewer buffers than it configured
+    /// waits for the screen to give one back before it can start its next frame.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn __wrap_nwindowQueueBuffer(
+        nw: *mut c_void,
+        slot: i32,
+        fence: *const c_void,
+    ) -> u32 {
+        let rc = unsafe { __real_nwindowQueueBuffer(nw, slot, fence) };
+        if rc == 0 && (0..64).contains(&slot) {
+            let bit = 1u64 << slot;
+            let queued = WINDOW_QUEUED_SLOTS.fetch_or(bit, Ordering::Relaxed) | bit;
+            if WINDOW_QUEUED.fetch_add(1, Ordering::Relaxed) + 1 == WINDOW_FRAMES_LOGGED {
+                let configured = WINDOW_CONFIGURED.load(Ordering::Relaxed);
+                tracing::info!(
+                    "[Window] producer {}: its first {WINDOW_FRAMES_LOGGED} frames went through {} of the {} buffers it configured (slots {queued:#b} of {configured:#b})",
+                    WINDOW_PRODUCER.load(Ordering::Relaxed),
+                    queued.count_ones(),
+                    configured.count_ones(),
+                );
+            }
+        }
+        rc
     }
 
     /// libnx's `NWindow` (display/native_window.h): its magic, and the offsets of the fields
@@ -315,9 +352,9 @@ pub mod horizon_stubs {
             // SAFETY: `nw` is the `NWindow` libnx is about to configure, and the offsets are its
             // fields'. Only the producer configuring it uses it during the call.
             unsafe {
-                let released = base.cast::<u32>().read() == NWINDOW_MAGIC
-                    && base.add(NWINDOW_SLOTS_CONFIGURED).cast::<u64>().read() == 0
-                    && base.add(NWINDOW_IS_CONNECTED).read() == 0;
+                let unconfigured = base.cast::<u32>().read() == NWINDOW_MAGIC
+                    && base.add(NWINDOW_SLOTS_CONFIGURED).cast::<u64>().read() == 0;
+                let released = unconfigured && base.add(NWINDOW_IS_CONNECTED).read() == 0;
                 let format = base.add(NWINDOW_FORMAT).cast::<u32>();
                 if released && format.read() == 0 {
                     format.write(u32::MAX);
@@ -326,9 +363,20 @@ pub mod horizon_stubs {
                          reset to unset, so slot {slot}'s buffer sets it"
                     );
                 }
+                // A new producer: count its slots from here.
+                if unconfigured {
+                    WINDOW_PRODUCER.fetch_add(1, Ordering::Relaxed);
+                    WINDOW_CONFIGURED.store(0, Ordering::Relaxed);
+                    WINDOW_QUEUED_SLOTS.store(0, Ordering::Relaxed);
+                    WINDOW_QUEUED.store(0, Ordering::Relaxed);
+                }
             }
         }
-        unsafe { __real_nwindowConfigureBuffer(nw, slot, buf) }
+        let rc = unsafe { __real_nwindowConfigureBuffer(nw, slot, buf) };
+        if rc == 0 && (0..64).contains(&slot) {
+            WINDOW_CONFIGURED.fetch_or(1u64 << slot, Ordering::Relaxed);
+        }
+        rc
     }
 
     /// libnx `ThreadFunc`.

@@ -29,7 +29,8 @@
       "--wrap=fchmod",
       "--wrap=rename",
       "--wrap=rmdir",
-      "--wrap=nwindowConfigureBuffer"
+      "--wrap=nwindowConfigureBuffer",
+      "--wrap=nwindowQueueBuffer"
     ]
   },
   "relocation-model": "pic",
