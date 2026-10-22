@@ -283,6 +283,54 @@ pub mod horizon_stubs {
         rc
     }
 
+    unsafe extern "C" {
+        /// libnx's own `nwindowConfigureBuffer`; `--wrap=nwindowConfigureBuffer` gives it this
+        /// name.
+        fn __real_nwindowConfigureBuffer(nw: *mut c_void, slot: i32, buf: *mut c_void) -> u32;
+    }
+
+    /// libnx's `NWindow` (display/native_window.h): its magic, and the offsets of the fields
+    /// read here, from devkitA64's libnx headers (128 bytes on AArch64, 8-aligned).
+    const NWINDOW_MAGIC: u32 = 0x6E69_574E;
+    const NWINDOW_SLOTS_CONFIGURED: usize = 48;
+    const NWINDOW_FORMAT: usize = 76;
+    const NWINDOW_IS_CONNECTED: usize = 124;
+
+    /// libnx takes a window's pixel format from the first buffer configured on it only while the
+    /// format is `~0`, as `nwindowCreate` leaves it, but releasing the buffers
+    /// (`nwindowReleaseBuffers`, which `framebufferClose` and NVK's swapchain teardown call)
+    /// resets it to 0. Every buffer the next producer configured, and every dequeue, then said
+    /// format 0: after the start-up splash's framebuffer (`splash.rs`), NVK's swapchain ran a game
+    /// at 20 fps where it had run at 30 (sk8 findings 59). The target spec links with
+    /// `--wrap=nwindowConfigureBuffer`, which sends calls here; a window with no buffers, not
+    /// connected and at format 0 gets `~0` back first, so the buffer's own format is taken.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn __wrap_nwindowConfigureBuffer(
+        nw: *mut c_void,
+        slot: i32,
+        buf: *mut c_void,
+    ) -> u32 {
+        if !nw.is_null() {
+            let base = nw.cast::<u8>();
+            // SAFETY: `nw` is the `NWindow` libnx is about to configure, and the offsets are its
+            // fields'. Only the producer configuring it uses it during the call.
+            unsafe {
+                let released = base.cast::<u32>().read() == NWINDOW_MAGIC
+                    && base.add(NWINDOW_SLOTS_CONFIGURED).cast::<u64>().read() == 0
+                    && base.add(NWINDOW_IS_CONNECTED).read() == 0;
+                let format = base.add(NWINDOW_FORMAT).cast::<u32>();
+                if released && format.read() == 0 {
+                    format.write(u32::MAX);
+                    tracing::info!(
+                        "[Window] the window's pixel format was 0 after its buffers were released; \
+                         reset to unset, so slot {slot}'s buffer sets it"
+                    );
+                }
+            }
+        }
+        unsafe { __real_nwindowConfigureBuffer(nw, slot, buf) }
+    }
+
     /// libnx `ThreadFunc`.
     type ThreadFunc = unsafe extern "C" fn(arg: *mut c_void);
 

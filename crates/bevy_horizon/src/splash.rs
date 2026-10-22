@@ -146,6 +146,8 @@ pub fn show(width: u32, height: u32, interval: Duration, mut draw: impl FnMut(Fr
 }
 
 /// Takes the splash down and gives the window back; waits for its thread. Does nothing without one.
+/// Releasing the framebuffer leaves libnx's window at pixel format 0, which the
+/// `nwindowConfigureBuffer` wrapper (`compat.rs`) undoes before the swapchain's buffers go on it.
 pub fn close() {
     let running = RUNNING.lock().unwrap_or_else(PoisonError::into_inner).take();
     if let Some(Running { stop, thread }) = running {
