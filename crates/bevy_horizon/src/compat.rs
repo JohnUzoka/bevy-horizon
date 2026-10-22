@@ -297,10 +297,10 @@ pub mod horizon_stubs {
     static WINDOW_CONFIGURED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     static WINDOW_QUEUED_SLOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     static WINDOW_QUEUED: AtomicU32 = AtomicU32::new(0);
-    /// Frames after which a producer's slots are logged.
-    const WINDOW_FRAMES_LOGGED: u32 = 300;
+    /// Frames after which a producer's slots are logged: early, for a short run, and later.
+    const WINDOW_FRAMES_LOGGED: [u32; 2] = [60, 600];
 
-    /// Counts the slots each producer of the window queues, and logs them once it has queued
+    /// Counts the slots each producer of the window queues, and logs them after each of
     /// `WINDOW_FRAMES_LOGGED` frames: a swapchain going through fewer buffers than it configured
     /// waits for the screen to give one back before it can start its next frame.
     #[unsafe(no_mangle)]
@@ -313,10 +313,11 @@ pub mod horizon_stubs {
         if rc == 0 && (0..64).contains(&slot) {
             let bit = 1u64 << slot;
             let queued = WINDOW_QUEUED_SLOTS.fetch_or(bit, Ordering::Relaxed) | bit;
-            if WINDOW_QUEUED.fetch_add(1, Ordering::Relaxed) + 1 == WINDOW_FRAMES_LOGGED {
+            let frames = WINDOW_QUEUED.fetch_add(1, Ordering::Relaxed) + 1;
+            if WINDOW_FRAMES_LOGGED.contains(&frames) {
                 let configured = WINDOW_CONFIGURED.load(Ordering::Relaxed);
                 tracing::info!(
-                    "[Window] producer {}: its first {WINDOW_FRAMES_LOGGED} frames went through {} of the {} buffers it configured (slots {queued:#b} of {configured:#b})",
+                    "[Window] producer {}: its first {frames} frames went through {} of the {} buffers it configured (slots {queued:#b} of {configured:#b})",
                     WINDOW_PRODUCER.load(Ordering::Relaxed),
                     queued.count_ones(),
                     configured.count_ones(),
