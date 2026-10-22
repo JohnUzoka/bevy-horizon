@@ -61,7 +61,11 @@ fn attach_default_nwindow(
     let Some((entity, holder)) = windows.iter().next() else {
         return;
     };
-    // The game's splash (`splash::show`) has the window until wgpu takes it here.
+    // The game's splash (`splash::show`) has the window until wgpu takes it here, later if the
+    // game holds it (`splash::hold`).
+    if crate::splash::held() {
+        return;
+    }
     crate::splash::close();
     let Some(n_window) = NonNull::new(unsafe { nwindowGetDefault() }) else {
         tracing::error!("nwindowGetDefault returned null; nothing can be drawn");
