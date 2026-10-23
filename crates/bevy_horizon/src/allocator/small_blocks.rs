@@ -19,7 +19,7 @@
 //!
 //! A cached block is a malloc block of its class's size, so malloc counts it as in use, and it can
 //! always go back to `free`. The most the cache holds is about 8.3 MiB in the shards and
-//! [`DEPOT_BYTES`] (8 MiB) in the depot; [`Stats::cached`] says how much it does. When malloc runs out, the allocator
+//! [`DEPOT_BYTES`] (32 MiB) in the depot; [`Stats::cached`] says how much it does. When malloc runs out, the allocator
 //! gives it the cache's blocks ([`Cache::drain`]) and asks again.
 
 use core::cell::UnsafeCell;
@@ -47,8 +47,10 @@ const MAX_MAGAZINE: usize = 32;
 /// up to 8 KiB, 4 above) overflowed on the console: in Skate 3's play, 801-1,277 full magazines a
 /// second went back to malloc, and 5-11 % of the allocations the cache took found nothing, while
 /// the cache held under 5 MiB. One budget lets the classes a frame frees most keep their blocks
-/// for the next; 8 MiB is about what the counts allowed altogether.
-const DEPOT_BYTES: usize = 8 << 20;
+/// for the next. With 8 MiB, the console's depot still made room 1,449 times a second in play,
+/// with 9.2 % of the allocations missing: a frame's blocks there come near that, with its
+/// hundred-odd of 8-32 KiB. When malloc runs out it still gets them back first.
+const DEPOT_BYTES: usize = 32 << 20;
 /// Tries at a depot slot before a magazine goes back to malloc or an allocation to malloc. Its
 /// holder keeps it for a few instructions, so trying again finds it free unless the holder was
 /// preempted, and a bounded number can't starve a holder on the same core.
