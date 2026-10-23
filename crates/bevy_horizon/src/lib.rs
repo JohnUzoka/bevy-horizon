@@ -104,6 +104,24 @@ pub fn memory_report() -> String {
     }
 }
 
+/// Gives the small-block cache's blocks back to malloc, for a game that has freed a world's worth
+/// at once and is about to make the next, as at a map change. Rust's allocations get the cache's
+/// blocks back when malloc runs out, but NVK falling back to malloc for a GPU block doesn't, and
+/// the cache holds up to about 40 MiB. Waits up to about 10 ms for each shard or depot slot
+/// another thread holds. True if there were blocks to give; without `top_down_alloc` there is no
+/// cache.
+#[cfg(target_os = "horizon")]
+pub fn release_cached_memory() -> bool {
+    #[cfg(feature = "top_down_alloc")]
+    {
+        allocator::release_cache()
+    }
+    #[cfg(not(feature = "top_down_alloc"))]
+    {
+        false
+    }
+}
+
 /// Frame budget for the frame loop: 60 Hz. A frame that finishes early sleeps out the rest.
 #[cfg(target_os = "horizon")]
 const FRAME_TIME: core::time::Duration = core::time::Duration::from_nanos(1_000_000_000 / 60);

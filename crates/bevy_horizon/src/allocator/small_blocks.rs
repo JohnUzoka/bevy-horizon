@@ -622,6 +622,12 @@ impl<B: Backend> Cache<B> {
         gave
     }
 
+    /// Gives malloc back every block it can hold the shards and depot slots of, as turning the
+    /// cache off does, and stays on. True if there were any.
+    pub(crate) fn release(&self) -> bool {
+        self.empty()
+    }
+
     /// Gives back the cached blocks it can hold the shards and depot slots of; true if any.
     fn empty(&self) -> bool {
         let mut gave = false;

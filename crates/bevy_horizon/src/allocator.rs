@@ -122,6 +122,11 @@ const MALLOC_REALLOCS: usize = 6;
 const MALLOC_FREES: usize = 7;
 pub(crate) const MALLOC_KINDS: usize = 8;
 
+/// [`crate::release_cached_memory`].
+pub(crate) fn release_cache() -> bool {
+    CACHE.release()
+}
+
 /// Counts an allocation the cache didn't take, unless it was only off.
 fn count_malloc_call(layout: Layout) {
     let kind = if layout.align() > small_blocks::MAX_ALIGN {
