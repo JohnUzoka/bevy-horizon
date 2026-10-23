@@ -66,8 +66,8 @@ fn attach_default_nwindow(
     if crate::splash::held() {
         return;
     }
-    let after_splash = crate::splash::close();
-    crate::compat::horizon_stubs::set_swapchain_images(after_splash);
+    crate::splash::close();
+    crate::compat::horizon_stubs::set_swapchain_images();
     let Some(n_window) = NonNull::new(unsafe { nwindowGetDefault() }) else {
         tracing::error!("nwindowGetDefault returned null; nothing can be drawn");
         return;

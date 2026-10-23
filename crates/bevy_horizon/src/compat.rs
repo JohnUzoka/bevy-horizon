@@ -312,19 +312,15 @@ pub mod horizon_stubs {
     pub static bh_wsi_switch_image_count: AtomicU32 = AtomicU32::new(3);
 
     /// The images of the swapchains made from here on: `BH_SWAPCHAIN_IMAGES` (3-8) when set, else
-    /// 4 after a start-up splash and 3 without one. After the splash's framebuffer had been on the
-    /// window, Skate 3's three-image swapchain got only two of them back from the screen and ran at
-    /// 20 fps where it ran at 33.7 without the splash (sk8 findings 59 §19); with a fourth image,
-    /// a slot the screen keeps still leaves it three.
-    pub fn set_swapchain_images(after_splash: bool) {
+    /// 3. With every slot given back before a producer's first frame (`__wrap_bqDequeueBuffer`),
+    /// Skate 3's three-image swapchain went through all three after the start-up splash and ran at
+    /// 31-35 fps, as it did without the splash (sk8 findings 59 §25).
+    pub fn set_swapchain_images() {
         let set = std::env::var("BH_SWAPCHAIN_IMAGES").ok().and_then(|images| images.trim().parse::<u32>().ok());
-        let images = set.map_or(if after_splash { 4 } else { 3 }, |images| images.clamp(3, 8));
+        let images = set.map_or(3, |images| images.clamp(3, 8));
         bh_wsi_switch_image_count.store(images, Ordering::Release);
-        if images != 3 {
-            tracing::info!(
-                "[Window] swapchains get {images} images ({})",
-                if set.is_some() { "BH_SWAPCHAIN_IMAGES" } else { "one more after the splash" }
-            );
+        if let Some(asked) = set {
+            tracing::info!("[Window] swapchains get {images} images (BH_SWAPCHAIN_IMAGES={asked})");
         }
     }
 
