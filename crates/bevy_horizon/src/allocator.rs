@@ -108,6 +108,30 @@ static MALLOC_MEDIUM_BYTES: AtomicUsize = AtomicUsize::new(0);
 static LARGE_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
 /// Small blocks malloc couldn't place, which the region took.
 static SMALL_RESCUES: AtomicUsize = AtomicUsize::new(0);
+/// Rust's calls that reach malloc, for the `[Memory]` lines: allocations under [`LARGE`] the
+/// small-block cache doesn't take, by why, then reallocs and frees malloc does.
+static MALLOC_CALLS: [AtomicUsize; MALLOC_KINDS] = [const { AtomicUsize::new(0) }; MALLOC_KINDS];
+/// Allocations aligned to more than [`small_blocks::MAX_ALIGN`].
+const MALLOC_ALIGNED: usize = 0;
+/// Allocations over [`small_blocks::MAX_SIZE`]: one index a doubling, 8-16 KiB here up to
+/// 128-256 KiB at `MALLOC_SIZED + 4`.
+const MALLOC_SIZED: usize = 1;
+const MALLOC_REALLOCS: usize = 6;
+const MALLOC_FREES: usize = 7;
+pub(crate) const MALLOC_KINDS: usize = 8;
+
+/// Counts an allocation the cache didn't take, unless it was only off.
+fn count_malloc_call(layout: Layout) {
+    let kind = if layout.align() > small_blocks::MAX_ALIGN {
+        MALLOC_ALIGNED
+    } else if layout.size() > small_blocks::MAX_SIZE {
+        let doublings = usize::BITS - ((layout.size() - 1) / small_blocks::MAX_SIZE).leading_zeros();
+        MALLOC_SIZED + (doublings as usize - 1).min(4)
+    } else {
+        return;
+    };
+    MALLOC_CALLS[kind].fetch_add(1, Relaxed);
+}
 
 /// Where Rust's memory is, for the `[Memory]` lines. Reading it doesn't allocate.
 #[derive(Clone, Copy)]
@@ -117,6 +141,7 @@ pub(crate) struct Figures {
     pub(crate) malloc_medium: u64,
     pub(crate) large_fallbacks: usize,
     pub(crate) small_rescues: usize,
+    pub(crate) malloc_calls: [usize; MALLOC_KINDS],
     pub(crate) cache: small_blocks::Stats,
 }
 
@@ -127,6 +152,7 @@ pub(crate) fn figures() -> Figures {
         malloc_medium: MALLOC_MEDIUM_BYTES.load(Relaxed) as u64,
         large_fallbacks: LARGE_FALLBACKS.load(Relaxed),
         small_rescues: SMALL_RESCUES.load(Relaxed),
+        malloc_calls: MALLOC_CALLS.each_ref().map(|calls| calls.load(Relaxed)),
         cache: CACHE.stats(),
     }
 }
@@ -205,7 +231,10 @@ unsafe fn allocate(layout: Layout, zeroed: bool) -> *mut u8 {
     }
     let small = || match CACHE.class_for(layout.size(), layout.align()) {
         Some(class) => unsafe { CACHE.alloc(class, layout.size(), zeroed) },
-        None => unsafe { malloc_alloc(layout, zeroed) },
+        None => {
+            count_malloc_call(layout);
+            unsafe { malloc_alloc(layout, zeroed) }
+        }
     };
     let ptr = or_after_drain(small(), small);
     if !ptr.is_null() {
@@ -232,6 +261,7 @@ unsafe fn deallocate(ptr: *mut u8, layout: Layout) {
         return unsafe { CACHE.free(ptr, class) };
     }
     count_malloc(layout.size(), false);
+    MALLOC_CALLS[MALLOC_FREES].fetch_add(1, Relaxed);
     unsafe { System.dealloc(ptr, layout) }
 }
 
@@ -317,6 +347,7 @@ unsafe impl GlobalAlloc for HorizonAllocator {
             }
             LARGE_FALLBACKS.fetch_add(1, Relaxed);
         }
+        MALLOC_CALLS[MALLOC_REALLOCS].fetch_add(1, Relaxed);
         let new = unsafe { System.realloc(ptr, layout, new_size) };
         // A failed realloc leaves the block as it was.
         let new = or_after_drain(new, || unsafe { System.realloc(ptr, layout, new_size) });

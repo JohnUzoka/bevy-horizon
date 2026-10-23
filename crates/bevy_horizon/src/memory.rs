@@ -320,6 +320,13 @@ impl core::fmt::Display for MallocFigures {
                     rust.small_rescues
                 )?;
             }
+            let [aligned, s16, s32, s64, s128, s256, reallocs, frees] = rust.malloc_calls;
+            write!(
+                f,
+                "; Rust's calls that reached malloc: {aligned} allocations aligned past 16 bytes, \
+                 {s16} / {s32} / {s64} / {s128} / {s256} of 8-16 / 16-32 / 32-64 / 64-128 / 128-256 KiB, \
+                 {reallocs} reallocs and {frees} frees"
+            )?;
             let cache = &rust.cache;
             if cache.enabled {
                 write!(

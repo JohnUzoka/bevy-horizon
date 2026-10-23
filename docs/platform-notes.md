@@ -185,7 +185,10 @@ With it, the same game's malloc holes stayed under about 26 MiB from the first f
 Rust's malloc blocks: X MiB of 256 KiB and up, Y MiB of 64-256 KiB
 N large blocks the region couldn't place went to malloc
 N small blocks malloc couldn't place went to the region
+Rust's calls that reached malloc: N allocations aligned past 16 bytes, N / N / N / N / N of 8-16 / 16-32 / 32-64 / 64-128 / 128-256 KiB, N reallocs and N frees
 ```
+
+The last line counts from launch the calls that took malloc's lock: allocations under 256 KiB that the small-block cache below doesn't take, and reallocs and frees of blocks it doesn't hold. Two lines a known time apart give their rates.
 
 **Costs.** It is your program's `#[global_allocator]`, so a game that sets its own can't use it. A large block can waste up to 64 KiB to rounding, and each large allocation and free takes the region's lock.
 
