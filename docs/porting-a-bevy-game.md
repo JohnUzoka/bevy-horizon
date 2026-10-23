@@ -434,6 +434,7 @@ Horizon has no shell and no launch arguments, so the game sets these itself, wit
 |---|---|---|---|---|
 | `BH_ROBUST_BUFFER_ACCESS` | `clamp` (or empty), `driver` (or `1`), `off` (or `0`) | `clamp` | When Bevy sets up the GPU, as `DefaultPlugins` is added | [Buffer robustness](rendering.md#buffer-robustness) |
 | `BH_RT_COMPRESSION` | `1` turns render-target compression on; recommended for 3D | Off | When wgpu creates its first texture | [Render-target compression](rendering.md#render-target-compression) |
+| `BH_VK_OBJECT_NAMES` | `1` names wgpu's Vulkan objects and labels its command buffers, for reading NVK's messages | Off, unless `InstanceFlags::DEBUG` | When Bevy sets up the GPU | [Rendering](rendering.md) |
 | `BH_AUDIO_FRAMES` | 256 to 8192, decimal or `0x` hex | 2048 with Bevy 0.19, 1024 with 0.18 | When the audio stream opens, as `DefaultPlugins` is added | [The audio host](input-and-audio.md#the-audio-host) |
 | `BH_AUDIO_STATS` | `1` logs an `[Audio]` timing line every 10 s | Off | When the audio stream opens | [The audio host](input-and-audio.md#the-audio-host) |
 | `BH_AUDIO_PRIORITY` | A thread priority, or `default` | 0x2B | When the audio stream opens | [The audio host](input-and-audio.md#the-audio-host) |

@@ -32,6 +32,7 @@ These settings change how wgpu and NVK draw on Horizon. The defaults are safe; c
 |---|---|---|---|
 | `BH_ROBUST_BUFFER_ACCESS` | `clamp`: naga keeps every shader's buffer accesses in bounds | `driver` to find an index bug; `off` only to measure what clamp costs | [Buffer robustness](#buffer-robustness) |
 | `BH_RT_COMPRESSION` | Off | `1` for a 3D game on the console | [Render-target compression](#render-target-compression) |
+| `BH_VK_OBJECT_NAMES` | Off: wgpu names no Vulkan object and labels no command buffer, unless `InstanceFlags::DEBUG`. NVK copied each name and label into memory it allocated, and the messenger for Mesa's messages stays either way | `1` when a message from NVK should name its object | (this table) |
 | wgpu's indirect-call validation | Off in release builds, on in debug builds | On, through `WgpuSettings`, to check indirect draws your game writes | [Indirect-call validation](#indirect-call-validation) |
 | `BEVY_HORIZON_ZCULL_DIR` | `greater`: [ZCULL](glossary.md#zcull) set up for Bevy's reversed depth | `less`, NVK's own direction, only to compare | [Performance](#performance) |
 | `MESA_SHADER_CACHE_DISABLE` | Unset: NVK caches compiled shaders on the SD card | `true` to compile every shader at every launch | [NVK's shader cache](#nvks-shader-cache-on-the-sd-card) |

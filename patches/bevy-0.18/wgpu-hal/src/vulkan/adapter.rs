@@ -2028,7 +2028,14 @@ impl super::Adapter {
         // Note that VK_EXT_debug_utils is an instance extension (enabled at the instance
         // level) but contains a few functions that can be loaded directly on the Device for a
         // dispatch-table-less pointer.
-        let debug_utils_fn = if self.instance.extensions.contains(&ext::debug_utils::NAME) {
+        // [bevy-horizon patch] On Horizon the instance always has VK_EXT_debug_utils, for the
+        // messenger that carries Mesa's messages (instance.rs). Its device functions name every
+        // object and label command buffers, each a copy NVK allocates, so they load only with
+        // `InstanceFlags::DEBUG`, as the extension does elsewhere, or with `BH_VK_OBJECT_NAMES=1`.
+        let debug_utils_fn = if self.instance.extensions.contains(&ext::debug_utils::NAME)
+            && (self.instance.flags.contains(wgt::InstanceFlags::DEBUG)
+                || std::env::var("BH_VK_OBJECT_NAMES").is_ok_and(|value| value.trim() == "1"))
+        {
             Some(ext::debug_utils::Device::new(
                 &self.instance.raw,
                 &raw_device,
