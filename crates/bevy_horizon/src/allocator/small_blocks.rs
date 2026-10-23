@@ -53,6 +53,9 @@ const DEPOT_BYTES: usize = 8 << 20;
 /// holder keeps it for a few instructions, so trying again finds it free unless the holder was
 /// preempted, and a bounded number can't starve a holder on the same core.
 const DEPOT_TRIES: usize = 4;
+/// Classes a full depot takes magazines from to make room for one coming in, the least lately
+/// taken first.
+const EVICT_CLASSES: usize = 4;
 
 /// Where blocks come from and go back to: newlib's malloc on the Switch.
 pub(crate) trait Backend {
@@ -144,12 +147,16 @@ pub(crate) struct Stats {
     pub(crate) refills: usize,
     /// Full magazines a shard gave the depot.
     pub(crate) flushes: usize,
-    /// Full magazines given back to malloc because the depot was full or held.
+    /// Full magazines given back to malloc: ones the depot turned away (full or held), and ones it
+    /// gave up to make room ([`Stats::evictions`]).
     pub(crate) returns: usize,
     /// Tries at a depot slot, to give or take a magazine, that found it held [`DEPOT_TRIES`] times.
     pub(crate) depot_held: usize,
     /// Magazines the depot turned away for [`DEPOT_BYTES`].
     pub(crate) depot_full: usize,
+    /// Magazines of the class taken from least lately that the depot gave back to malloc to make
+    /// room for another class's.
+    pub(crate) evictions: usize,
     /// Times malloc ran out with blocks in the cache, which gave them back.
     pub(crate) drains: usize,
     /// Bytes in cached blocks.
@@ -202,11 +209,13 @@ struct DepotSlot {
     head: UnsafeCell<*mut u8>,
     /// Written only with the slot held.
     len: AtomicUsize,
+    /// The depot's count of takes when a magazine was last taken from here; 0 if none was.
+    last_take: AtomicUsize,
 }
 
 impl DepotSlot {
     const fn new() -> Self {
-        Self { locked: AtomicBool::new(false), head: UnsafeCell::new(null_mut()), len: AtomicUsize::new(0) }
+        Self { locked: AtomicBool::new(false), head: UnsafeCell::new(null_mut()), len: AtomicUsize::new(0), last_take: AtomicUsize::new(0) }
     }
 }
 
@@ -292,8 +301,11 @@ pub(crate) struct Cache<B> {
     depot: [DepotSlot; CLASSES],
     /// Bytes in the depot's magazines, against [`DEPOT_BYTES`].
     depot_bytes: AtomicUsize,
+    /// Magazines taken from the depot, for [`DepotSlot::last_take`].
+    depot_takes: AtomicUsize,
     depot_held: AtomicUsize,
     depot_full: AtomicUsize,
+    evictions: AtomicUsize,
     busy_allocs: AtomicUsize,
     busy_frees: AtomicUsize,
     rejected: AtomicUsize,
@@ -315,8 +327,10 @@ impl<B: Backend> Cache<B> {
             shards: [const { Shard::new() }; SHARDS],
             depot: [const { DepotSlot::new() }; CLASSES],
             depot_bytes: AtomicUsize::new(0),
+            depot_takes: AtomicUsize::new(0),
             depot_held: AtomicUsize::new(0),
             depot_full: AtomicUsize::new(0),
+            evictions: AtomicUsize::new(0),
             busy_allocs: AtomicUsize::new(0),
             busy_frees: AtomicUsize::new(0),
             rejected: AtomicUsize::new(0),
@@ -435,12 +449,13 @@ impl<B: Backend> Cache<B> {
         let returned = unsafe { self.push(shard, class, ptr) };
         drop(held);
         if !returned.is_null() {
-            self.returns.fetch_add(1, Ordering::Relaxed);
-            unsafe { Self::free_list(returned) };
+            let magazines = unsafe { Self::free_magazines(returned) };
+            self.returns.fetch_add(magazines, Ordering::Relaxed);
         }
     }
 
-    /// Puts a block in the shard. Returns a full magazine to give back to malloc, or null.
+    /// Puts a block in the shard. Returns full magazines to give back to malloc, linked as in the
+    /// depot, or null.
     #[inline]
     unsafe fn push(&self, shard: &Shard, class: usize, block: *mut u8) -> *mut u8 {
         // SAFETY: the shard is held.
@@ -449,10 +464,9 @@ impl<B: Backend> Cache<B> {
         if mags.len == LENS[class] {
             if !mags.spare.is_null() {
                 sub(&shard.cached, LENS[class] * SIZES[class]);
-                if unsafe { self.depot_put(class, mags.spare) } {
+                returned = unsafe { self.depot_put(class, mags.spare) };
+                if returned != mags.spare {
                     self.flushes.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    returned = mags.spare;
                 }
             }
             mags.spare = core::mem::replace(&mut mags.current, null_mut());
@@ -482,23 +496,36 @@ impl<B: Backend> Cache<B> {
             *head = unsafe { next_magazine(magazine) };
             sub(&slot.len, 1);
             self.depot_bytes.fetch_sub(LENS[class] * SIZES[class], Ordering::Relaxed);
+            slot.last_take.store(self.depot_takes.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
             self.refills.fetch_add(1, Ordering::Relaxed);
         }
         magazine
     }
 
-    /// Gives the depot a full magazine of `class`. False if it's full or held.
-    unsafe fn depot_put(&self, class: usize, magazine: *mut u8) -> bool {
+    /// Gives the depot a full magazine of `class`. Returns null if it took it, or else magazines
+    /// for malloc, linked as in the depot: `magazine` itself if its slot was held or it still
+    /// didn't fit, and one taken out of the class taken from least lately to make room.
+    unsafe fn depot_put(&self, class: usize, magazine: *mut u8) -> *mut u8 {
         let bytes = LENS[class] * SIZES[class];
-        // Threads putting at once can pass this together, by a magazine each.
+        let mut give_back = null_mut();
+        // Threads putting at once can pass these checks together, by a magazine each.
+        for _ in 0..EVICT_CLASSES {
+            let over = (self.depot_bytes.load(Ordering::Relaxed) + bytes).saturating_sub(DEPOT_BYTES);
+            if over == 0 {
+                break;
+            }
+            give_back = unsafe { self.evict(class, over, give_back) };
+        }
         if self.depot_bytes.load(Ordering::Relaxed) + bytes > DEPOT_BYTES {
             self.depot_full.fetch_add(1, Ordering::Relaxed);
-            return false;
+            unsafe { set_next_magazine(magazine, give_back) };
+            return magazine;
         }
         let slot = &self.depot[class];
         let Some(_held) = try_hold_soon(&slot.locked) else {
             self.depot_held.fetch_add(1, Ordering::Relaxed);
-            return false;
+            unsafe { set_next_magazine(magazine, give_back) };
+            return magazine;
         };
         // SAFETY: the slot is held.
         let head = unsafe { &mut *slot.head.get() };
@@ -506,7 +533,59 @@ impl<B: Backend> Cache<B> {
         *head = magazine;
         add(&slot.len, 1);
         self.depot_bytes.fetch_add(bytes, Ordering::Relaxed);
-        true
+        give_back
+    }
+
+    /// Takes magazines out of the depot for malloc, `need` bytes' worth or what there is, from
+    /// the class other than `keep` taken from least lately, so that a class the frames no longer
+    /// ask for (a map load's) gives its room to one they do. Returns them ahead of `list`, linked
+    /// as in the depot; `list` alone if no other class has one, or its slot is held.
+    unsafe fn evict(&self, keep: usize, need: usize, mut list: *mut u8) -> *mut u8 {
+        let mut victim = None;
+        let mut oldest = usize::MAX;
+        for (class, slot) in self.depot.iter().enumerate() {
+            if class != keep && slot.len.load(Ordering::Relaxed) > 0 {
+                let stamp = slot.last_take.load(Ordering::Relaxed);
+                if stamp < oldest {
+                    (oldest, victim) = (stamp, Some(class));
+                }
+            }
+        }
+        let Some(class) = victim else {
+            return list;
+        };
+        let slot = &self.depot[class];
+        let Some(_held) = try_hold(&slot.locked) else {
+            return list;
+        };
+        let bytes = LENS[class] * SIZES[class];
+        // SAFETY: the slot is held.
+        let head = unsafe { &mut *slot.head.get() };
+        let mut freed = 0;
+        while freed < need && !head.is_null() {
+            let magazine = *head;
+            *head = unsafe { next_magazine(magazine) };
+            unsafe { set_next_magazine(magazine, list) };
+            list = magazine;
+            sub(&slot.len, 1);
+            self.depot_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+            freed += bytes;
+        }
+        list
+    }
+
+    /// Gives every block of a list of magazines, linked as in the depot, back to malloc; returns
+    /// how many magazines there were.
+    unsafe fn free_magazines(mut magazine: *mut u8) -> usize {
+        let mut count = 0;
+        while !magazine.is_null() {
+            let following = unsafe { next_magazine(magazine) };
+            unsafe { Self::free_list(magazine) };
+            magazine = following;
+            count += 1;
+        }
+        count
     }
 
     /// Gives every block in a list back to malloc.
@@ -592,6 +671,7 @@ impl<B: Backend> Cache<B> {
             returns: relaxed(&self.returns),
             depot_held: relaxed(&self.depot_held),
             depot_full: relaxed(&self.depot_full),
+            evictions: relaxed(&self.evictions),
             drains: relaxed(&self.drains),
             ..Stats::default()
         };

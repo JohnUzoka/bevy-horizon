@@ -347,8 +347,9 @@ impl core::fmt::Display for MallocFigures {
                 )?;
                 write!(
                     f,
-                    "; {} tries found a depot slot held, and {} magazines found the depot full",
-                    cache.depot_held, cache.depot_full
+                    "; {} tries found a depot slot held, {} magazines found the depot full, and {} of \
+                     the class taken from least lately made room",
+                    cache.depot_held, cache.depot_full, cache.evictions
                 )?;
                 if cache.drains > 0 {
                     write!(f, "; malloc ran out {} times, and took back the cache's blocks", cache.drains)?;
