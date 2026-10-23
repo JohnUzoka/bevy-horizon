@@ -63,7 +63,7 @@ vulkan = []
 # Rust's blocks of 256 KiB and up go in the top-down region at the top of the heap, where NVK takes
 # GPU memory from, instead of between malloc's small blocks: the part mmap plays for a desktop
 # malloc, which newlib's lacks (allocator.rs). Freed after loading, they leave runs GPU memory can
-# use, not holes it can't. Blocks of up to 8 KiB stay in a cache when freed, so threads don't all
+# use, not holes it can't. Blocks of up to 32 KiB stay in a cache when freed, so threads don't all
 # queue for malloc's one lock (allocator/small_blocks.rs; BH_ALLOC_CACHE=0 turns it off). This sets
 # the `#[global_allocator]`, so a game with its own can't use it.
 top_down_alloc = ["vulkan"]

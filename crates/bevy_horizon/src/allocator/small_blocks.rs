@@ -18,7 +18,7 @@
 //! go of it.
 //!
 //! A cached block is a malloc block of its class's size, so malloc counts it as in use, and it can
-//! always go back to `free`. The most the cache holds is about 3.4 MiB in the shards and 6.8 MiB
+//! always go back to `free`. The most the cache holds is about 8.3 MiB in the shards and 8.0 MiB
 //! in the depot; [`Stats::cached`] says how much it does. When malloc runs out, the allocator
 //! gives it the cache's blocks ([`Cache::drain`]) and asks again.
 
@@ -27,10 +27,11 @@ use core::marker::PhantomData;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// The size classes: 16 to 128 bytes in steps of 16, then four to each doubling, up to 8 KiB.
-pub(crate) const CLASSES: usize = 32;
-/// The largest block the cache keeps.
-pub(crate) const MAX_SIZE: usize = 8 << 10;
+/// The size classes: 16 to 128 bytes in steps of 16, then four to each doubling, up to 32 KiB.
+pub(crate) const CLASSES: usize = 40;
+/// The largest block the cache keeps. In Skate 3's play on Ryujinx, 93 % of Rust's allocations
+/// that still reached malloc with 8 KiB here were 8-32 KiB, about 146 a frame.
+pub(crate) const MAX_SIZE: usize = 32 << 10;
 /// The largest alignment the cache serves. malloc's blocks are aligned to two `size_t`s, 16 bytes
 /// on AArch64 (newlib `libc/stdlib/_mallocr.c`, `MALLOC_ALIGNMENT`), and every class's size is a
 /// multiple of 16.
@@ -42,10 +43,16 @@ pub(crate) const SHARDS: usize = 8;
 const MAGAZINE_BYTES: usize = 8 << 10;
 const MIN_MAGAZINE: usize = 2;
 const MAX_MAGAZINE: usize = 32;
-/// Full magazines the depot keeps per class. With 4, Skate 3's map load on Ryujinx gave 109,851
-/// full magazines back to malloc; with 32, 105,007. In play the cache serves over 99.8 % of the
-/// allocations it takes either way.
+/// Full magazines the depot keeps per class of up to 8 KiB. With 4, Skate 3's map load on Ryujinx
+/// gave 109,851 full magazines back to malloc; with 32, 105,007. In play the cache serves over
+/// 99.8 % of the allocations it takes either way.
 const DEPOT_MAGAZINES: usize = 32;
+
+/// Full magazines the depot keeps of `class`: [`DEPOT_MAGAZINES`] up to 8 KiB, 4 above, which
+/// bounds what the larger classes hold there to about 1.2 MiB.
+const fn depot_magazines(class: usize) -> usize {
+    if class_size(class) > 8 << 10 { 4 } else { DEPOT_MAGAZINES }
+}
 
 /// Where blocks come from and go back to: newlib's malloc on the Switch.
 pub(crate) trait Backend {
@@ -458,7 +465,7 @@ impl<B: Backend> Cache<B> {
         let Some(_held) = try_hold(&slot.locked) else {
             return false;
         };
-        if slot.len.load(Ordering::Relaxed) >= DEPOT_MAGAZINES {
+        if slot.len.load(Ordering::Relaxed) >= depot_magazines(class) {
             return false;
         }
         // SAFETY: the slot is held.
@@ -593,7 +600,7 @@ mod tests {
     #[test]
     fn most_it_holds() {
         let shards: usize = (0..CLASSES).map(|c| 2 * magazine_len(c) * class_size(c)).sum::<usize>() * SHARDS;
-        let depot: usize = (0..CLASSES).map(|c| DEPOT_MAGAZINES * magazine_len(c) * class_size(c)).sum();
+        let depot: usize = (0..CLASSES).map(|c| depot_magazines(c) * magazine_len(c) * class_size(c)).sum();
         println!("shards {:.2} MiB, depot {:.2} MiB", shards as f64 / 1048576.0, depot as f64 / 1048576.0);
     }
 }

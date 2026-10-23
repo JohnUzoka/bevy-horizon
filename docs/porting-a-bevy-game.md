@@ -110,7 +110,7 @@ The 0.18 list plays on the console in a full 3D game. The 0.19 list builds for H
 | `vulkan` | Links NVK (`nvk/lib/libvulkan_bh.a`), so wgpu draws through [Vulkan](glossary.md#vulkan). Without it, Bevy's renderer panics with `Unable to find a GPU! Make sure you have installed required drivers!` | The game draws |
 | `render` | Adds `HorizonUploadPlugin`, which [paces GPU uploads](platform-notes.md#pacing-uploads-the-render-feature) | The game draws, with Bevy 0.19 |
 | `render_0_18` | The same, for Bevy 0.18 | The game draws, with Bevy 0.18 |
-| `top_down_alloc` | Turns on `vulkan` and installs a global allocator: blocks of 256 KiB and up go in the region NVK takes GPU memory from, and freed blocks of up to 8 KiB are cached | The game loads large assets; not with your own `#[global_allocator]` |
+| `top_down_alloc` | Turns on `vulkan` and installs a global allocator: blocks of 256 KiB and up go in the region NVK takes GPU memory from, and freed blocks of up to 32 KiB are cached | The game loads large assets; not with your own `#[global_allocator]` |
 | `fps_overlay` | Exports `HorizonFpsOverlayPlugin` ([the FPS overlay](rendering.md#the-fps-overlay)), which you add and toggle with (−)+(+), and `fps_chord_held`, which tells your (+) handler to ignore presses while (−) is held. Needs `bevy_ui_render`, `bevy_text` and `default_font` | You want a frame counter on the console; Bevy 0.19 only |
 
 A wrong combination stops the build with a message that starts `bevy_horizon:`, for example ``bevy_horizon: a Bevy 0.18 game turns on `render_0_18`; `render` is for Bevy 0.19`` ([Troubleshooting](troubleshooting.md)). With `vulkan`, the build also stops if NVK isn't built: ``bevy_horizon's `vulkan` feature links …/nvk/lib/libvulkan_bh.a, which is missing``. Build it with `scripts/build_nvk.sh`, then `scripts/localize_nvk.sh` ([Getting started](building.md)).
@@ -346,7 +346,7 @@ One [heap](glossary.md#heap) holds everything: code, Rust and C allocations, thr
   ```
 
   In Bevy 0.18, pass the same closure to `asset_server.load_with_settings`. For glTF files, set `load_meshes` and `load_materials` in `GltfLoaderSettings` the same way.
-- **Turn on `top_down_alloc` for large assets.** Blocks of 256 KiB and up then come from the top of the heap, where NVK takes GPU memory, and leave malloc's free space whole; freed blocks of up to 8 KiB are kept for reuse (`BH_ALLOC_CACHE=0` turns that off). [Platform notes](platform-notes.md) explains both ("Large Rust blocks in the region" and "Small blocks: a cache in front of malloc").
+- **Turn on `top_down_alloc` for large assets.** Blocks of 256 KiB and up then come from the top of the heap, where NVK takes GPU memory, and leave malloc's free space whole; freed blocks of up to 32 KiB are kept for reuse (`BH_ALLOC_CACHE=0` turns that off). [Platform notes](platform-notes.md) explains both ("Large Rust blocks in the region" and "Small blocks: a cache in front of malloc").
 - **Measure at load stages.** `bevy_horizon::memory_report()` (Horizon only) returns one line on the heap: what malloc has in use and has taken, and what GPU memory holds. For example: `info!("level loaded: {}", bevy_horizon::memory_report())`. It walks the heap, so call it when a stage finishes, not every frame. The heartbeat also logs memory every 60 s ([Heartbeat lines](logging-and-crash-reports.md#heartbeat-lines)).
 
 ## 7. Input, audio, HOME and exit

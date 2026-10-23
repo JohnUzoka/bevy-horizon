@@ -15,7 +15,7 @@
 //! A large block the region can't place comes from malloc, and a small block malloc can't place
 //! goes to the region if one of its runs is free. The `[Memory]` lines count both.
 //!
-//! Blocks of up to 8 KiB, aligned to at most 16 bytes, go through a cache in front of malloc
+//! Blocks of up to 32 KiB, aligned to at most 16 bytes, go through a cache in front of malloc
 //! (small_blocks.rs) unless `BH_ALLOC_CACHE=0`.
 
 mod small_blocks;
@@ -113,9 +113,11 @@ static SMALL_RESCUES: AtomicUsize = AtomicUsize::new(0);
 static MALLOC_CALLS: [AtomicUsize; MALLOC_KINDS] = [const { AtomicUsize::new(0) }; MALLOC_KINDS];
 /// Allocations aligned to more than [`small_blocks::MAX_ALIGN`].
 const MALLOC_ALIGNED: usize = 0;
-/// Allocations over [`small_blocks::MAX_SIZE`]: one index a doubling, 8-16 KiB here up to
-/// 128-256 KiB at `MALLOC_SIZED + 4`.
+/// Allocations over [`small_blocks::MAX_SIZE`]: one index a doubling from [`SIZED_BASE`], 8-16 KiB
+/// here up to 128-256 KiB at `MALLOC_SIZED + 4`, so the lines compare with builds whose cache
+/// stopped at 8 KiB.
 const MALLOC_SIZED: usize = 1;
+const SIZED_BASE: usize = 8 << 10;
 const MALLOC_REALLOCS: usize = 6;
 const MALLOC_FREES: usize = 7;
 pub(crate) const MALLOC_KINDS: usize = 8;
@@ -125,7 +127,7 @@ fn count_malloc_call(layout: Layout) {
     let kind = if layout.align() > small_blocks::MAX_ALIGN {
         MALLOC_ALIGNED
     } else if layout.size() > small_blocks::MAX_SIZE {
-        let doublings = usize::BITS - ((layout.size() - 1) / small_blocks::MAX_SIZE).leading_zeros();
+        let doublings = usize::BITS - ((layout.size() - 1) / SIZED_BASE).leading_zeros();
         MALLOC_SIZED + (doublings as usize - 1).min(4)
     } else {
         return;
