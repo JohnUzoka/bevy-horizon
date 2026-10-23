@@ -260,6 +260,8 @@ bevy_horizon::set_thread_core_policy(bevy_horizon::ThreadCorePolicy::AnyCore);
 | `Spread` | Start on the next of cores 1, 2, 0 in turn; the kernel may move them. |
 | `Pinned` | Fixed to the next of cores 1, 2, 0 in turn. |
 
+Without that call, `BH_THREAD_CORES` picks the policy: `default`, `any`, `spread` or `pinned`. It's read as each thread is created, so a game that sets it from a settings file early in `main` covers the threads made after that, Bevy's task pools among them.
+
 Each `[Thread]` line shows where its thread runs, and [captest](glossary.md#captest)'s `cores-*` checks time each policy on the console.
 
 ## C struct layouts and the libc patch

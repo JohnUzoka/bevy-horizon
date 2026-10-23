@@ -1,0 +1,106 @@
+bevy-horizon: flatten small ifs before Volta (NAK_DEBUG=psel)
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 953fa75a, after 0001-0025. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+Before SM70 every if NAK keeps is a real branch, with SSY, BRA and SYNC around it, and NAK ran
+nir_opt_peephole_select with a limit of 0, so it only flattened empty ifs. With psel, an if
+whose sides hold up to 8 instructions becomes selects. Switch builds turn psel on with the other
+defaults (patch 0019); NAK_DEBUG=-psel turns it off. The flags key NVK's shader cache, so
+shaders compiled with and without it are cached apart. Not yet timed with Skate 3 (sk8 findings
+61).
+
+The change is StevensND's (https://github.com/StevensND), from his Mesa patch for the reference
+Switch port of the ReXGlue recompilation framework, as carried by masseffect-nx's NVK patch
+(https://github.com/nebadasSwifty/masseffect-nx, mesa/mesa-switch-masseffect.patch, by
+nebadasSwifty; MIT, as its THIRD_PARTY_NOTICES.md puts its mesa/ changes).
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index b7058c0..7cc716a 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -42,9 +42,10 @@ enum DebugFlags {
+     WgBar,
+     Share,
+     JThr,
++    PSel,
+ }
+ 
+-const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 20] = [
++const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 21] = [
+     ("panic", DebugFlags::Panic),
+     ("print", DebugFlags::Print),
+     ("serial", DebugFlags::Serial),
+@@ -65,14 +66,16 @@ const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 20] = [
+     ("wgbar", DebugFlags::WgBar),
+     ("share", DebugFlags::Share),
+     ("jthr", DebugFlags::JThr),
++    ("psel", DebugFlags::PSel),
+ ];
+ 
+ /// The flags NAK_DEBUG starts from. Switch builds (meson sets
+ /// nak_switch_defaults for horizon) start from the ones measured faster on the
+-/// console, plus ofold, which saves instructions at the same register count;
++/// console, plus ofold, which saves instructions at the same register count,
++/// and psel, from masseffect-nx's NVK patch (not yet timed with Skate 3);
+ /// other builds start from none.
+ #[cfg(nak_switch_defaults)]
+-const DEFAULT_DEBUG_FLAGS: &str = "xbar,sink,remat,xbrk,lsink,plat,ofold";
++const DEFAULT_DEBUG_FLAGS: &str = "xbar,sink,remat,xbrk,lsink,plat,ofold,psel";
+ #[cfg(not(nak_switch_defaults))]
+ const DEFAULT_DEBUG_FLAGS: &str = "";
+ 
+@@ -205,6 +208,10 @@ pub trait GetDebugFlags {
+     fn jthr(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::JThr as u8) != 0
+     }
++
++    fn psel(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::PSel as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+@@ -297,6 +304,11 @@ pub extern "C" fn nak_debug_wgbar() -> bool {
+     DEBUG.wgbar()
+ }
+ 
++#[no_mangle]
++pub extern "C" fn nak_debug_psel() -> bool {
++    DEBUG.psel()
++}
++
+ fn nir_options(dev: &nv_device_info) -> nir_shader_compiler_options {
+     nir_shader_compiler_options {
+         lower_fdiv: true,
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+index 74fb8c0..5fb10db 100644
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -204,8 +204,12 @@ nak_optimize_nir(nir_shader *nir, const struct nak_compiler *nak)
+       LOOP_OPT(nir, nir_opt_dce);
+       LOOP_OPT(nir, nir_opt_cse);
+ 
++      /* NAK_DEBUG=psel: before Volta every if is a real branch (SSY, BRA,
++       * SYNC), so an if with up to 8 instructions on its sides becomes
++       * selects, from masseffect-nx's NVK patch.
++       */
+       nir_opt_peephole_select_options peephole_select_options = {
+-         .limit = 0,
++         .limit = nak_debug_psel() ? 8 : 0,
+          .discard_ok = true,
+       };
+       LOOP_OPT_NOT_IDEMPOTENT(nir, nir_opt_peephole_select,
+diff --git a/src/nouveau/compiler/nak_private.h b/src/nouveau/compiler/nak_private.h
+index a915a98..cd693e4 100644
+--- a/src/nouveau/compiler/nak_private.h
++++ b/src/nouveau/compiler/nak_private.h
+@@ -21,6 +21,7 @@ bool nak_debug_remat(void);
+ bool nak_debug_lsink(void);
+ bool nak_debug_ofold(void);
+ bool nak_debug_wgbar(void);
++bool nak_debug_psel(void);
+ 
+ struct nak_compiler {
+    uint8_t sm;

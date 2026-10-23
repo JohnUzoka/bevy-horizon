@@ -1,0 +1,155 @@
+bevy-horizon: a fragment-to-fragment barrier without WAIT_FOR_IDLE (NVK_SWITCH_FRAG_BARRIER)
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 953fa75a, after 0001-0028. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+A pipeline barrier whose sources and destinations are all fragment stages, with color attachment
+or sampled access, waits for the whole 3D engine (WAIT_FOR_IDLE). On Maxwell B,
+PIXEL_SHADER_BARRIER waits only for earlier pixel shaders, as deko3d's DkBarrier_Fragments does.
+NVK_SWITCH_FRAG_BARRIER=1 uses it for color attachment and sampled reads and writes, =2 for
+depth/stencil attachments too; 0, the default, keeps WAIT_FOR_IDLE. Barriers from an undefined
+layout keep the full wait (ZCULL may be initialized through the copy engine). It logs the first,
+1000th and 100000th use.
+
+The change is nebadasSwifty's, from masseffect-nx's NVK patch
+(https://github.com/nebadasSwifty/masseffect-nx, mesa/mesa-switch-masseffect.patch;
+MIT, as its THIRD_PARTY_NOTICES.md puts its mesa/ changes).
+
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index 6228ff5..181aa4e 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -21,6 +21,8 @@
+ #include "vk_pipeline_layout.h"
+ #include "vk_synchronization.h"
+ #include "util/compiler.h"
++#include "util/u_atomic.h"
++#include "util/u_debug.h"
+ 
+ #include "clb097.h"
+ #include "clb197.h"
+@@ -871,6 +873,108 @@ nvk_barrier_invalidates(VkPipelineStageFlags2 stages,
+    return barriers;
+ }
+ 
++#ifdef HAVE_SWITCH_PLATFORM
++/* NVK_SWITCH_FRAG_BARRIER: a barrier from fragment work to fragment work
++ * waits only for earlier pixel shaders (PIXEL_SHADER_BARRIER, deko3d's
++ * DkBarrier_Fragments) instead of the whole engine (WAIT_FOR_IDLE). 0, the
++ * default, is off; 1 takes color attachment and sampled reads and writes; 2
++ * depth/stencil attachments too. From masseffect-nx's NVK patch.
++ */
++DEBUG_GET_ONCE_NUM_OPTION(nvk_switch_frag_barrier, "NVK_SWITCH_FRAG_BARRIER", 0)
++static uint32_t nvk_switch_frag_barrier_count;
++
++static const VkPipelineStageFlags2 nvk_frag_stages =
++   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
++   VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
++   VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
++   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
++
++static bool
++nvk_barrier_is_frag_to_frag(VkPipelineStageFlags2 src_stages,
++                            VkAccessFlags2 src_access,
++                            VkPipelineStageFlags2 dst_stages,
++                            int64_t mode)
++{
++   src_stages = vk_expand_src_stage_flags2(src_stages);
++   dst_stages = vk_expand_dst_stage_flags2(dst_stages);
++   src_access = vk_filter_src_access_flags2(src_stages, src_access);
++   if (!src_stages || (src_stages & ~nvk_frag_stages))
++      return false;
++   if (!dst_stages || (dst_stages & ~nvk_frag_stages))
++      return false;
++   VkAccessFlags2 allowed = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
++                            VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
++                            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
++                            VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT;
++   if (mode >= 2)
++      allowed |= VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
++                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
++   else if (src_stages & (VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
++                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT))
++      return false;
++   return !(src_access & ~allowed);
++}
++
++static bool
++nvk_dep_is_frag_to_frag(const VkDependencyInfo *dep, int64_t mode)
++{
++   if (dep->dependencyFlags & VK_DEPENDENCY_ASYMMETRIC_EVENT_BIT_KHR)
++      return false;
++   if (dep->bufferMemoryBarrierCount)
++      return false;
++   if (!dep->memoryBarrierCount && !dep->imageMemoryBarrierCount)
++      return false;
++   for (uint32_t i = 0; i < dep->memoryBarrierCount; i++) {
++      const VkMemoryBarrier2 *bar = &dep->pMemoryBarriers[i];
++      if (!nvk_barrier_is_frag_to_frag(bar->srcStageMask, bar->srcAccessMask,
++                                       bar->dstStageMask, mode))
++         return false;
++   }
++   for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; i++) {
++      const VkImageMemoryBarrier2 *bar = &dep->pImageMemoryBarriers[i];
++      if (bar->srcQueueFamilyIndex != bar->dstQueueFamilyIndex)
++         return false;
++      /* A layout change from undefined may initialize ZCULL through the copy
++       * engine, which the pixel shader barrier doesn't wait for.
++       */
++      if (bar->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED ||
++          bar->oldLayout == VK_IMAGE_LAYOUT_PREINITIALIZED)
++         return false;
++      if (!nvk_barrier_is_frag_to_frag(bar->srcStageMask, bar->srcAccessMask,
++                                       bar->dstStageMask, mode))
++         return false;
++   }
++   return true;
++}
++#endif
++
++/* Whether this dependency's wait can be a pixel shader barrier
++ * (NVK_SWITCH_FRAG_BARRIER).
++ */
++static bool
++nvk_cmd_frag_barrier_only(struct nvk_cmd_buffer *cmd,
++                          const VkDependencyInfo *dep,
++                          enum nvk_barrier barriers)
++{
++#ifdef HAVE_SWITCH_PLATFORM
++   const int64_t mode = debug_get_option_nvk_switch_frag_barrier();
++   const struct nvk_physical_device *pdev =
++      nvk_device_physical(nvk_cmd_buffer_device(cmd));
++   if (mode <= 0 || (barriers & ~NVK_BARRIER_WFI) ||
++       pdev->info.cls_eng3d < MAXWELL_B ||
++       nvk_cmd_buffer_last_subchannel(cmd) != SUBC_NV9097 ||
++       !nvk_dep_is_frag_to_frag(dep, mode))
++      return false;
++   const uint32_t n = p_atomic_inc_return(&nvk_switch_frag_barrier_count);
++   if (n == 1 || n == 1000 || n == 100000)
++      fprintf(stderr, "[NVK] PIXEL_SHADER_BARRIER instead of WAIT_FOR_IDLE "
++              "(NVK_SWITCH_FRAG_BARRIER=%d): %u\n", (int)mode, n);
++   return true;
++#else
++   return false;
++#endif
++}
++
+ void
+ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+                        const VkDependencyInfo *dep,
+@@ -944,6 +1048,14 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+             .flush_data = FLUSH_DATA_TRUE,
+          });
+       }
++   } else if ((barriers & NVK_BARRIER_WFI) && wait &&
++              nvk_cmd_frag_barrier_only(cmd, dep, barriers)) {
++      /* Fragment work waits only for earlier fragment work; texture
++       * invalidates follow in nvk_cmd_invalidate_deps.
++       */
++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
++      __push_immd(p, SUBC_NV9097, NVB197_PIXEL_SHADER_BARRIER,
++                  NVB197_PIXEL_SHADER_BARRIER_SYSMEMBAR_ENABLE_FALSE);
+    } else if ((barriers & NVK_BARRIER_WFI) && wait) {
+       /* If this comes from a vkCmdSetEvent, we don't need to wait
+        *

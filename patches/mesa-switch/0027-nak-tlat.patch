@@ -1,0 +1,124 @@
+bevy-horizon: schedule texture and memory ops as long-latency (NAK_DEBUG=tlat)
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 953fa75a, after 0001-0026. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+NAK's scheduler assumed 32 cycles for texture ops and for the memory ops' arm (Ld, St, Atom,
+ALd, Ipa and the rest). On the Switch's GM20B, which shares LPDDR4 with the CPU, a texture miss
+or a global load takes hundreds. With tlat, both are estimated at 200, so the scheduler places a
+sample further from its use and keeps more requests in flight. It changes scheduling priority
+only; the scoreboard barriers come from calc_instr_deps.rs. Switch builds turn tlat on with the
+other defaults; NAK_DEBUG=-tlat turns it off. Not yet timed with Skate 3 (sk8 findings 61).
+
+The change is StevensND's (https://github.com/StevensND), from his Mesa patch for the reference
+Switch port of the ReXGlue recompilation framework, as carried by masseffect-nx's NVK patch
+(https://github.com/nebadasSwifty/masseffect-nx, mesa/mesa-switch-masseffect.patch, by
+nebadasSwifty; MIT, as its THIRD_PARTY_NOTICES.md puts its mesa/ changes).
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 7cc716a..8493197 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -43,9 +43,10 @@ enum DebugFlags {
+     Share,
+     JThr,
+     PSel,
++    TLat,
+ }
+ 
+-const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 21] = [
++const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 22] = [
+     ("panic", DebugFlags::Panic),
+     ("print", DebugFlags::Print),
+     ("serial", DebugFlags::Serial),
+@@ -67,15 +68,17 @@ const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 21] = [
+     ("share", DebugFlags::Share),
+     ("jthr", DebugFlags::JThr),
+     ("psel", DebugFlags::PSel),
++    ("tlat", DebugFlags::TLat),
+ ];
+ 
+ /// The flags NAK_DEBUG starts from. Switch builds (meson sets
+ /// nak_switch_defaults for horizon) start from the ones measured faster on the
+ /// console, plus ofold, which saves instructions at the same register count,
+-/// and psel, from masseffect-nx's NVK patch (not yet timed with Skate 3);
++/// and psel and tlat, from masseffect-nx's NVK patch (not yet timed with
++/// Skate 3);
+ /// other builds start from none.
+ #[cfg(nak_switch_defaults)]
+-const DEFAULT_DEBUG_FLAGS: &str = "xbar,sink,remat,xbrk,lsink,plat,ofold,psel";
++const DEFAULT_DEBUG_FLAGS: &str = "xbar,sink,remat,xbrk,lsink,plat,ofold,psel,tlat";
+ #[cfg(not(nak_switch_defaults))]
+ const DEFAULT_DEBUG_FLAGS: &str = "";
+ 
+@@ -212,6 +215,10 @@ pub trait GetDebugFlags {
+     fn psel(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::PSel as u8) != 0
+     }
++
++    fn tlat(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::TLat as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+diff --git a/src/nouveau/compiler/nak/opt_instr_sched_common.rs b/src/nouveau/compiler/nak/opt_instr_sched_common.rs
+index 2d8be48..d736eae 100644
+--- a/src/nouveau/compiler/nak/opt_instr_sched_common.rs
++++ b/src/nouveau/compiler/nak/opt_instr_sched_common.rs
+@@ -1,6 +1,7 @@
+ // Copyright © 2024 Valve Corporation
+ // SPDX-License-Identifier: MIT
+ 
++use crate::api::{GetDebugFlags, DEBUG};
+ use crate::ir::*;
+ use compiler::cfg::CFG;
+ use std::cmp::max;
+@@ -254,6 +255,17 @@ pub fn estimate_block_weight(cfg: &CFG<BasicBlock>, block_idx: usize) -> u64 {
+ /// Memory instructions were copied from L1 data cache latencies.
+ /// For instructions not mentioned in the paper, I made up numbers.
+ /// This could probably be improved.
++/// The latency the scheduler assumes for texture and memory ops: 200 cycles
++/// with NAK_DEBUG=tlat, else 32. Ipa and ALd share the memory ops' arm and
++/// are cheaper; overestimating them only places them earlier.
++fn memory_latency() -> u32 {
++    if DEBUG.tlat() {
++        200
++    } else {
++        32
++    }
++}
++
+ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
+     if !sm.op_needs_scoreboard(op) {
+         return 0;
+@@ -283,13 +295,17 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
+         // Uniform ops
+         Op::Redux(_) | Op::R2UR(_) => 15,
+ 
+-        // Texture ops
++        // Texture ops. NAK_DEBUG=tlat: on a GPU that shares LPDDR4 with the
++        // CPU (the Switch's GM20B), a texture miss takes hundreds of cycles,
++        // so the scheduler separates samples from their uses further (from
++        // masseffect-nx's NVK patch). Only scheduling priority: the
++        // scoreboard barriers come from calc_instr_deps.rs.
+         Op::Tex(_)
+         | Op::Tld(_)
+         | Op::Tld4(_)
+         | Op::Tmml(_)
+         | Op::Txd(_)
+-        | Op::Txq(_) => 32,
++        | Op::Txq(_) => memory_latency(),
+ 
+         // Surface ops
+         Op::SuLd(_)
+@@ -314,7 +330,7 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
+         | Op::Ipa(_)
+         | Op::CCtl(_)
+         | Op::LdTram(_)
+-        | Op::MemBar(_) => 32,
++        | Op::MemBar(_) => memory_latency(),
+ 
+         // Control-flow ops
+         Op::WarpSync(_) => 16,

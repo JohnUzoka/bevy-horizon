@@ -21,6 +21,7 @@ Rust has no built-in Switch target, so `aarch64-nintendo-horizon.json`, at the r
 |---|---|---|
 | `arch`, `llvm-target` | `aarch64`, `aarch64-unknown-none` | The Switch's Cortex-A57. LLVM emits freestanding code; libnx supplies the OS layer. |
 | `os`, `env`, `vendor`, `target-family` | `horizon`, `newlib`, `nintendo`, `unix` | Crates take their `cfg(target_os = "horizon")` and Unix paths. |
+| `cpu` | `cortex-a57` | LLVM schedules and tunes Rust code for the Switch's Cortex-A57 cores, not a generic Armv8-A one. `scripts/build_game.sh` also builds with thin LTO (`LTO=fat` or `LTO=off` changes it). |
 | `features` | `+v8a,+neon,+crypto,+crc` | The CPU features C code also gets, from `.cargo/config.toml`. |
 | `panic-strategy` | `abort` | No unwinding: a panic writes `panic.txt` and ends the app. |
 | `linker`, `linker-flavor` | `rust-lld`, `gnu-lld` | LLD does the final link, not GCC. |
@@ -106,7 +107,7 @@ rust-lld: error: relocation refers to a symbol in a discarded section: DW.ref.ru
 
 #### The mesa-switch patches
 
-The 25 patches are in `patches/mesa-switch/`, numbered in the order they apply; each one's header says what it changes and why. Lowercase names are `NAK_DEBUG` flags. NVK's reports go to stderr, which is `log.txt`.
+The 30 patches are in `patches/mesa-switch/`, numbered in the order they apply; each one's header says what it changes and why. Lowercase names are `NAK_DEBUG` flags. NVK's reports go to stderr, which is `log.txt`.
 
 - **GPU memory (0001):** NVK takes GPU memory from the top of the heap down ([platform-notes.md](platform-notes.md#nvk-takes-gpu-memory-from-the-top-of-the-heap)).
 - **On by default in Switch builds** (0019 and 0021), each measured faster on the console:
@@ -116,11 +117,18 @@ The 25 patches are in `patches/mesa-switch/`, numbered in the order they apply; 
   - `lsink` (0011): a fragment input used only inside a large loop is read in the loop;
   - `plat` (0015): the scheduler before register allocation waits out latencies, instead of putting each texture read just above its use;
   - `ofold` (0021): a storage access's constant offset is folded into the access.
+- **On by default in Switch builds, not yet timed with Skate 3** (0026-0028), from [masseffect-nx](https://github.com/nebadasSwifty/masseffect-nx)'s NVK patch, where these changes are [StevensND](https://github.com/StevensND)'s ([CREDITS.md](../CREDITS.md)):
+  - `psel` (0026): an `if` with up to 8 instructions on its sides becomes selects, where every `if` is a real branch before Volta;
+  - `tlat` (0027): the scheduler counts texture and memory ops as 200 cycles, not 32, so a sample sits further from its use;
+  - `NVK_SWITCH_DEAD_COLOR` (0028): a fragment shader's writes to color attachments the pipeline doesn't have are removed, and what only fed them with them; `=0` keeps them.
 - **Off by default:** `ubra` (0006), plain branches for an `if` that is uniform across the warp; `share` (0023), a load shares a scoreboard when all six are taken; `jthr` (0024), jump threading; and `wgbar` (0022), only for [Ryujinx](glossary.md#ryujinx) on [lavapipe](glossary.md#lavapipe).
 - **Reports:** `stats` (0003), one line per compiled shader ([logging-and-crash-reports.md](logging-and-crash-reports.md)); `final` (0004), each shader's final code; whether the depth passes use [ZCULL](glossary.md#zcull) (0010); and which images NVK compresses (0013, [rendering.md](rendering.md#render-target-compression)).
 - **Register cap (0014):** `NAK_GPR_LIMIT=n`, a multiple of 8 from 24 to 248, caps every shader; NAK ignores any other value and says so. An entry point whose name ends in `_gpr` and a number, such as `fragment_gpr48`, caps one shader.
 - **Switches for `nvk_tune`:** early Z, its hysteresis, ZCULL and ZCULL's serialisation (0008); ZCULL's direction (0009); and skipping [indirect draws](glossary.md#indirect-draw) with no instances, which Bevy's GPU culling issues for every culled batch (0012).
 - **Fixes:** GPU timestamps count the [Tegra X1](glossary.md#tegra-x1)'s 1.6276 ns tick (0002); NAK's unit tests build on a PC (0016); and pipeline-statistics queries, such as Bevy's per-pass statistics, count compute invocations correctly without stalling the GPU between compute passes (0017, 0018 and 0020).
+- **From masseffect-nx's NVK patch, by nebadasSwifty** (0029 and 0030):
+  - **A lighter fragment barrier (0029), off by default:** `NVK_SWITCH_FRAG_BARRIER=1` waits only for earlier pixel shaders (`PIXEL_SHADER_BARRIER`) at a barrier from fragment work to fragment work on color attachments and sampled images, instead of the whole 3D engine; `=2` takes depth/stencil attachments too. No barrier wgpu records qualifies: wgpu-hal gives a sampled read the vertex and compute stages as well as the fragment one, and a texture that stays a color or depth target from one pass to the next gets no barrier. So it does nothing in a Bevy game until wgpu-hal narrows those stages.
+  - **GPFIFO room (0030):** each batch of entries reserves the submission's tail too, so a full queue can't fail the submit after it with `NO_SPACE`, which NVK turns into a lost device.
 - **Swapchain images (0025):** a Switch swapchain has as many images as `bh_wsi_switch_image_count` says, from 3 to 8. bevy_horizon defines it: 3, unless `BH_SWAPCHAIN_IMAGES` sets it ([How a frame reaches the screen](rendering.md#how-a-frame-reaches-the-screen)). Any other program that links NVK must define it too.
 
 **Setting NAK's options.** `NAK_DEBUG` takes a comma-separated list: `name` turns a flag on and `-name` turns it off, so `NAK_DEBUG=stats,-plat` logs shader statistics and turns `plat` off. NAK prints the flags in effect. It reads `NAK_DEBUG` and `NAK_GPR_LIMIT` once, and both are part of the shader cache's key, so changing them compiles the shaders again. Set them with `std::env::set_var` at the start of `main`, before you build the App.

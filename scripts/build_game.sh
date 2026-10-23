@@ -12,6 +12,7 @@ set -euo pipefail
 #               .cargo/bevy-$BEVY.toml has the [patch] table for it
 #   CARGO_ARGS  more `cargo build` arguments, e.g. "--no-default-features"
 #   JOBS        caps cargo's parallel jobs; each rustc on a Bevy crate can take 1-2 GB of RAM
+#   LTO         the release build's link-time optimization: thin (default), fat or off
 #   ROMFS       a directory inside game_dir to pack into the NRO as its romfs
 #   AUTHOR      the author the HOME menu and sphaira show (default: bevy-horizon)
 #   VERSION     the version they show (default: 0.1.0)
@@ -24,7 +25,7 @@ IMAGE_NAME="bevy-horizon-toolchain:local"
 ENGINE="${CONTAINER_ENGINE:-$(command -v docker >/dev/null && echo docker || echo podman)}"
 WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [ $# -lt 3 ]; then
-    sed -n '4,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+    sed -n '4,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
     exit 1
 fi
 GAME_DIR="$(cd "$1" && pwd)"
@@ -142,6 +143,7 @@ echo "==> Compiling $PACKAGE ($BIN) for Nintendo Switch (Horizon OS)..."
 # std's own workspace is moved onto patches/libc first, as in build_example.sh.
 "$ENGINE" run --rm --log-driver=none \
     -e PACKAGE="$PACKAGE" -e BIN="$BIN" -e JOBS="${JOBS:-}" -e CONFIG="$CONFIG" \
+    -e CARGO_PROFILE_RELEASE_LTO="${LTO:-thin}" \
     -e CARGO_ARGS="${CARGO_ARGS:-}" \
     -v "$REGISTRY_VOLUME" "${MOUNTS[@]}" \
     -w "/src/$GAME_NAME" \

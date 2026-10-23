@@ -1,0 +1,37 @@
+bevy-horizon: reserve the submission's tail with each batch of GPFIFO entries
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 953fa75a, after 0001-0029. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+nouveau_horizon_channel_exec_locked reserved a batch's entries with no tail, so a batch could
+fill the GPFIFO up to the final skid, and the submit after it could then fail with NO_SPACE
+("channel submit failed: no queue space"), which NVK turns into a lost device. It now keeps 3
+entries for the submission's fence, report and cross-channel wait.
+
+The change is nebadasSwifty's, from masseffect-nx's NVK patch
+(https://github.com/nebadasSwifty/masseffect-nx, mesa/mesa-switch-masseffect.patch;
+MIT, as its THIRD_PARTY_NOTICES.md puts its mesa/ changes), which saw the failure
+on this base.
+
+diff --git a/src/nouveau/horizon/nouveau_horizon_channel.c b/src/nouveau/horizon/nouveau_horizon_channel.c
+index 512a3f7..dddf66f 100644
+--- a/src/nouveau/horizon/nouveau_horizon_channel.c
++++ b/src/nouveau/horizon/nouveau_horizon_channel.c
+@@ -1852,9 +1852,15 @@ nouveau_horizon_channel_exec_locked(
+    const struct nouveau_horizon_exec *execs)
+ {
+    const uint32_t acquire_entries = channel->cache_acquire_emitted ? 0 : 2;
++   /* Leave room for the submission's tail too: submit_locked adds its fence
++    * and report entries (up to 2) and a cross-channel wait (1) after the
++    * final skid. Reserving the skid alone let a batch fill the GPFIFO to it,
++    * and the submit that followed failed with NO_SPACE, which NVK turns into
++    * a lost device. From masseffect-nx's NVK patch.
++    */
+    enum nouveau_horizon_status status =
+       nouveau_horizon_channel_reserve_entries_locked(
+-         channel, exec_count + acquire_entries, 0);
++         channel, exec_count + acquire_entries, 3);
+    if (status != NOUVEAU_HORIZON_SUCCESS)
+       goto done;
+ 

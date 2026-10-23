@@ -53,15 +53,36 @@ impl ThreadCorePolicy {
 }
 
 static THREAD_CORE_POLICY: AtomicU8 = AtomicU8::new(ThreadCorePolicy::Default as u8);
+/// Whether the game chose a policy (`set_thread_core_policy`), which `BH_THREAD_CORES` then
+/// doesn't override.
+static THREAD_CORE_POLICY_SET: CoreAtomicBool = CoreAtomicBool::new(false);
 
 /// Sets the core policy for threads created from now on; threads that already exist keep theirs.
 /// Set it before `App::new()` / `DefaultPlugins` for it to cover Bevy's task pools. Does nothing
 /// off Horizon.
 pub fn set_thread_core_policy(policy: ThreadCorePolicy) {
     THREAD_CORE_POLICY.store(policy as u8, AtomicOrdering::SeqCst);
+    THREAD_CORE_POLICY_SET.store(true, AtomicOrdering::SeqCst);
 }
 
+/// The policy for the next thread: the game's (`set_thread_core_policy`), else
+/// `BH_THREAD_CORES` (`default`, `any`, `spread` or `pinned`), else `Default`. The variable is
+/// read at each thread's creation, so one set from a settings file early in `main` covers the
+/// threads made after it.
 pub fn thread_core_policy() -> ThreadCorePolicy {
+    if !THREAD_CORE_POLICY_SET.load(AtomicOrdering::SeqCst) {
+        let named = std::env::var("BH_THREAD_CORES").ok();
+        let from_env = match named.as_deref().map(str::trim) {
+            Some(name) if name.eq_ignore_ascii_case("default") => Some(ThreadCorePolicy::Default),
+            Some(name) if name.eq_ignore_ascii_case("any") => Some(ThreadCorePolicy::AnyCore),
+            Some(name) if name.eq_ignore_ascii_case("spread") => Some(ThreadCorePolicy::Spread),
+            Some(name) if name.eq_ignore_ascii_case("pinned") => Some(ThreadCorePolicy::Pinned),
+            _ => None,
+        };
+        if let Some(policy) = from_env {
+            return policy;
+        }
+    }
     ThreadCorePolicy::from_u8(THREAD_CORE_POLICY.load(AtomicOrdering::SeqCst))
 }
 
