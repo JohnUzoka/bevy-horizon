@@ -345,6 +345,11 @@ impl core::fmt::Display for MallocFigures {
                     cache.refills,
                     cache.returns,
                 )?;
+                write!(
+                    f,
+                    "; {} tries found a depot slot held, and {} magazines found the depot full",
+                    cache.depot_held, cache.depot_full
+                )?;
                 if cache.drains > 0 {
                     write!(f, "; malloc ran out {} times, and took back the cache's blocks", cache.drains)?;
                 }

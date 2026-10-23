@@ -18,8 +18,8 @@
 //! go of it.
 //!
 //! A cached block is a malloc block of its class's size, so malloc counts it as in use, and it can
-//! always go back to `free`. The most the cache holds is about 8.3 MiB in the shards and 8.0 MiB
-//! in the depot; [`Stats::cached`] says how much it does. When malloc runs out, the allocator
+//! always go back to `free`. The most the cache holds is about 8.3 MiB in the shards and
+//! [`DEPOT_BYTES`] (8 MiB) in the depot; [`Stats::cached`] says how much it does. When malloc runs out, the allocator
 //! gives it the cache's blocks ([`Cache::drain`]) and asks again.
 
 use core::cell::UnsafeCell;
@@ -43,16 +43,16 @@ pub(crate) const SHARDS: usize = 8;
 const MAGAZINE_BYTES: usize = 8 << 10;
 const MIN_MAGAZINE: usize = 2;
 const MAX_MAGAZINE: usize = 32;
-/// Full magazines the depot keeps per class of up to 8 KiB. With 4, Skate 3's map load on Ryujinx
-/// gave 109,851 full magazines back to malloc; with 32, 105,007. In play the cache serves over
-/// 99.8 % of the allocations it takes either way.
-const DEPOT_MAGAZINES: usize = 32;
-
-/// Full magazines the depot keeps of `class`: [`DEPOT_MAGAZINES`] up to 8 KiB, 4 above, which
-/// bounds what the larger classes hold there to about 1.2 MiB.
-const fn depot_magazines(class: usize) -> usize {
-    if class_size(class) > 8 << 10 { 4 } else { DEPOT_MAGAZINES }
-}
+/// Bytes the depot keeps in full magazines, all classes together. Counts per class (32 magazines
+/// up to 8 KiB, 4 above) overflowed on the console: in Skate 3's play, 801-1,277 full magazines a
+/// second went back to malloc, and 5-11 % of the allocations the cache took found nothing, while
+/// the cache held under 5 MiB. One budget lets the classes a frame frees most keep their blocks
+/// for the next; 8 MiB is about what the counts allowed altogether.
+const DEPOT_BYTES: usize = 8 << 20;
+/// Tries at a depot slot before a magazine goes back to malloc or an allocation to malloc. Its
+/// holder keeps it for a few instructions, so trying again finds it free unless the holder was
+/// preempted, and a bounded number can't starve a holder on the same core.
+const DEPOT_TRIES: usize = 4;
 
 /// Where blocks come from and go back to: newlib's malloc on the Switch.
 pub(crate) trait Backend {
@@ -146,6 +146,10 @@ pub(crate) struct Stats {
     pub(crate) flushes: usize,
     /// Full magazines given back to malloc because the depot was full or held.
     pub(crate) returns: usize,
+    /// Tries at a depot slot, to give or take a magazine, that found it held [`DEPOT_TRIES`] times.
+    pub(crate) depot_held: usize,
+    /// Magazines the depot turned away for [`DEPOT_BYTES`].
+    pub(crate) depot_full: usize,
     /// Times malloc ran out with blocks in the cache, which gave them back.
     pub(crate) drains: usize,
     /// Bytes in cached blocks.
@@ -225,6 +229,18 @@ fn try_hold(flag: &AtomicBool) -> Option<Held<'_>> {
     flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).ok().map(|_| Held(flag))
 }
 
+/// [`try_hold`] up to [`DEPOT_TRIES`] times.
+#[inline]
+fn try_hold_soon(flag: &AtomicBool) -> Option<Held<'_>> {
+    for _ in 1..DEPOT_TRIES {
+        if let Some(held) = try_hold(flag) {
+            return Some(held);
+        }
+        core::hint::spin_loop();
+    }
+    try_hold(flag)
+}
+
 /// For turning the cache off, where waiting is fine: sleeping, unlike yielding, lets a
 /// lower-priority holder run. Gives up after about 10 ms.
 fn hold_patiently(flag: &AtomicBool) -> Option<Held<'_>> {
@@ -274,6 +290,10 @@ pub(crate) struct Cache<B> {
     enabled: AtomicBool,
     shards: [Shard; SHARDS],
     depot: [DepotSlot; CLASSES],
+    /// Bytes in the depot's magazines, against [`DEPOT_BYTES`].
+    depot_bytes: AtomicUsize,
+    depot_held: AtomicUsize,
+    depot_full: AtomicUsize,
     busy_allocs: AtomicUsize,
     busy_frees: AtomicUsize,
     rejected: AtomicUsize,
@@ -294,6 +314,9 @@ impl<B: Backend> Cache<B> {
             enabled: AtomicBool::new(true),
             shards: [const { Shard::new() }; SHARDS],
             depot: [const { DepotSlot::new() }; CLASSES],
+            depot_bytes: AtomicUsize::new(0),
+            depot_held: AtomicUsize::new(0),
+            depot_full: AtomicUsize::new(0),
             busy_allocs: AtomicUsize::new(0),
             busy_frees: AtomicUsize::new(0),
             rejected: AtomicUsize::new(0),
@@ -445,7 +468,11 @@ impl<B: Backend> Cache<B> {
     /// A full magazine of `class` from the depot, or null.
     fn depot_take(&self, class: usize) -> *mut u8 {
         let slot = &self.depot[class];
-        let Some(_held) = try_hold(&slot.locked) else {
+        if slot.len.load(Ordering::Relaxed) == 0 {
+            return null_mut();
+        }
+        let Some(_held) = try_hold_soon(&slot.locked) else {
+            self.depot_held.fetch_add(1, Ordering::Relaxed);
             return null_mut();
         };
         // SAFETY: the slot is held.
@@ -454,6 +481,7 @@ impl<B: Backend> Cache<B> {
         if !magazine.is_null() {
             *head = unsafe { next_magazine(magazine) };
             sub(&slot.len, 1);
+            self.depot_bytes.fetch_sub(LENS[class] * SIZES[class], Ordering::Relaxed);
             self.refills.fetch_add(1, Ordering::Relaxed);
         }
         magazine
@@ -461,18 +489,23 @@ impl<B: Backend> Cache<B> {
 
     /// Gives the depot a full magazine of `class`. False if it's full or held.
     unsafe fn depot_put(&self, class: usize, magazine: *mut u8) -> bool {
-        let slot = &self.depot[class];
-        let Some(_held) = try_hold(&slot.locked) else {
-            return false;
-        };
-        if slot.len.load(Ordering::Relaxed) >= depot_magazines(class) {
+        let bytes = LENS[class] * SIZES[class];
+        // Threads putting at once can pass this together, by a magazine each.
+        if self.depot_bytes.load(Ordering::Relaxed) + bytes > DEPOT_BYTES {
+            self.depot_full.fetch_add(1, Ordering::Relaxed);
             return false;
         }
+        let slot = &self.depot[class];
+        let Some(_held) = try_hold_soon(&slot.locked) else {
+            self.depot_held.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
         // SAFETY: the slot is held.
         let head = unsafe { &mut *slot.head.get() };
         unsafe { set_next_magazine(magazine, *head) };
         *head = magazine;
         add(&slot.len, 1);
+        self.depot_bytes.fetch_add(bytes, Ordering::Relaxed);
         true
     }
 
@@ -528,7 +561,7 @@ impl<B: Backend> Cache<B> {
             }
             shard.cached.store(0, Ordering::Relaxed);
         }
-        for slot in &self.depot {
+        for (class, slot) in self.depot.iter().enumerate() {
             let Some(_held) = hold_patiently(&slot.locked) else {
                 continue;
             };
@@ -540,7 +573,8 @@ impl<B: Backend> Cache<B> {
                 *head = unsafe { next_magazine(magazine) };
                 unsafe { Self::free_list(magazine) };
             }
-            slot.len.store(0, Ordering::Relaxed);
+            let magazines = slot.len.swap(0, Ordering::Relaxed);
+            self.depot_bytes.fetch_sub(magazines * LENS[class] * SIZES[class], Ordering::Relaxed);
         }
         gave
     }
@@ -556,6 +590,8 @@ impl<B: Backend> Cache<B> {
             refills: relaxed(&self.refills),
             flushes: relaxed(&self.flushes),
             returns: relaxed(&self.returns),
+            depot_held: relaxed(&self.depot_held),
+            depot_full: relaxed(&self.depot_full),
             drains: relaxed(&self.drains),
             ..Stats::default()
         };
@@ -600,7 +636,7 @@ mod tests {
     #[test]
     fn most_it_holds() {
         let shards: usize = (0..CLASSES).map(|c| 2 * magazine_len(c) * class_size(c)).sum::<usize>() * SHARDS;
-        let depot: usize = (0..CLASSES).map(|c| depot_magazines(c) * magazine_len(c) * class_size(c)).sum();
+        let depot = DEPOT_BYTES;
         println!("shards {:.2} MiB, depot {:.2} MiB", shards as f64 / 1048576.0, depot as f64 / 1048576.0);
     }
 }
