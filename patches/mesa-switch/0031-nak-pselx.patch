@@ -1,0 +1,102 @@
+bevy-horizon: flatten larger ifs before Volta, transcendentals too (NAK_DEBUG=pselx)
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 953fa75a, after 0001-0030. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+psel (patch 0026) turns an if whose sides hold up to 8 instructions into selects, so it pays no
+SSY, BRA and SYNC, but nir_opt_peephole_select leaves any if with a transcendental (rsq, sqrt,
+log2, exp2), which NIR counts as expensive. pselx raises the limit to 24 and lets those in. It
+flattens only ALU: speculated loads (indirect_load_ok) changed none of Skate 3's world shaders,
+so they stay out. Off by default, NAK_DEBUG=pselx turns it on; the flags key NVK's shader cache.
+
+Skate 3's main-pass world shaders on the host (sk8 findings 62 §19), with the Switch's default
+flags, instructions and registers:
+
+  shader                               default      pselx
+  opaque, MaloofMoneyCup's 0x77        1,849, 48    1,763, 48
+  opaque, all features (Downtown)      1,976, 56    1,938, 48 (40 warps, not 36)
+  opaque, features 0x57                1,760, 48    1,676, 48
+  water                                2,710, 120   2,657, 120
+
+NAK's cycle estimate falls 2-4% for three of them and rises 4% for the second, but it predicted
+neither psel and tlat's measured saving nor ubra's measured loss, so only the console can say.
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index 8493197..29f654e 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -44,9 +44,10 @@ enum DebugFlags {
+     JThr,
+     PSel,
+     TLat,
++    PSelX,
+ }
+ 
+-const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 22] = [
++const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 23] = [
+     ("panic", DebugFlags::Panic),
+     ("print", DebugFlags::Print),
+     ("serial", DebugFlags::Serial),
+@@ -69,6 +70,7 @@ const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 22] = [
+     ("jthr", DebugFlags::JThr),
+     ("psel", DebugFlags::PSel),
+     ("tlat", DebugFlags::TLat),
++    ("pselx", DebugFlags::PSelX),
+ ];
+ 
+ /// The flags NAK_DEBUG starts from. Switch builds (meson sets
+@@ -219,6 +221,10 @@ pub trait GetDebugFlags {
+     fn tlat(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::TLat as u8) != 0
+     }
++
++    fn pselx(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::PSelX as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+@@ -316,6 +322,11 @@ pub extern "C" fn nak_debug_psel() -> bool {
+     DEBUG.psel()
+ }
+ 
++#[no_mangle]
++pub extern "C" fn nak_debug_pselx() -> bool {
++    DEBUG.pselx()
++}
++
+ fn nir_options(dev: &nv_device_info) -> nir_shader_compiler_options {
+     nir_shader_compiler_options {
+         lower_fdiv: true,
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+index 5fb10db..123643a 100644
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -206,10 +206,12 @@ nak_optimize_nir(nir_shader *nir, const struct nak_compiler *nak)
+ 
+       /* NAK_DEBUG=psel: before Volta every if is a real branch (SSY, BRA,
+        * SYNC), so an if with up to 8 instructions on its sides becomes
+-       * selects, from masseffect-nx's NVK patch.
++       * selects, from masseffect-nx's NVK patch. NAK_DEBUG=pselx takes ifs
++       * with up to 24, transcendentals (rsq, sqrt, log2, exp2) included.
+        */
+       nir_opt_peephole_select_options peephole_select_options = {
+-         .limit = nak_debug_psel() ? 8 : 0,
++         .limit = nak_debug_pselx() ? 24 : nak_debug_psel() ? 8 : 0,
++         .expensive_alu_ok = nak_debug_pselx(),
+          .discard_ok = true,
+       };
+       LOOP_OPT_NOT_IDEMPOTENT(nir, nir_opt_peephole_select,
+diff --git a/src/nouveau/compiler/nak_private.h b/src/nouveau/compiler/nak_private.h
+index cd693e4..f0e23c7 100644
+--- a/src/nouveau/compiler/nak_private.h
++++ b/src/nouveau/compiler/nak_private.h
+@@ -22,6 +22,7 @@ bool nak_debug_lsink(void);
+ bool nak_debug_ofold(void);
+ bool nak_debug_wgbar(void);
+ bool nak_debug_psel(void);
++bool nak_debug_pselx(void);
+ 
+ struct nak_compiler {
+    uint8_t sm;
