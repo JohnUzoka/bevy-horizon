@@ -8,22 +8,25 @@ psel (patch 0026) turns an if whose sides hold up to 8 instructions into selects
 SSY, BRA and SYNC, but nir_opt_peephole_select leaves any if with a transcendental (rsq, sqrt,
 log2, exp2), which NIR counts as expensive. pselx raises the limit to 24 and lets those in. It
 flattens only ALU: speculated loads (indirect_load_ok) changed none of Skate 3's world shaders,
-so they stay out. Off by default, NAK_DEBUG=pselx turns it on; the flags key NVK's shader cache.
+so they stay out. Switch builds turn it on with the other defaults; NAK_DEBUG=-pselx goes back
+to psel's 8. The flags key NVK's shader cache.
 
-Skate 3's main-pass world shaders on the host (sk8 findings 62 §19), with the Switch's default
-flags, instructions and registers:
+Skate 3's main-pass world shaders on the host, with the Switch's other default flags,
+instructions and registers:
 
-  shader                               default      pselx
+  shader                               psel         pselx
   opaque, MaloofMoneyCup's 0x77        1,849, 48    1,763, 48
   opaque, all features (Downtown)      1,976, 56    1,938, 48 (40 warps, not 36)
   opaque, features 0x57                1,760, 48    1,676, 48
   water                                2,710, 120   2,657, 120
 
-NAK's cycle estimate falls 2-4% for three of them and rises 4% for the second, but it predicted
-neither psel and tlat's measured saving nor ubra's measured loss, so only the console can say.
+On a Switch Lite at 1280x720, three frozen steps a launch (sk8 findings 62 §20), the main pass
+took 18.52-18.56 ms in MaloofMoneyCup against 18.98-19.06 without it, and 20.44-20.65 ms in
+Downtown against 21.44-21.76: 0.47 and 1.07 ms less, shading the same fragments. NAK's own cycle
+estimate had put Downtown's shader 4% slower.
 
 diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
-index 8493197..29f654e 100644
+index 8493197..ef0d312 100644
 --- a/src/nouveau/compiler/nak/api.rs
 +++ b/src/nouveau/compiler/nak/api.rs
 @@ -44,9 +44,10 @@ enum DebugFlags {
@@ -38,7 +41,7 @@ index 8493197..29f654e 100644
      ("panic", DebugFlags::Panic),
      ("print", DebugFlags::Print),
      ("serial", DebugFlags::Serial),
-@@ -69,6 +70,7 @@ const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 22] = [
+@@ -69,16 +70,16 @@ const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 22] = [
      ("jthr", DebugFlags::JThr),
      ("psel", DebugFlags::PSel),
      ("tlat", DebugFlags::TLat),
@@ -46,7 +49,21 @@ index 8493197..29f654e 100644
  ];
  
  /// The flags NAK_DEBUG starts from. Switch builds (meson sets
-@@ -219,6 +221,10 @@ pub trait GetDebugFlags {
+ /// nak_switch_defaults for horizon) start from the ones measured faster on the
+-/// console, plus ofold, which saves instructions at the same register count,
+-/// and psel and tlat, from masseffect-nx's NVK patch (not yet timed with
+-/// Skate 3);
+-/// other builds start from none.
++/// console, among them psel and tlat, from masseffect-nx's NVK patch, and
++/// pselx, which widens psel; plus ofold, which saves instructions at the same
++/// register count. Other builds start from none.
+ #[cfg(nak_switch_defaults)]
+-const DEFAULT_DEBUG_FLAGS: &str = "xbar,sink,remat,xbrk,lsink,plat,ofold,psel,tlat";
++const DEFAULT_DEBUG_FLAGS: &str = "xbar,sink,remat,xbrk,lsink,plat,ofold,psel,tlat,pselx";
+ #[cfg(not(nak_switch_defaults))]
+ const DEFAULT_DEBUG_FLAGS: &str = "";
+ 
+@@ -219,6 +220,10 @@ pub trait GetDebugFlags {
      fn tlat(&self) -> bool {
          self.debug_flags() & (1 << DebugFlags::TLat as u8) != 0
      }
@@ -57,7 +74,7 @@ index 8493197..29f654e 100644
  }
  
  pub static DEBUG: OnceLock<Debug> = OnceLock::new();
-@@ -316,6 +322,11 @@ pub extern "C" fn nak_debug_psel() -> bool {
+@@ -316,6 +321,11 @@ pub extern "C" fn nak_debug_psel() -> bool {
      DEBUG.psel()
  }
  
