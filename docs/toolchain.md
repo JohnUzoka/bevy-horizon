@@ -107,7 +107,7 @@ rust-lld: error: relocation refers to a symbol in a discarded section: DW.ref.ru
 
 #### The mesa-switch patches
 
-The 31 patches are in `patches/mesa-switch/`, numbered in the order they apply; each one's header says what it changes and why. Lowercase names are `NAK_DEBUG` flags. NVK's reports go to stderr, which is `log.txt`.
+The 32 patches are in `patches/mesa-switch/`, numbered in the order they apply; each one's header says what it changes and why. Lowercase names are `NAK_DEBUG` flags. NVK's reports go to stderr, which is `log.txt`.
 
 - **GPU memory (0001):** NVK takes GPU memory from the top of the heap down ([platform-notes.md](platform-notes.md#nvk-takes-gpu-memory-from-the-top-of-the-heap)).
 - **On by default in Switch builds** (0019, 0021 and 0031), each measured faster on the console:
@@ -127,6 +127,7 @@ The 31 patches are in `patches/mesa-switch/`, numbered in the order they apply; 
 - **Register cap (0014):** `NAK_GPR_LIMIT=n`, a multiple of 8 from 24 to 248, caps every shader; NAK ignores any other value and says so. An entry point whose name ends in `_gpr` and a number, such as `fragment_gpr48`, caps one shader.
 - **Switches for `nvk_tune`:** early Z, its hysteresis, ZCULL and ZCULL's serialisation (0008); ZCULL's direction (0009); and skipping [indirect draws](glossary.md#indirect-draw) with no instances, which Bevy's GPU culling issues for every culled batch (0012).
 - **Fixes:** GPU timestamps count the [Tegra X1](glossary.md#tegra-x1)'s 1.6276 ns tick (0002); NAK's unit tests build on a PC (0016); and pipeline-statistics queries, such as Bevy's per-pass statistics, count compute invocations correctly without stalling the GPU between compute passes (0017, 0018 and 0020).
+- **Helper lanes' loads (0032), on by default as `hzero`:** a fragment shader's helper lanes, the ones outside the triangle that run so that derivatives work, don't load from global memory on Horizon, because NVK can't clear the register bit that lets them; such a load leaves its destination register as it was. A loop whose bounds come from a storage buffer, like Bevy's clustered point and spot lights, can then run on in a helper lane until the GPU times out. `hzero` gives helper lanes zero from every global load, one select per loaded value; `-hzero` turns it off. It ended the GPU hang that lit `StandardMaterial` caused in Bevy 0.18 ([The helper-lane hang](rendering.md#the-helper-lane-hang-fixed)).
 - **From masseffect-nx's NVK patch, by nebadasSwifty** (0029 and 0030):
   - **A lighter fragment barrier (0029), off by default:** `NVK_SWITCH_FRAG_BARRIER=1` waits only for earlier pixel shaders (`PIXEL_SHADER_BARRIER`) at a barrier from fragment work to fragment work on color attachments and sampled images, instead of the whole 3D engine; `=2` takes depth/stencil attachments too. No barrier wgpu records qualifies: wgpu-hal gives a sampled read the vertex and compute stages as well as the fragment one, and a texture that stays a color or depth target from one pass to the next gets no barrier. So it does nothing in a Bevy game until wgpu-hal narrows those stages.
   - **GPFIFO room (0030):** each batch of entries reserves the submission's tail too, so a full queue can't fail the submit after it with `NO_SPACE`, which NVK turns into a lost device.

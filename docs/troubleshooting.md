@@ -167,11 +167,11 @@ Then read them in this order:
   - If you write your own indirect draws, test them in a debug build, or insert `VALIDATION` and `VALIDATION_INDIRECT_CALL` into `WgpuSettings::instance_flags`. Release builds on Horizon skip wgpu's indirect-call validation ([indirect-call validation](rendering.md#indirect-call-validation)).
   - Rule out memory with `bevy_horizon::memory_report()` ([out of memory](#wgpu-reports-out-of-memory)).
 
-### A Bevy 0.18 scene stops the GPU in its first frames (known issue)
+### A Bevy 0.18 scene stops the GPU in its first frames (fixed by Mesa patch 0032)
 
 - **What you see:** the GPU stops within the first few frames. About 10–13 s after the first frame, the log shows a `channel N lost: …` line with `notification={type=8 (fifo idle timeout) info=0 status=65535}`. Then wgpu reports the device lost, and the final panic is in `Surface::present` or `Texture::create_view`.
-- **Why:** unknown. It has been seen in one simple Bevy 0.18 test scene: a lit `StandardMaterial`, a non-HDR camera that tonemaps in the shader, a sun and a ground plane. It isn't memory: more than 2 GiB was free. bevy-horizon's Bevy 0.19 examples draw the same stock path without trouble.
-- **Fix:** none is known yet. See [rendering.md](rendering.md).
+- **Why:** a light loop in a fragment shader's helper lanes, the lanes of a 2×2 quad outside the triangle, which run so that derivatives work. On Horizon they load nothing from storage buffers, so a loop whose bounds come from one, like Bevy's clustered point and spot lights in a lit `StandardMaterial`, ran on between stale bounds until the GPU timed out. It isn't memory: more than 2 GiB was free.
+- **Fix:** Mesa patch 0032 gives helper lanes zero from those loads (`NAK_DEBUG=hzero`, on by default in Switch builds); run `scripts/build_nvk.sh` and `scripts/localize_nvk.sh` again if your `nvk/` predates it. With it, Skate 3's test world, which hung in every earlier build, runs on the console. See [The helper-lane hang](rendering.md#the-helper-lane-hang-fixed).
 
 ### The FPS overlay doesn't show, or (−)+(+) quits the game
 

@@ -10,7 +10,7 @@ This page is for anyone whose Bevy game draws on the Switch: the Bevy features a
 - **The default settings are safe; a 3D game should also set `BH_RT_COMPRESSION=1`,** which saves GPU time on the console. Set variables with `std::env::set_var` at the start of `main` ([Render settings](#render-settings)).
 - **Large 3D games are GPU-bound at [handheld](glossary.md#handheld-mode) clocks.** The first launch also compiles every shader; NVK caches them on the [SD card](glossary.md#sdmc) under `sdmc:/.mesa/`, so later launches start faster ([Performance](#performance)).
 - **When the GPU stops, the log says why.** Every Horizon build logs NVK's own messages, the Vulkan error and the wgpu call that lost the device. A [panic](glossary.md#panic) after a [lost device](glossary.md#device-lost) is a consequence, not a second bug ([Diagnosing a lost device or a GPU hang](#diagnosing-a-lost-device-or-a-gpu-hang)).
-- **One Bevy 0.18 scene hangs the GPU,** for a reason not yet known ([Known issues](#known-issues)).
+- **Lit `StandardMaterial` used to hang the GPU in Bevy 0.18,** until Mesa patch 0032: a fragment shader's helper lanes looped between light-list bounds they couldn't load ([The helper-lane hang](#the-helper-lane-hang-fixed)).
 - **Stock [Ryujinx](glossary.md#ryujinx) can't run the Vulkan builds.** NVK hits emulator bugs at startup and on the first frames, and the project's fixes are local and unpublished. The emulator's speed says nothing about the console's ([What the emulator gets wrong](#what-the-emulator-gets-wrong)).
 
 ## Bevy features a game needs
@@ -178,7 +178,7 @@ When the GPU stops, or a Vulkan call fails in a way wgpu can't recover from, wgp
 
 ### Reading a loss
 
-Read the first lines of the loss, not the last. A GPU hang logs, in order, a long wait for the next image, NVK's message saying why, and the call that lost the device. This is the [known hang](#known-issues) in a Bevy 0.18 game, whose log format leaves out each line's target:
+Read the first lines of the loss, not the last. A GPU hang logs, in order, a long wait for the next image, NVK's message saying why, and the call that lost the device. This is the [helper-lane hang](#the-helper-lane-hang-fixed) in a Bevy 0.18 game, whose log format leaves out each line's target:
 
 ```text
 WARN wgpu-hal: waited 8.5 s for the window's next image, longer than the 1.0 s wgpu asks for; on Horizon it waits for as long as it takes
@@ -211,9 +211,12 @@ After a loss, Mesa can still hold GPU memory, so Horizon's GPU driver ([nv](glos
 - **Turn on the driver's buffer robustness** (`BH_ROBUST_BUFFER_ACCESS=driver`) to see whether an index past the end of a buffer is the cause.
 - **Run render_check with the same settings** to tell a problem in your game from one in the drawing path.
 
+### The helper-lane hang (fixed)
+
+Before Mesa patch 0032, Bevy 0.18's lit `StandardMaterial` stopped the GPU within its first frames: about 10 to 13 s after the first frame came the loss in [Reading a loss](#reading-a-loss). A fragment shader runs pixels in 2×2 quads, and the pixels of a quad outside the triangle run too, as helpers, so that derivatives work. On Horizon a helper lane loads nothing from global memory, because NVK can't clear the GPU register bit that allows it, so the load leaves its register as it was. Bevy's clustered lighting loops over point and spot lights between bounds it loads from a storage buffer, and in a helper lane those bounds were whatever the register held, so the loop could run on until the channel timed out. Memory, the driver's buffer robustness, shadows, the depth prepass, an unlit ground and `WGPU_SETTINGS_PRIO=compatibility` made no difference; capping each loop at 16 iterations stopped the hang, while the pixels on screen loaded no lights at all. Patch 0032 gives helper lanes zero from every global load (`NAK_DEBUG=hzero`, on by default; [toolchain.md](toolchain.md#the-mesa-switch-patches)), and Skate 3's test world, which hung in every earlier build, runs on the console at 30–40 fps; with `NAK_DEBUG=-hzero` the same build hangs again. bevy-horizon's Bevy 0.19 examples drew the same path without trouble before it, probably because what a stale register holds depends on how the shader was compiled.
+
 ## Known issues
 
-- **A GPU hang in one Bevy 0.18 scene.** A simple test scene, with lit `StandardMaterial` meshes, a non-HDR camera that tonemaps in the shader, a sun and a ground plane, stops the GPU within its first few frames. About 10 to 13 s after the first frame, the log shows `channel N lost: … notification={type=8 (fifo idle timeout) info=0 status=65535}`, then wgpu reports the device lost, and the final panic is in `Surface::present` or `Texture::create_view` ([Reading a loss](#reading-a-loss) has the log). It isn't memory: more than 2 GiB was free. None of these helped: the driver's buffer robustness, no shadows, no depth prepass, an unlit ground, or `WGPU_SETTINGS_PRIO=compatibility`, which also turns off bindless materials, indirect draws and GPU culling. This repo's Bevy 0.19 examples draw the same stock path on the same driver build, and the same game's main world plays. The cause is unknown.
 - **Large 3D games are GPU-bound** at handheld clocks ([Performance](#performance)).
 - **The first launch compiles every shader,** so it starts slower than later ones ([NVK's shader cache on the SD card](#nvks-shader-cache-on-the-sd-card)).
 

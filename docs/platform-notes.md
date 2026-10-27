@@ -375,7 +375,7 @@ A Horizon result code packs a module and a description. libnx and bevy_horizon (
 | captest | 179 pass, 0 fail, 2 warn (`fs-unicode-name`, and `stick-center`: the sticks rest at 0.081 against Bevy's 0.05 dead zone), at handheld clocks with Bevy 0.19, before the current audio host ([testing.md](testing.md)). |
 | C layouts | All 348 items match devkitA64's headers. |
 | Docked mode | Untested; the window becomes 1920×1080. |
-| Known issue | One simple Bevy 0.18 scene stops the GPU within its first frames. About 10–13 s after the first frame, the log shows `channel N lost: notification={type=8 (fifo idle timeout) info=0 status=65535}`, then the device is lost. It isn't memory, and the cause is unknown ([rendering.md](rendering.md)). |
+| Lit `StandardMaterial` (Bevy 0.18) | Proven on the console with Mesa patch 0032 (`hzero`): Skate 3's test world runs at 30–40 fps. Before it, the GPU stopped within the first frames, because a fragment shader's helper lanes looped between light-list bounds they couldn't load ([rendering.md](rendering.md#the-helper-lane-hang-fixed)). |
 
 ## Sources used for these notes
 

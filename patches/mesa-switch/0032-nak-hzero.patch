@@ -1,0 +1,201 @@
+bevy-horizon: give helper lanes zero from global loads (NAK_DEBUG=hzero)
+
+For mesa-switch (https://github.com/danfromtico/mesa-switch, by danfromtico and NaGaa95; MIT)
+at 953fa75a, after 0001-0031. scripts/build_nvk.sh applies it; this text before the first
+"diff --git" line is ignored by git apply.
+
+A fragment shader runs a 2x2 quad of lanes at a time, and the lanes outside the triangle run as
+helpers so that derivatives work. Helper lanes load from global memory only once bit 3 of
+gr_gpcs_tpcs_sm_disp_ctrl is clear. NVK clears it with its SET_PRIV_REG macro, which Horizon
+doesn't offer (nvk_cmd_draw.c), so on the Switch a helper lane's load leaves its destination
+register as it was. Storage buffers are global memory, and Bevy's clustered forward lighting
+loops over point and spot lights between bounds it loads from one, so in a helper lane those
+loops can run for as long as a stale register says, and the channel times out (fifo idle
+timeout). That is the GPU hang that Bevy's lit StandardMaterial caused on the Switch (sk8
+findings 55 and 59): capping each loop at 16 iterations stopped it, while the pixels on screen
+saw no lights at all.
+
+With hzero, every global load in a fragment shader is followed by a select that gives helper
+lanes zero, so such a loop runs no iterations in them. A helper lane's values reach the other
+lanes only through derivatives, which a stale register spoils as surely. A shader without a
+demote reads the helper state once (S2R of SR_THREAD_KILL); one with a demote reads it at each
+load, as a demoted lane becomes a helper. Switch builds turn hzero on with the other defaults
+(patch 0019); NAK_DEBUG=-hzero turns it off. The flags key NVK's shader cache, so shaders
+compiled with and without it are cached apart.
+
+On the host NAK (GM20B, the Switch defaults), Bevy 0.18's lit forward shader gains one select
+per loaded value, 48, and one S2R, at the same 72 registers; Skate 3's world shader gains 34-188
+instructions (3-7 %) at the same registers and about the same static cycle count. On the
+console, Skate 3's test world, whose lit StandardMaterial ground hung the GPU in every earlier
+build, runs at 30-40 fps with hzero (sk8 0.1.4-visfix10); with NAK_DEBUG=-hzero the same build
+hangs again, and a retail map plays as it did without the patch.
+
+diff --git a/src/nouveau/compiler/nak/api.rs b/src/nouveau/compiler/nak/api.rs
+index ef0d312..f0c51af 100644
+--- a/src/nouveau/compiler/nak/api.rs
++++ b/src/nouveau/compiler/nak/api.rs
+@@ -45,9 +45,10 @@ enum DebugFlags {
+     PSel,
+     TLat,
+     PSelX,
++    HZero,
+ }
+ 
+-const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 23] = [
++const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 24] = [
+     ("panic", DebugFlags::Panic),
+     ("print", DebugFlags::Print),
+     ("serial", DebugFlags::Serial),
+@@ -71,15 +72,17 @@ const DEBUG_FLAG_NAMES: [(&str, DebugFlags); 23] = [
+     ("psel", DebugFlags::PSel),
+     ("tlat", DebugFlags::TLat),
+     ("pselx", DebugFlags::PSelX),
++    ("hzero", DebugFlags::HZero),
+ ];
+ 
+ /// The flags NAK_DEBUG starts from. Switch builds (meson sets
+ /// nak_switch_defaults for horizon) start from the ones measured faster on the
+ /// console, among them psel and tlat, from masseffect-nx's NVK patch, and
+ /// pselx, which widens psel; plus ofold, which saves instructions at the same
+-/// register count. Other builds start from none.
++/// register count, and hzero, which gives helper lanes zero from the global
++/// loads Horizon leaves undone in them. Other builds start from none.
+ #[cfg(nak_switch_defaults)]
+-const DEFAULT_DEBUG_FLAGS: &str = "xbar,sink,remat,xbrk,lsink,plat,ofold,psel,tlat,pselx";
++const DEFAULT_DEBUG_FLAGS: &str = "xbar,sink,remat,xbrk,lsink,plat,ofold,psel,tlat,pselx,hzero";
+ #[cfg(not(nak_switch_defaults))]
+ const DEFAULT_DEBUG_FLAGS: &str = "";
+ 
+@@ -224,6 +227,10 @@ pub trait GetDebugFlags {
+     fn pselx(&self) -> bool {
+         self.debug_flags() & (1 << DebugFlags::PSelX as u8) != 0
+     }
++
++    fn hzero(&self) -> bool {
++        self.debug_flags() & (1 << DebugFlags::HZero as u8) != 0
++    }
+ }
+ 
+ pub static DEBUG: OnceLock<Debug> = OnceLock::new();
+@@ -326,6 +333,11 @@ pub extern "C" fn nak_debug_pselx() -> bool {
+     DEBUG.pselx()
+ }
+ 
++#[no_mangle]
++pub extern "C" fn nak_debug_hzero() -> bool {
++    DEBUG.hzero()
++}
++
+ fn nir_options(dev: &nv_device_info) -> nir_shader_compiler_options {
+     nir_shader_compiler_options {
+         lower_fdiv: true,
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+index 123643a..bb94e1f 100644
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -1344,6 +1344,84 @@ nak_nir_lower_load_store(nir_shader *nir, const struct nak_compiler *nak)
+    return progress;
+ }
+ 
++/* NAK_DEBUG=hzero: a fragment shader's helper lanes load nothing from global
++ * memory on Horizon: the GPU lets them only once bit 3 of
++ * gr_gpcs_tpcs_sm_disp_ctrl is clear, and Horizon gives NVK no way to write
++ * that register (nvk_cmd_draw.c skips its SET_PRIV_REG there).  A helper
++ * lane's LDG leaves the destination holding whatever its register held
++ * before.  Storage buffers are global memory, so a loop whose bounds a helper
++ * lane loads from one, like Bevy's clustered light loops, can run on in that
++ * lane long after the quad's other lanes are done, until the channel times
++ * out.  With hzero, helper lanes take zero from every global load instead, so
++ * such a loop runs no iterations in them.  A helper lane's values reach the
++ * other lanes only through derivatives, which a stale register spoils as
++ * surely as a zero.
++ *
++ * A demote makes the lane a helper from there on, so in a shader with one,
++ * each load reads the lane's state where it runs; without one, the shader
++ * reads it once.
++ */
++static bool
++nak_nir_zero_helper_global_loads(nir_shader *nir)
++{
++   if (nir->info.stage != MESA_SHADER_FRAGMENT)
++      return false;
++
++   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
++   bool has_load = false, has_demote = false;
++   nir_foreach_block(block, impl) {
++      nir_foreach_instr(instr, block) {
++         if (instr->type != nir_instr_type_intrinsic)
++            continue;
++
++         switch (nir_instr_as_intrinsic(instr)->intrinsic) {
++         case nir_intrinsic_load_global_nv:
++            has_load = true;
++            break;
++         case nir_intrinsic_demote:
++         case nir_intrinsic_demote_if:
++            has_demote = true;
++            break;
++         default:
++            break;
++         }
++      }
++   }
++   if (!has_load)
++      return nir_no_progress(impl);
++
++   nir_builder b = nir_builder_at(nir_before_impl(impl));
++   nir_def *shader_live = NULL;
++   if (!has_demote) {
++      nir_def *killed = nak_nir_load_sysval(&b, NAK_SV_THREAD_KILL, 0);
++      shader_live = nir_ieq_imm(&b, killed, 0);
++   }
++
++   nir_foreach_block(block, impl) {
++      nir_foreach_instr_safe(instr, block) {
++         if (instr->type != nir_instr_type_intrinsic)
++            continue;
++
++         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++         if (intr->intrinsic != nir_intrinsic_load_global_nv)
++            continue;
++
++         b.cursor = nir_after_instr(instr);
++         nir_def *live = shader_live;
++         if (live == NULL) {
++            nir_def *killed = nak_nir_load_sysval(&b, NAK_SV_THREAD_KILL, 0);
++            live = nir_ieq_imm(&b, killed, 0);
++         }
++         nir_def *zero = nir_imm_zero(&b, intr->def.num_components,
++                                      intr->def.bit_size);
++         nir_def *res = nir_bcsel(&b, live, &intr->def, zero);
++         nir_def_rewrite_uses_after(&intr->def, res);
++      }
++   }
++
++   return nir_progress(true, impl, nir_metadata_control_flow);
++}
++
+ /* NAK_DEBUG=ofold: a storage buffer's address is its binding's 64-bit base
+  * plus the u2u64 of a 32-bit offset (nir_address_format_64bit_global_32bit_offset),
+  * and nir_opt_offsets can't look through the u2u64, so every field of a struct
+@@ -2169,6 +2247,8 @@ nak_postprocess_nir(nir_shader *nir,
+ 
+    if (OPT(nir, nak_nir_lower_load_store, nak))
+       OPT(nir, nir_opt_constant_folding);
++   if (nak_debug_hzero())
++      OPT(nir, nak_nir_zero_helper_global_loads);
+ 
+    if (nak_debug_ofold())
+       OPT(nir, nak_nir_split_global_offset);
+diff --git a/src/nouveau/compiler/nak_private.h b/src/nouveau/compiler/nak_private.h
+index f0e23c7..45ddc52 100644
+--- a/src/nouveau/compiler/nak_private.h
++++ b/src/nouveau/compiler/nak_private.h
+@@ -23,6 +23,7 @@ bool nak_debug_ofold(void);
+ bool nak_debug_wgbar(void);
+ bool nak_debug_psel(void);
+ bool nak_debug_pselx(void);
++bool nak_debug_hzero(void);
+ 
+ struct nak_compiler {
+    uint8_t sm;

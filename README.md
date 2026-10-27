@@ -22,7 +22,7 @@ bevy-horizon is young. All of its testing on hardware has been on one Switch Lit
 | Docked mode | Untested. The window switches to 1920×1080 when docked, but nothing has been run docked yet. |
 | Emulators | Stock emulators can't run the Vulkan builds yet ([testing.md](docs/testing.md#testing-in-an-emulator)). |
 
-One known problem: a lit Bevy 0.18 scene has hung the GPU about 10 seconds in, and the cause isn't known yet ([rendering.md](docs/rendering.md#known-issues)).
+A lit Bevy 0.18 scene used to hang the GPU about 10 seconds in; Mesa patch 0032 fixed it ([rendering.md](docs/rendering.md#the-helper-lane-hang-fixed)).
 
 ## Requirements
 
