@@ -24,7 +24,7 @@ kyokoxdev/iw4l-nx-crate-patches is no longer online (GitHub returns 404 for it).
 
 ## Linked or used to build
 
-- [devkitPro](https://devkitpro.org): devkitA64, libnx, switch-tools (`elf2nro`, `nacptool`), and the portlibs `switch-mesa`, `switch-libexpat`, `switch-zlib` and `switch-libzstd`.
+- [devkitPro](https://devkitpro.org): devkitA64, libnx, switch-tools (`elf2nro`, `nacptool`), and the portlibs `switch-mesa`, `switch-libexpat`, `switch-zlib` and `switch-libzstd`; the toolchain image also installs `switch-curl` (libcurl, [curl license](https://curl.se/docs/copyright.html)) for games that link it.
 - [Bevy](https://github.com/bevyengine/bevy) 0.19.1 and [wgpu](https://github.com/gfx-rs/wgpu) 29.0.4, with their dependencies from crates.io; games on Bevy 0.18 build against Bevy 0.18.1 and wgpu 27 instead (`.cargo/bevy-0.18.toml`). The `fps_overlay` feature wraps Bevy's own `FpsOverlayPlugin` from `bevy_dev_tools` (`crates/bevy_horizon/src/fps_overlay.rs`); wgpu-hal reaches NVK through [ash](https://github.com/ash-rs/ash)'s Vulkan bindings (MIT OR Apache-2.0).
 - [Mesa](https://mesa3d.org)'s NVK driver and NAK shader compiler, as built by [danfromtico/mesa-switch](https://github.com/danfromtico/mesa-switch) (MIT), linked into every `vulkan` build.
 - [Rust](https://github.com/rust-lang/rust) nightly, `1.101.0-nightly (db8f076d2 2026-10-03)`.

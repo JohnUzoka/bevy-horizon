@@ -1,9 +1,12 @@
 FROM docker.io/devkitpro/devkita64:latest
 
-# Install Nintendo Switch graphics, audio, and dev tools
+# Install Nintendo Switch graphics, audio, and dev tools. switch-curl is libcurl with libnx's TLS
+# backend (the console's SSL service and its trusted certificates), for games that make HTTPS
+# requests (docs/porting-a-bevy-game.md, "Networking").
 RUN dkp-pacman -Syu --noconfirm \
     switch-mesa \
     switch-sdl2 \
+    switch-curl \
     switch-tools \
     libnx \
     devkitA64 && \

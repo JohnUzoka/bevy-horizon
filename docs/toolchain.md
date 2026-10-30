@@ -55,7 +55,7 @@ Startup, files, sockets, controllers, `malloc` and the system services come from
 /opt/devkitpro/devkitA64/lib/gcc/aarch64-none-elf/16.1.0/pic
 ```
 
-The image starts from [devkitPro](glossary.md#devkitpro)'s `devkitpro/devkita64` and installs the current packages with `dkp-pacman`, unpinned. Today that gives devkitA64 r30-1 (GCC 16.1.0), libnx 4.12.0, switch-sdl2 2.28.5, switch-tools 1.13.1 and [switch-mesa](glossary.md#switch-mesa) 20.1.0, the [OpenGL ES](glossary.md#opengl-es) driver that [captest](glossary.md#captest)'s GLES probe uses.
+The image starts from [devkitPro](glossary.md#devkitpro)'s `devkitpro/devkita64` and installs the current packages with `dkp-pacman`, unpinned. Today that gives devkitA64 r30-1 (GCC 16.1.0), libnx 4.12.0, switch-sdl2 2.28.5, switch-tools 1.13.1, switch-curl 7.69.1 (libcurl, whose TLS goes through the console's SSL service, for games that make HTTPS requests) and [switch-mesa](glossary.md#switch-mesa) 20.1.0, the [OpenGL ES](glossary.md#opengl-es) driver that [captest](glossary.md#captest)'s GLES probe uses.
 
 **`-z notext`.** The examples' build scripts (`examples/*/build.rs`) repeat these folders and libraries and add `-z notext`, which lets the link keep relocations in read-only code. `bevy_horizon` doesn't, and [Skate 3 Rust Engine](https://github.com/JohnUzoka/skate-3-rust-engine), a full 3D game, links without it. Add it to your game's `build.rs`, for Horizon only, as `examples/hello_switch/build.rs` does, if rust-lld stops on a dynamic relocation in a read-only segment.
 

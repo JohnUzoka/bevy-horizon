@@ -15,7 +15,8 @@ set -euo pipefail
 #   LTO         the release build's link-time optimization: thin (default), fat or off
 #   ROMFS       a directory inside game_dir to pack into the NRO as its romfs
 #   AUTHOR      the author the HOME menu and sphaira show (default: bevy-horizon)
-#   VERSION     the version they show (default: 0.1.0)
+#   VERSION     the version they show (default: 0.1.0). The game's build scripts also get it as
+#               NRO_VERSION, empty when VERSION isn't set, so a game can compile its version in
 #   ICON        the icon they show: a 256x256 JPEG (default: libnx's)
 # The NRO lands in <game_dir>/target/aarch64-nintendo-horizon/release/<bin>.nro.
 # The game's Cargo.lock is changed in place: each patched crate is moved to the patch's version.
@@ -144,7 +145,7 @@ echo "==> Compiling $PACKAGE ($BIN) for Nintendo Switch (Horizon OS)..."
 "$ENGINE" run --rm --log-driver=none \
     -e PACKAGE="$PACKAGE" -e BIN="$BIN" -e JOBS="${JOBS:-}" -e CONFIG="$CONFIG" \
     -e CARGO_PROFILE_RELEASE_LTO="${LTO:-thin}" \
-    -e CARGO_ARGS="${CARGO_ARGS:-}" \
+    -e CARGO_ARGS="${CARGO_ARGS:-}" -e NRO_VERSION="${VERSION:-}" \
     -v "$REGISTRY_VOLUME" "${MOUNTS[@]}" \
     -w "/src/$GAME_NAME" \
     "$IMAGE_NAME" \

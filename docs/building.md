@@ -62,7 +62,7 @@ From bevy-horizon's folder:
 docker build -t bevy-horizon-toolchain:local -f Containerfile .
 ```
 
-With Podman, run `podman build` with the same arguments. The image has [devkitA64](glossary.md#devkita64) (GCC and newlib for the Switch's CPU), [libnx](glossary.md#libnx), `elf2nro` and `nacptool`, and a pinned Rust nightly with `rust-src`. Every script uses it.
+With Podman, run `podman build` with the same arguments. The image has [devkitA64](glossary.md#devkita64) (GCC and newlib for the Switch's CPU), [libnx](glossary.md#libnx), `elf2nro` and `nacptool`, libcurl for HTTPS, and a pinned Rust nightly with `rust-src`. Every script uses it.
 
 `scripts/build_example.sh` builds the image if it's missing, but it never rebuilds it, so run the command above again after the `Containerfile` changes. `scripts/build_nvk.sh` doesn't build the image at all, which is why this step comes before NVK.
 
@@ -76,6 +76,7 @@ The image used for testing had:
 | switch-tools | `1.13.1-1` | `elf2nro` and `nacptool` |
 | switch-mesa | `20.1.0-5` | OpenGL ES, used only by `switch_captest` |
 | switch-sdl2 | `2.28.5-4` | Nothing; it's installed but unused ([why not SDL2](input-and-audio.md#why-not-sdl2)) |
+| switch-curl | `7.69.1-5` | HTTPS for games that link it: libcurl, with TLS through the console's SSL service ([Networking](porting-a-bevy-game.md#8-audit-your-dependencies)) |
 
 - **The base image isn't pinned.** The `Containerfile` starts from `devkitpro/devkita64:latest`, so a fresh build can bring a newer devkitA64. The `build.rs` files expect GCC 16.1.0; see [Troubleshooting](#troubleshooting) if linking can't find `-lgcc`.
 - **The nightly is pinned by `ARG RUST_NIGHTLY`** and installed under the plain name `nightly`. `-Z build-std` writes std's path into the debug info, so the plain name keeps rebuilds byte-identical. `--build-arg RUST_NIGHTLY=nightly` takes the latest nightly instead.
@@ -84,7 +85,7 @@ To see what an image has:
 
 ```sh
 docker run --rm bevy-horizon-toolchain:local bash -c \
-  'rustc -V; aarch64-none-elf-gcc --version | head -1; dkp-pacman -Q devkitA64 libnx switch-tools switch-mesa'
+  'rustc -V; aarch64-none-elf-gcc --version | head -1; dkp-pacman -Q devkitA64 libnx switch-tools switch-mesa switch-curl'
 ```
 
 ## 3. Build NVK
