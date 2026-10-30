@@ -2,7 +2,7 @@
 """Names the offsets in a bevy_horizon CPU profile (crates/bevy_horizon/src/profiler.rs).
 
 Usage: scripts/symbolize_cpu_profile.py <cpu-profile.txt> <the game's ELF> [--top N] [--chains N]
-                                        [--threads N] [--lines] [--width N]
+                                        [--threads N] [--lines] [--width N] [--callers FUNCTION]
 
 The ELF is the one the NRO was made from (<game>/target/aarch64-nintendo-horizon/release/<bin>).
 It is linked at 0, so the report's offsets are its addresses. Function names come from `nm` (GNU
@@ -24,6 +24,11 @@ What it prints:
   (inclusive), and where they wait.
 A running sample is a thread that wasn't in a system call. On a busy CPU it may have been ready
 but not on a core, so a thread's busy % is the measure of its CPU time; its samples say where.
+
+--callers FUNCTION (repeatable, e.g. `--callers _free_r --callers _malloc_r`) says who the time in
+FUNCTION is for: each thread's running samples in it, by the first frame outside the allocators
+(libc/newlib, horizon-nx's Rust allocator, Mesa's Vulkan allocation callbacks, std's drop and growth
+machinery), and how much came through horizon-nx's allocator (Rust) rather than straight from C.
 """
 
 import argparse
@@ -46,6 +51,14 @@ PLUMBING = re.compile(
     r"bevy_horizon::compat::|__wrap_|thread_start$|threadEntry$|_start$|__libnx_|"
     r"<F as core::ops::function|<std::thread::|core::ops::function)"
 )
+# Frames between an allocation or a free and the code that asked for it, for --callers.
+ALLOCATION = re.compile(
+    r"^(_?(malloc|free|realloc|calloc|memalign)(_r)?$|aligned_alloc$|posix_memalign$|"
+    r"__malloc_\w+$|_malloc_\w+_r$|r?mutex(Lock|Unlock)$|__rust_|vk_default_\w+$|"
+    r"vk_(z|re)?alloc2?$|vk_free2?$|<?horizon_nx::allocator|alloc::alloc::|<alloc::alloc::Global|"
+    r"<?alloc::raw_vec|core::ptr::drop|.* as core::ops::drop::Drop>::drop$|.*::drop_key_val$)"
+)
+RUST_ALLOCATOR = ("horizon_nx::allocator", "<horizon_nx::allocator")
 
 
 def parse(path):
@@ -199,6 +212,8 @@ def main():
     parser.add_argument("--chains", type=int, default=0, help="also print each thread's N commonest chains")
     parser.add_argument("--lines", action="store_true", help="file:line of the hottest addresses (slow)")
     parser.add_argument("--width", type=int, default=0, help="cut names to this many characters (0: whole)")
+    parser.add_argument("--callers", action="append", default=[], metavar="FUNCTION",
+                        help="who the running samples in FUNCTION are for (repeatable; e.g. _free_r)")
     args = parser.parse_args()
     global WIDTH
     WIDTH = args.width
@@ -299,6 +314,29 @@ def main():
         for index, address in enumerate(addresses):
             where = out[3 * index + 2] if 3 * index + 2 < len(out) else "?"
             print(f"  {hot_pcs_all[address]:6d} {address:#10x} {where}  {short(compact(symbols.name(address)), 90)}")
+
+    for function in args.callers:
+        print(f"\nCallers of {function} (running samples, by the first frame outside the "
+              f"allocators; Rust = through horizon-nx's allocator):")
+        for thread, *_ in sorted(named, key=lambda item: item[0]["cpu_ms"], reverse=True):
+            callers, rust, total = collections.Counter(), 0, 0
+            for count, flags, frames in thread["chains"]:
+                if flags & FLAG_WAITING:
+                    continue
+                names = frame_names(symbols, flags, frames)
+                if names[0] != function:
+                    continue
+                total += count
+                from_rust = any(name.startswith(RUST_ALLOCATOR) for name in names)
+                rust += count if from_rust else 0
+                owner = next((n for n in names[1:] if n != "…" and not ALLOCATION.match(n)), "?")
+                callers[("Rust  " if from_rust else "C     ") + compact(owner)] += count
+            if not total:
+                continue
+            print(f"  {thread['name']}: {total} samples, {100 * rust / total:.1f}% from Rust, "
+                  f"{100 * (total - rust) / total:.1f}% from C")
+            for name, count in callers.most_common(args.top):
+                print(f"    {100.0 * count / total:5.1f}%  {short(name)}")
 
 
 if __name__ == "__main__":
