@@ -45,6 +45,11 @@ mod ffi {
         /// end the process, as libnx always does for an NSO. An application asks with
         /// `ISelfController::Exit`, a library applet with `ExitProcessAndReturn`.
         pub static mut __nx_applet_exit_mode: u32;
+        /// Whether the homebrew loader passed buffers for the next NRO to start (libnx `env.c`).
+        pub fn envHasNextLoad() -> bool;
+        /// Copies `path` and `argv` into the loader's buffers with `strcpy`: the loader then starts
+        /// that NRO when this one returns to it, instead of the homebrew menu.
+        pub fn envSetNextLoad(path: *const c_char, argv: *const c_char) -> u32;
     }
 
     /// libnx `Service` (switch/sf/service.h). `session` is 0 while the service is closed.
@@ -129,6 +134,45 @@ pub fn register_release_hook(hook: fn()) -> bool {
     }
     RELEASE_HOOKS[slot].store(hook as usize, Ordering::SeqCst);
     true
+}
+
+/// The sizes of nx-hbloader's next-NRO buffers (`g_nextNroPath`, `g_nextArgv`), which libnx's
+/// `envSetNextLoad` fills with `strcpy`.
+#[cfg(target_os = "horizon")]
+const NEXT_PATH_MAX: usize = 512;
+#[cfg(target_os = "horizon")]
+const NEXT_ARGV_MAX: usize = 2048;
+
+/// Asks the homebrew loader to start the NRO at `path` when this one exits, instead of going back
+/// to the homebrew menu: what hbmenu does to start an NRO. The next NRO gets `path` as `argv[0]`.
+/// A game can start itself again this way, for instance after replacing its own `.nro` with a
+/// newer one; the loader reads the file afresh.
+///
+/// The request only counts if the exit returns to the loader: after `[Exit] PASS`. After
+/// `[Exit] WARN`, AM ends the process, the console goes to HOME and the request is lost
+/// (docs/lifecycle-and-exit.md). Returns `false`, and asks nothing, when the loader takes no
+/// requests (`envHasNextLoad`, false when the NRO wasn't started by a homebrew loader), when
+/// `path` doesn't fit the loader's buffers or holds a NUL, or when libnx refuses it. Always
+/// `false` on other platforms.
+pub fn set_next_load(path: &str) -> bool {
+    #[cfg(target_os = "horizon")]
+    {
+        // libnx's argv parser takes a quoted argument as one, spaces and all.
+        let argv = format!("\"{path}\"");
+        if path.len() >= NEXT_PATH_MAX || argv.len() >= NEXT_ARGV_MAX {
+            return false;
+        }
+        let (Ok(path), Ok(argv)) = (std::ffi::CString::new(path), std::ffi::CString::new(argv)) else {
+            return false;
+        };
+        // SAFETY: both strings are NUL-terminated and shorter than the loader's buffers.
+        unsafe { ffi::envHasNextLoad() && ffi::envSetNextLoad(path.as_ptr(), argv.as_ptr()) == 0 }
+    }
+    #[cfg(not(target_os = "horizon"))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 #[cfg(target_os = "horizon")]

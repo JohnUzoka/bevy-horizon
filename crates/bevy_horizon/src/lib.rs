@@ -81,8 +81,8 @@ pub use display::{HorizonDisplayMode, HorizonDisplayPlugin};
 #[cfg(feature = "fps_overlay")]
 pub use fps_overlay::{HorizonFpsOverlayPlugin, fps_chord_held};
 pub use input::{HorizonGamepadState, HorizonInputPlugin, RawPad, npad_button, raw_pad};
-pub use lifecycle::{HorizonLifecyclePlugin, register_release_hook};
-pub use logging::{flush_switch_logs, init_switch_logging};
+pub use lifecycle::{HorizonLifecyclePlugin, register_release_hook, set_next_load};
+pub use logging::{flush_switch_logs, init_switch_logging, nro_path};
 #[cfg(any(feature = "render", feature = "render_0_18"))]
 pub use uploads::{HorizonUploadPlugin, HorizonUploadSettings};
 

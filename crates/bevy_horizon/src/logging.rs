@@ -227,14 +227,20 @@ fn set_asset_root(nro_path: Option<&str>, app_name: &str) {
     write_log(line.as_bytes());
 }
 
-/// `argv[0]`, the path the NRO was launched from, as parsed by libnx's `argvSetup`.
-#[cfg(target_os = "horizon")]
-fn nro_path() -> Option<&'static str> {
+/// `argv[0]`, the path the NRO was launched from, as parsed by libnx's `argvSetup`, such as
+/// `sdmc:/switch/hello_switch/hello_switch.nro`. `None` when the app wasn't started as an NRO,
+/// and on other platforms.
+pub fn nro_path() -> Option<&'static str> {
+    #[cfg(target_os = "horizon")]
     unsafe {
         if ffi::__system_argc < 1 || ffi::__system_argv.is_null() || (*ffi::__system_argv).is_null() {
             return None;
         }
         CStr::from_ptr(*ffi::__system_argv).to_str().ok()
+    }
+    #[cfg(not(target_os = "horizon"))]
+    {
+        None
     }
 }
 

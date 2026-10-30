@@ -161,6 +161,14 @@ If focus comes back within 100 ms of that switch, the system didn't suspend the 
 
 [logging-and-crash-reports.md](logging-and-crash-reports.md) describes these files. **Never call `svcExitProcess` yourself:** it ends the process without telling the system's applet manager ([AM](glossary.md#am)), which may then report an error. When `bevy_horizon` must end the process, it asks AM.
 
+## Starting another NRO after exit
+
+`bevy_horizon::set_next_load(path)` asks the homebrew loader to start the NRO at `path` when this one exits, instead of the homebrew menu: the request hbmenu makes to start an NRO (libnx's `envSetNextLoad`). The next NRO gets `path` as `argv[0]`. Send `AppExit` afterwards as usual.
+
+A game can start itself again this way, for instance after replacing its own `.nro` with a newer one: `bevy_horizon::nro_path()` is the path it was started from. Replacing that file while the game runs is safe, because the loader reads the whole NRO into the heap before starting it, and only [RomFS](glossary.md#romfs) reads it again afterwards; a game with RomFS has to stop reading it first.
+
+The request only holds when the exit returns to the loader, after `[Exit] PASS`. After `[Exit] WARN`, AM ends the process and the console goes to HOME, so the user starts the NRO again from the homebrew menu. `set_next_load` returns `false`, and asks nothing, when the loader took no requests (`envHasNextLoad`, false when no homebrew loader started the NRO) or the path is too long for the loader's 512-byte buffer.
+
 ## Quitting: the App drop
 
 `App::run` hands the App to the runner (`bevy_app-0.19.1/src/app.rs:192-194`), whose loop drops it on `AppExit`, still inside `run()`. Everything the App owns drops with it:
@@ -394,8 +402,8 @@ The check applies the kernel's rule for [IPC](glossary.md#ipc) buffers (Atmosph√
 |---|---|
 | `HorizonPlugin` and the runner | `crates/bevy_horizon/src/lib.rs` (`HorizonPlugin`, `FRAME_TIME`) |
 | libnx hooks: thread pointer, threads, aborts, exceptions | `crates/bevy_horizon/src/compat.rs` (`userAppInit`, `set_thread_pointer`, `__wrap_threadCreate`, `close_detached_threads`, `userAppExit`, `diagAbortWithResult`, `__libnx_exception_handler`) |
-| Boot log, `log.txt`, the log writer, the panic hook | `crates/bevy_horizon/src/logging.rs` (`start_boot_log`, `init_switch_logging`, `set_asset_root`, `stop_log_writer`, `write_log_line`, `FixedBuf`, `record_panic`) |
-| Startup services, HOME, the heartbeat, the exit hook | `crates/bevy_horizon/src/lifecycle.rs` (`init_horizon_services`, `check_applet_loop`, `suspend_until_out_of_background`, `frame_timer`, `flush_logs_system`, `register_release_hook`, `release_horizon_services`, `stop_task_pools`, `release_nvdrv`) |
+| Boot log, `log.txt`, the log writer, the panic hook | `crates/bevy_horizon/src/logging.rs` (`start_boot_log`, `init_switch_logging`, `nro_path`, `set_asset_root`, `stop_log_writer`, `write_log_line`, `FixedBuf`, `record_panic`) |
+| Startup services, HOME, the heartbeat, the exit hook, the next NRO | `crates/bevy_horizon/src/lifecycle.rs` (`init_horizon_services`, `check_applet_loop`, `suspend_until_out_of_background`, `frame_timer`, `flush_logs_system`, `register_release_hook`, `set_next_load`, `release_horizon_services`, `stop_task_pools`, `release_nvdrv`) |
 | The heap scan | `crates/bevy_horizon/src/memory.rs` (`scan_heap`, `check_heap_for_exit`, `wait_for_heap_unlock`, `nvmap_heap`) |
 | Screen, input, dock status | `crates/bevy_horizon/src/window.rs` (`attach_default_nwindow`), `input.rs` (`poll_horizon_input`), `display.rs` (`monitor_dock_status`) |
 | Stopping the task pools | `patches/bevy_tasks/src/usages.rs`, `patches/bevy-0.18/bevy_tasks/src/usages.rs` (`shut_down_global_task_pools`) |
