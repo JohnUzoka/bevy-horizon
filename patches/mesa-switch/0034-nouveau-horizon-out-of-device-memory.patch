@@ -1,0 +1,51 @@
+From ef27adb7278949c7201c23464806ca0f143e11b9 Mon Sep 17 00:00:00 2001
+From: John Uzoka <johnuzoka19@gmail.com>
+Date: Sat, 31 Oct 2026 19:07:24 -0600
+Subject: [PATCH] bevy-horizon: a GPU block with no room in the heap is out of
+ device memory
+
+nouveau_horizon_memory_create returned OUT_OF_HOST_MEMORY when the heap had no room for a new
+GPU block, so vkAllocateMemory did too. gpu-allocator maps only OUT_OF_DEVICE_MEMORY to its
+OutOfMemory and anything else to an internal error, which wgpu-hal reports as a lost device:
+horizon (Minecraft in Rust) on the Switch lost its device when a high render distance filled the
+heap, and its next buffer came back invalid instead of failing an allocation it handles. The
+block's memory is the device memory here (VkDeviceMemory lives in the heap), so this returns
+OUT_OF_DEVICE_MEMORY, and logs the failure (at the 1st, 2nd, 4th, 8th... failure).
+---
+ src/nouveau/horizon/nouveau_horizon_memory.c | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/horizon/nouveau_horizon_memory.c b/src/nouveau/horizon/nouveau_horizon_memory.c
+index 9c28a96..d8ba30e 100644
+--- a/src/nouveau/horizon/nouveau_horizon_memory.c
++++ b/src/nouveau/horizon/nouveau_horizon_memory.c
+@@ -986,8 +986,25 @@ nouveau_horizon_memory_create(
+                continue;
+             }
+             nouveau_horizon_memory_record_create_failure(device);
++            /* No room left in the heap for the block. That is device memory
++             * running out (VkDeviceMemory lives in the heap here), so say so:
++             * gpu-allocator turns any other vkAllocateMemory error into an
++             * internal error and wgpu into a lost device (bevy-horizon's
++             * RUN 24 crash), where a failed allocation is one the app handles.
++             */
++            struct nouveau_horizon_device_debug_stats stats = {0};
++            nouveau_horizon_device_get_debug_stats(device, &stats);
++            if (util_is_power_of_two_nonzero64(stats.memory_create_failures))
++               nouveau_horizon_log(device, NOUVEAU_HORIZON_LOG_ERROR,
++                                   "no room in the heap for a GPU block of "
++                                   "0x%llx bytes (align 0x%llx): out of device "
++                                   "memory (%llu allocations failed so far)",
++                                   (unsigned long long)size_B,
++                                   (unsigned long long)align_B,
++                                   (unsigned long long)
++                                      stats.memory_create_failures);
+             FREE(identity);
+-            return NOUVEAU_HORIZON_ERROR_OUT_OF_HOST_MEMORY;
++            return NOUVEAU_HORIZON_ERROR_OUT_OF_DEVICE_MEMORY;
+          }
+ 
+          Result rc = nouveau_horizon_memory_nvmap_create(&identity->map, identity->cpu_addr,
+-- 
+2.53.0
+
