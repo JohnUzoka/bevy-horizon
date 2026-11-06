@@ -485,7 +485,7 @@ BEVY=0.18 JOBS=16 CARGO_ARGS="--no-default-features" AUTHOR="Skate 3 Rust Engine
 
 It provides:
 
-- **The platform layer Bevy expects:** the run loop, the window on the screen, one controller as a Bevy gamepad, HOME, sleep and focus as Bevy's messages, the dock state, RomFS and sockets.
+- **The platform layer Bevy expects:** the run loop, the window on the screen, one controller as a Bevy gamepad, HOME, sleep and focus as Bevy's messages, the dock state, RomFS and sockets, and the system's software keyboard for text (`keyboard`).
 - **Drawing,** through wgpu's Vulkan backend and NVK linked into the NRO (`vulkan`), with upload pacing (`render`, `render_0_18`) and an allocator for large assets (`top_down_alloc`).
 - **Sound,** through the patched cpal hosts.
 - **Logs:** `log.txt`, `panic.txt`, the heartbeat, `memory_report()`, a CPU profiler, and an [FPS overlay](rendering.md#the-fps-overlay) (`fps_overlay`, Bevy 0.19).
@@ -495,7 +495,7 @@ It provides:
 
 It doesn't provide, yet:
 
-- touch, motion controls, rumble, a keyboard, or a second controller;
+- touch, motion controls, rumble, a hardware keyboard, or a second controller;
 - a microphone, or more than one audio output;
 - system save data; saves are files on the SD card;
 - tested docked mode;

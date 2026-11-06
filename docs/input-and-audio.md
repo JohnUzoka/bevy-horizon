@@ -7,7 +7,7 @@ This page covers controllers and sound: how bevy_horizon turns the Switch's butt
 - **Input is one Bevy gamepad.** `HorizonPlugin` spawns it at startup and fills it from the Switch's [HID](glossary.md#hid) service every frame. Read it with Bevy's `Gamepad`, as on any platform.
 - **Buttons map by position, not by letter.** Nintendo A is Bevy's `East` and B is `South`. A game that jumps on `South` gets the bottom button: B on the Switch, A on an Xbox pad.
 - **Give the sticks a dead zone of your own, about 0.1.** `Gamepad::left_stick()` returns the raw value, and released sticks on the tested Switch Lite read about 0.08.
-- **Touch, motion, rumble and keyboards aren't in bevy_horizon.** A game can call [libnx](glossary.md#libnx) for [touch](glossary.md#touch-screen) and [motion](glossary.md#motion-sensor), which work on the console. [Rumble](glossary.md#rumble) is untested, because a Switch Lite has no rumble motors.
+- **Touch, motion, rumble and keyboards aren't in bevy_horizon; the software keyboard is.** `bevy_horizon::keyboard::Keyboard { initial, header, max_chars, password }.show()` brings up the system's keyboard [applet](glossary.md#applet) and returns what the player typed. A game can call [libnx](glossary.md#libnx) for [touch](glossary.md#touch-screen) and [motion](glossary.md#motion-sensor), which work on the console. [Rumble](glossary.md#rumble) is untested, because a Switch Lite has no rumble motors.
 - **Sound works through bevy_audio as usual.** bevy-horizon patches [cpal](glossary.md#cpal) with a host that feeds the Switch's audio renderer, [audren](glossary.md#audren). `scripts/build_game.sh` applies the patch that matches the Bevy version in your `Cargo.lock`.
 - **Look for `[Audio] audren output` in `log.txt`.** If bevy_audio logs `No audio device found.` instead, the patch usually isn't applied.
 - **Set the `BH_AUDIO_*` variables before you add `DefaultPlugins`.** The host reads them when bevy_audio opens its stream. If `BH_AUDIO_STATS=1` shows the sound running dry, raise `BH_AUDIO_FRAMES` to 2048 or 4096.
@@ -213,7 +213,8 @@ In Ryujinx, a full game's sound stopped after about 6 s. On the console it takes
 - **The Bevy 0.19 audio host has passed only in the emulator.** It is the Bevy 0.18 host's code on cpal 0.17.3. The 0.18 host is proven on the console in a full 3D game: no crackle, sound back after HOME and after sleep, and about 19 ms to close at exit.
 - **One player.** The plugin reads player 1 and the handheld controls as one gamepad, and doesn't show the system's controller [applet](glossary.md#applet).
 - **Not tested on hardware:** [docked mode](glossary.md#docked-mode), a Pro Controller and detached Joy-Con. Testing so far is on a Switch Lite, which is handheld only.
-- **No touch screen, motion sensors, rumble, keyboards or software keyboard in bevy_horizon.** libnx's touch and motion calls work on the console, and its rumble calls succeed; captest makes them through FFI (`examples/switch_captest/src/interactive.rs`: `touch`, `motion`, `rumble`).
+- **No touch screen, motion sensors, rumble or hardware keyboards in bevy_horizon.** libnx's touch and motion calls work on the console, and its rumble calls succeed; captest makes them through FFI (`examples/switch_captest/src/interactive.rs`: `touch`, `motion`, `rumble`).
+- **The software keyboard blocks the calling thread** until the player confirms or cancels (`keyboard.rs`), so the game's frames stop while it is up. libnx sets a length limit with an inline function that can't be linked, so `max_chars` cuts the returned text rather than limiting the keyboard. It comes from the Minecraft port's `horizon-nx::keyboard`, which that port's menus call.
 - **SL and SR aren't mapped.**
 - **Output only, one stream at a time.**
 

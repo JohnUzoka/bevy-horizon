@@ -56,6 +56,7 @@ pub mod display;
 #[cfg(feature = "fps_overlay")]
 pub mod fps_overlay;
 pub mod input;
+pub mod keyboard;
 pub mod lifecycle;
 pub mod logging;
 #[cfg(all(target_os = "horizon", feature = "top_down_alloc"))]
