@@ -59,6 +59,7 @@ pub mod input;
 pub mod keyboard;
 pub mod lifecycle;
 pub mod logging;
+pub mod notice;
 #[cfg(all(target_os = "horizon", feature = "top_down_alloc"))]
 mod allocator;
 #[cfg(target_os = "horizon")]
