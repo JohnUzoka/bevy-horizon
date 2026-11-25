@@ -445,6 +445,13 @@ void *dkp_open(void) {
         DkQueueMaker queue_maker;
         dkQueueMakerDefaults(&queue_maker, ctx->device);
         queue_maker.flags = DkQueueFlags_Graphics | DkQueueFlags_Compute;
+        // The queue's own command memory holds fences, compute jobs (a QMD each) and present
+        // commands. deko3d's default, 64 KiB in 16 fenced slices with a kickoff whenever 8 KiB
+        // are in flight, made dkQueueSubmitCommands and dkQueueFlush wait for the GPU inside
+        // dkp_submit once Horizon's frames ran ahead with culling's dispatches (16-30 ms of
+        // queue_commands and 7-9 ms of kick per frame in int2-deko3d's deko3d::timing).
+        queue_maker.commandMemorySize = 1024 * 1024;
+        queue_maker.flushThreshold = 256 * 1024;
         ctx->queue = dkQueueCreate(&queue_maker);
         if (ctx->queue)
             return ctx;
