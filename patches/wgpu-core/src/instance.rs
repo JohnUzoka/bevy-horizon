@@ -202,7 +202,17 @@ impl Instance {
             instance_per_backend: vec![(A::VARIANT, Box::new(hal_instance))],
             requested_backends: A::VARIANT.into(),
             supported_backends: A::VARIANT.into(),
-            flags: wgt::InstanceFlags::default(),
+            flags: {
+                // bevy-horizon: the same rule as `new` for an instance made from a HAL instance,
+                // as wgpu_deko3d's is: without it, release builds validated every indirect draw
+                // with an extra compute pass on deko3d but not on Vulkan.
+                let mut flags = wgt::InstanceFlags::default();
+                #[cfg(target_os = "horizon")]
+                if !flags.contains(wgt::InstanceFlags::VALIDATION) {
+                    flags.remove(wgt::InstanceFlags::VALIDATION_INDIRECT_CALL);
+                }
+                flags
+            },
             display: None, // TODO: Extract display from HAL instance if available?
         }
     }
