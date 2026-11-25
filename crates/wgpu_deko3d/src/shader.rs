@@ -2,7 +2,8 @@
 use std::{
     collections::HashMap,
     ffi::CString,
-    sync::{Arc, Mutex},
+    path::PathBuf,
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use naga::back::glsl;
@@ -62,6 +63,20 @@ pub const EMPTY_FRAGMENT: &str = "#version 450\nvoid main() {}\n";
 /// The binding immediates are rewritten to: a uniform buffer the encoder fills per draw.
 pub const IMMEDIATES: naga::ResourceBinding = naga::ResourceBinding { group: u32::MAX, binding: 0 };
 
+/// `WGPU_DEKO3D_DUMP_GLSL=DIR` writes every program's GLSL to DIR as
+/// `<entry point>.<stage>.<key>.glsl`, the key naming its DKSH in the shader cache, so what naga
+/// emits can be read and compiled again with the host's `uam`.
+static DUMP_GLSL: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    let dir = PathBuf::from(std::env::var_os("WGPU_DEKO3D_DUMP_GLSL")?);
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => Some(dir),
+        Err(e) => {
+            log::warn!("WGPU_DEKO3D_DUMP_GLSL: can't create {}: {e}", dir.display());
+            None
+        }
+    }
+});
+
 pub fn compile(
     cache: &Cache,
     stage: &hal::ProgrammableStage<'_, super::ShaderModule>,
@@ -103,10 +118,16 @@ pub fn compile(
         zero_initialize_workgroup_memory: stage.zero_initialize_workgroup_memory,
     };
     let pipeline = glsl::PipelineOptions { shader_stage: kind, entry_point: stage.entry_point.to_owned(), multiview: None };
+    // Measurements: WGPU_DEKO3D_IMAGE_LOAD=unchecked|restrict sets the texelFetch policy.
+    let image_load = match std::env::var("WGPU_DEKO3D_IMAGE_LOAD").as_deref() {
+        Ok("unchecked") => naga::proc::BoundsCheckPolicy::Unchecked,
+        Ok("restrict") => naga::proc::BoundsCheckPolicy::Restrict,
+        _ => naga::proc::BoundsCheckPolicy::ReadZeroSkipWrite,
+    };
     let bounds = naga::proc::BoundsCheckPolicies {
         index: naga::proc::BoundsCheckPolicy::Restrict,
         buffer: naga::proc::BoundsCheckPolicy::ReadZeroSkipWrite,
-        image_load: naga::proc::BoundsCheckPolicy::ReadZeroSkipWrite,
+        image_load,
         binding_array: naga::proc::BoundsCheckPolicy::Restrict,
     };
     let mut source = String::new();
@@ -154,6 +175,13 @@ fn finish(
         naga::ShaderStage::Fragment => (ffi::UAM_FRAGMENT, "fragment"),
         _ => (ffi::UAM_COMPUTE, "compute"),
     };
+    if let Some(dir) = DUMP_GLSL.as_ref() {
+        let key = super::shader_cache::key(uam_stage, &source);
+        let path = dir.join(format!("{entry_point}.{name}.{key:032x}.glsl"));
+        if let Err(e) = std::fs::write(&path, &source) {
+            log::warn!("writing {}: {e}", path.display());
+        }
+    }
     let dksh = cache.compile(uam_stage, &source).map_err(|e| {
         log::error!("{entry_point} {name}: {e}\n{source}");
         error(format!("{entry_point}: {e}"))

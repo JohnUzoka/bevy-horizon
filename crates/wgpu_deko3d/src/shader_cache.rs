@@ -57,7 +57,7 @@ pub fn get_or_compile(stage: i32, glsl: &str, compile: impl FnOnce() -> Result<A
         ffi::UAM_FRAGMENT => "fragment",
         _ => "compute",
     };
-    let key = fnv128(&[&FORMAT.to_le_bytes()[..], UAM.as_bytes(), &stage.to_le_bytes(), glsl.as_bytes()]);
+    let key = key(stage, glsl);
     let path = DIR.as_ref().map(|dir| dir.join(format!("{key:032x}.dksh")));
     if let Some(path) = &path {
         let start = Instant::now();
@@ -152,6 +152,11 @@ fn store(path: &Path, key: u128, stage: i32, glsl_len: usize, took: Duration, dk
         }
     }
     Ok(())
+}
+
+/// The cache key of `glsl` compiled for `stage`, which names its file.
+pub fn key(stage: i32, glsl: &str) -> u128 {
+    fnv128(&[&FORMAT.to_le_bytes()[..], UAM.as_bytes(), &stage.to_le_bytes(), glsl.as_bytes()])
 }
 
 fn fnv128(parts: &[&[u8]]) -> u128 {
