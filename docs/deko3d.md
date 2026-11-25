@@ -5,7 +5,7 @@ This page is for anyone who wants a Bevy game to draw through [deko3d](https://g
 ## In short
 
 - **Turn on bevy_horizon's `deko3d` feature instead of `vulkan`, and give Bevy's `RenderPlugin` `bevy_horizon::deko3d::render_creation()`.** [hello_switch](glossary.md#hello_switch) does this with its own `deko3d` feature: `FEATURES=deko3d scripts/build_example.sh`.
-- **Build UAM first:** `scripts/build_uam.sh` leaves `deko3d/lib/libuam.a`, deko3d's shader compiler as a library. Shaders are compiled on the console, from the GLSL naga writes for each pipeline, and kept for the run.
+- **Build UAM first:** `scripts/build_uam.sh` leaves `deko3d/lib/libuam.a`, deko3d's shader compiler as a library. Shaders are compiled on the console, from the GLSL naga writes for each pipeline, the first time a game uses them; the [shader cache](#shader-cache) keeps them on the SD card for later launches.
 - **The game's code doesn't change.** `crates/wgpu_deko3d` is a [wgpu](glossary.md#wgpu)-hal backend, so Bevy and the game use wgpu as usual.
 - **What doesn't work yet** is listed under [Limits](#limits): above all, a depth texture that a shader both compares against and reads directly.
 
@@ -15,6 +15,7 @@ This page is for anyone who wants a Bevy game to draw through [deko3d](https://g
 |---|---|
 | `crates/wgpu_deko3d/native/bridge.c` | Thin C over deko3d with plain structs: devices, the queue and fences, memory, images, samplers, pipelines, command recording, swapchains. deko3d's state structs are bitfields, which Rust can't build directly |
 | `crates/wgpu_deko3d/src` | The `wgpu_hal::Api`: bind group slots, texture/sampler pairing, immediates, queries, surface |
+| `crates/wgpu_deko3d/src/shader_cache.rs` | Keeps UAM's output on the SD card, so launches after the first skip compiling ([Shader cache](#shader-cache)) |
 | `patches/uam/console-library.patch` | UAM v1.1.0 as a static library with a C API, and three scheduling fixes (below) |
 | `crates/bevy_horizon/src/deko3d.rs` | Creates the device and queue Bevy's automatic setup would, on deko3d's one adapter |
 | `patches/wgpu-hal` | Two accessors an out-of-tree backend needs: `BufferBinding::buffer` and `InstanceError::new` |
@@ -27,6 +28,28 @@ This page is for anyone who wants a Bevy game to draw through [deko3d](https://g
 **Memory.** Buffers up to 1 MiB are slots in shared 64 KiB+ blocks: wgpu-core makes a staging buffer for each `queue.write_buffer`, and mapping a block per buffer cost about 0.3 ms. Command memory is pooled the same way. CPU-written memory is uncached on both sides, so neither needs cache maintenance.
 
 **UAM fixes.** Upstream UAM read an instruction's scheduling data before setting it, so stall counts depended on heap contents and the console's output differed from the host tool's; ended a block with a stall of 1 after an instruction that sets a barrier, where Mesa uses 2; and dual-issued instructions, which Mesa never does on GM107 and which has been reported to corrupt lighting. With the patch, the console and a host build of the same source produce identical bytes.
+
+## Shader cache
+
+UAM compiles a shader on the console in 5 ms to 3 s; Bevy's PBR fragment shader, 96 KB of GLSL, takes 2.9 s. Bevy without `multi_threaded` creates pipelines on the main thread as it first needs them, so each compile holds up a frame. hello_switch compiles 33 programs (21 of them compute) in its first three frames, 6.1 s of UAM, and without a cache the screen keeps its first frame for 6.4 s.
+
+The backend therefore keeps every program it compiles in `sdmc:/.deko3d/shader_cache/uam-<UAM>-v<format>/`, one file per program, as NVK keeps its own in `sdmc:/.mesa`. Games share it: a program is found by a hash of everything that decides UAM's output, which is the GLSL, the stage, the bytes of the linked `libuam.a` (`<UAM>` in the directory name) and the cache's format. A new UAM build or format starts a new directory and leaves the old one.
+
+- **Writes are atomic:** a file is written under a temporary name and renamed into place.
+- **Reads are checked:** a file is used only if its header, key, length and checksum all match. Otherwise, and on any SD card error, the shader is compiled as if there were no cache, a damaged file is replaced, and `log.txt` says why.
+- **To clear it,** delete `sdmc:/.deko3d/shader_cache` (or one `uam-…` directory in it). Nothing else refers to it.
+- **`log.txt` shows each program** under `deko3d::shader_cache`: compiled (and how long it took) or read (and how much time that saved), with running totals. Programs created while `DefaultPlugins` are being added, before Bevy's log is set up, don't appear (two of hello_switch's), but the totals count them.
+- **Writing costs about 28 ms a program** on the SD card, on the thread that compiled it: 0.9 s of hello_switch's first launch. A writer thread would hide it, but one still running when the game exits keeps its stack locked, and the homebrew loader can't load the next program into a locked heap.
+
+hello_switch on the console, in seconds from the device opening at the start of `main` (loading the NRO comes before that):
+
+| Launch | First frame | First 60 frames | Stall after the first frame | Shaders |
+|---|---|---|---|---|
+| Before the cache | 2.06 | 9.56 | 6.45 | 33 compiled, 6.13 s |
+| First, empty cache | 2.27 | 10.42 | 7.07 | 33 compiled (6.12 s) and stored (0.91 s) |
+| Later, warm cache | 1.30–1.32 | 3.56–3.58 | 1.27 | 33 read in 0.19 s; 5.9 s saved |
+
+Most of what remains of the stall, about 1.1 s, comes before the backend sees a shader: Bevy composing its shaders and wgpu parsing and validating the WGSL (0.4 s for the PBR shader alone). NVK does the same work. The backend's part, writing GLSL and reading programs, is 0.18 s.
 
 ## Limits
 
