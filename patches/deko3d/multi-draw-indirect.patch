@@ -1,0 +1,182 @@
+deko3d draws an indirect draw with one macro call whose parameters the GPU's command fetch reads
+from the indirect buffer: a gpfifo entry of its own, not prefetched, after the entry that calls the
+macro. A wgpu multi-draw of N draws was therefore N calls and 2N gpfifo entries, each a stall in the
+command fetch, and enough of them filled the 0x800-entry ring within a frame. This patch adds
+dkCmdBufMultiDrawIndirect and dkCmdBufMultiDrawIndexedIndirect, which draw `drawCount` tightly
+packed DkDrawIndirectData / DkDrawIndexedIndirectData (16 and 20 bytes) with one call of a looping
+macro (DrawMulti, DrawIndexedMulti in maxwell/draw.mme): two gpfifo entries for the whole
+multi-draw, as NVK's multi-draw does. At most DK_MAX_MULTI_DRAW_COUNT (1024) draws per call, to
+stay within a method header's 13-bit count.
+
+diff --git a/include/deko3d.h b/include/deko3d.h
+index 0f208dd..34ad043 100644
+--- a/include/deko3d.h
++++ b/include/deko3d.h
+@@ -157,6 +157,7 @@ DK_CONSTEXPR void dkDeviceMakerDefaults(DkDeviceMaker* maker)
+ #define DK_NUM_SCISSORS 16
+ #define DK_MAX_VERTEX_ATTRIBS 32
+ #define DK_MAX_VERTEX_BUFFERS 16
++#define DK_MAX_MULTI_DRAW_COUNT 1024 // draws per dkCmdBufMultiDraw(Indexed)Indirect call
+ #define DK_IMAGE_LINEAR_STRIDE_ALIGNMENT 32
+ 
+ enum
+@@ -1307,6 +1308,8 @@ void dkCmdBufDraw(DkCmdBuf obj, DkPrimitive prim, uint32_t vertexCount, uint32_t
+ void dkCmdBufDrawIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect);
+ void dkCmdBufDrawIndexed(DkCmdBuf obj, DkPrimitive prim, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
+ void dkCmdBufDrawIndexedIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect);
++void dkCmdBufMultiDrawIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect, uint32_t drawCount);
++void dkCmdBufMultiDrawIndexedIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect, uint32_t drawCount);
+ void dkCmdBufDispatchCompute(DkCmdBuf obj, uint32_t numGroupsX, uint32_t numGroupsY, uint32_t numGroupsZ);
+ void dkCmdBufDispatchComputeIndirect(DkCmdBuf obj, DkGpuAddr indirect);
+ void dkCmdBufPushConstants(DkCmdBuf obj, DkGpuAddr uboAddr, uint32_t uboSize, uint32_t offset, uint32_t size, const void* data);
+diff --git a/source/maxwell/draw.mme b/source/maxwell/draw.mme
+index 327f307..1ea08ae 100644
+--- a/source/maxwell/draw.mme
++++ b/source/maxwell/draw.mme
+@@ -100,3 +100,106 @@ DrawIndexed::
+ 	0 to mem
+ 	*DrawBaseVertex'0 to addr'mem # just in case reset this
+ 	VertexIdBase'0 to addr'mem    # and this too
++
++# Non-indexed multi-draw, for indirect draws: one macro call reads every draw's parameters
++# Arguments:
++# - 0: Primitive
++# - 1: Draw count (at least 1)
++# - 2..: For each draw, DkDrawIndirectData: vertex count, instance count, first vertex, first
++#        instance (updates gl_BaseInstance)
++# It is assumed that the caller of this macro used SelectDriverConstbuf previously
++DrawMulti::
++	fetch r3 # Fetch draw count
++	r1 to r4 # r4 = primitive, kept across draws
++	1 to r2 # r2 = 1 (needed for later)
++.nextDraw
++	r4 to r1 # This draw starts from the primitive again
++	fetch r6 # Fetch vertex count
++	fetch r7 # Fetch instance count
++	DrawArraysFirst'0 to addr; fetch mem # Fetch first vertex
++	DrawBaseInstance'0 to addr; fetch r5 # Fetch base instance
++	r5 to mem # Update DrawBaseInstance
++	LoadConstbufOffset'1 to addr
++	0x004 to mem
++	bz r7 .drawDone # Skip the draw if its instance count is zero
++	r5 to mem # Update gl_BaseInstance (c[0x0][0x004] in the deko3d driver constbuf)
++
++.drawLoop
++	# Draw current instance
++	VertexBeginGl'0 to addr
++	r1 to mem
++	DrawArraysCount'0 to addr
++	r6 to mem
++	VertexEndGl'0 to addr'mem
++
++	# Decrement instance counter and loop if there are more instances to draw
++	dec r7 to r7
++	bnz r7 .drawLoop
++	ei VertexBeginGlInstanceNext_Shift:r1 0:r2 2 to r1 # i.e. r1 |= 1<<VertexBeginGlInstanceNext_Shift (and clear InstanceCont)
++
++.drawDone
++	# Decrement draw counter and loop if there are more draws
++	dec r3 to r3
++	bnz r3 .nextDraw
++	nop
++
++	# We're done; now reset gl_BaseInstance back to 0
++	LoadConstbufOffset'1 to addr
++	*0x004 to mem
++	0 to mem
++
++# Indexed multi-draw, for indirect draws: one macro call reads every draw's parameters
++# Arguments:
++# - 0: Primitive
++# - 1: Draw count (at least 1)
++# - 2..: For each draw, DkDrawIndexedIndirectData: index count, instance count, first index,
++#        vertex offset (updates gl_BaseVertex), first instance (updates gl_BaseInstance)
++# It is assumed that the caller of this macro used SelectDriverConstbuf previously
++DrawIndexedMulti::
++	fetch r3 # Fetch draw count
++	r1 to r4 # r4 = primitive, kept across draws
++	1 to r2 # r2 = 1 (needed for later)
++.nextDraw
++	r4 to r1 # This draw starts from the primitive again
++	fetch r6 # Fetch index count
++	fetch r7 # Fetch instance count
++	DrawElementsFirst'0 to addr; fetch mem # Fetch first index
++	VertexIdBase'0 to addr; fetch r5 # Fetch vertex offset
++	r5 to mem # Update VertexIdBase
++	LoadConstbufOffset'1 to addr
++	0x000 to mem
++	r5 to mem # Update gl_BaseVertex (c[0x0][0x000] in the deko3d driver constbuf)
++	DrawBaseVertex'1 to addr
++	r5 to mem; fetch r5 # Update DrawBaseVertex, and fetch base instance
++	r5 to mem # Update DrawBaseInstance
++	LoadConstbufOffset'1 to addr
++	0x004 to mem
++	bz r7 .drawDone # Skip the draw if its instance count is zero
++	r5 to mem # Update gl_BaseInstance (c[0x0][0x004] in the deko3d driver constbuf)
++
++.drawLoop
++	# Draw current instance
++	VertexBeginGl'0 to addr
++	r1 to mem
++	DrawElementsCount'0 to addr
++	r6 to mem
++	VertexEndGl'0 to addr'mem
++
++	# Decrement instance counter and loop if there are more instances to draw
++	dec r7 to r7
++	bnz r7 .drawLoop
++	ei VertexBeginGlInstanceNext_Shift:r1 0:r2 2 to r1 # i.e. r1 |= 1<<VertexBeginGlInstanceNext_Shift (and clear InstanceCont)
++
++.drawDone
++	# Decrement draw counter and loop if there are more draws
++	dec r3 to r3
++	bnz r3 .nextDraw
++	nop
++
++	# We're done; now reset gl_BaseVertex and gl_BaseInstance back to 0
++	LoadConstbufOffset'1 to addr
++	0x000 to mem
++	0 to mem
++	0 to mem
++	*DrawBaseVertex'0 to addr'mem # just in case reset this
++	VertexIdBase'0 to addr'mem    # and this too
+diff --git a/source/maxwell/gpu_3d_base.cpp b/source/maxwell/gpu_3d_base.cpp
+index cf519f1..6871ba0 100644
+--- a/source/maxwell/gpu_3d_base.cpp
++++ b/source/maxwell/gpu_3d_base.cpp
+@@ -583,3 +583,35 @@ void dkCmdBufDrawIndexedIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indir
+ 	w.split(CtrlCmdGpfifoEntry::NoPrefetch);
+ 	w.addRaw(indirect, 5, CtrlCmdGpfifoEntry::AutoKick);
+ }
++
++void dkCmdBufMultiDrawIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect, uint32_t drawCount)
++{
++	DK_ENTRYPOINT(obj);
++	DK_DEBUG_BAD_INPUT(indirect == DK_GPU_ADDR_INVALID);
++	DK_DEBUG_DATA_ALIGN(indirect, 4);
++	DK_DEBUG_BAD_INPUT(!drawCount || drawCount > DK_MAX_MULTI_DRAW_COUNT);
++	CmdBufWriter w{obj};
++	w.reserve(4);
++
++	// One macro call takes every draw's parameters, straight from the indirect buffer
++	w << MacroInline(SelectDriverConstbuf, 0); // needed for updating gl_BaseInstance in the driver constbuf
++	w << CmdList<3>{ MakeCmdHeader(IncreaseOnce, 2 + 4*drawCount, Subchannel3D, MmeMacroDrawMulti), prim, drawCount };
++	w.split(CtrlCmdGpfifoEntry::NoPrefetch);
++	w.addRaw(indirect, 4*drawCount, CtrlCmdGpfifoEntry::AutoKick);
++}
++
++void dkCmdBufMultiDrawIndexedIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect, uint32_t drawCount)
++{
++	DK_ENTRYPOINT(obj);
++	DK_DEBUG_BAD_INPUT(indirect == DK_GPU_ADDR_INVALID);
++	DK_DEBUG_DATA_ALIGN(indirect, 4);
++	DK_DEBUG_BAD_INPUT(!drawCount || drawCount > DK_MAX_MULTI_DRAW_COUNT);
++	CmdBufWriter w{obj};
++	w.reserve(4);
++
++	// One macro call takes every draw's parameters, straight from the indirect buffer
++	w << MacroInline(SelectDriverConstbuf, 0); // needed for updating gl_BaseVertex/gl_BaseInstance in the driver constbuf
++	w << CmdList<3>{ MakeCmdHeader(IncreaseOnce, 2 + 5*drawCount, Subchannel3D, MmeMacroDrawIndexedMulti), prim, drawCount };
++	w.split(CtrlCmdGpfifoEntry::NoPrefetch);
++	w.addRaw(indirect, 5*drawCount, CtrlCmdGpfifoEntry::AutoKick);
++}

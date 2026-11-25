@@ -73,6 +73,10 @@ const LIMITS: wgt::Limits = wgt::Limits {
     ..wgt::Limits::defaults()
 };
 
+// Early depth tests: naga writes `layout(early_fragment_tests) in;`, UAM sets the DKSH header's
+// flag and deko3d forces the hardware's early Z for the program. Storage writes from vertex
+// shaders are GLSL `buffer` blocks bound per stage like the fragment stage's. Mappable buffers of
+// any usage: CPU and GPU share the memory, and every block is mapped (create_buffer).
 const FEATURES: wgt::Features = wgt::Features::TEXTURE_COMPRESSION_BC
     .union(wgt::Features::DEPTH_CLIP_CONTROL)
     .union(wgt::Features::TEXTURE_FORMAT_16BIT_NORM)
@@ -82,7 +86,10 @@ const FEATURES: wgt::Features = wgt::Features::TEXTURE_COMPRESSION_BC
     .union(wgt::Features::IMMEDIATES)
     .union(wgt::Features::TIMESTAMP_QUERY)
     .union(wgt::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
-    .union(wgt::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
+    .union(wgt::Features::TIMESTAMP_QUERY_INSIDE_PASSES)
+    .union(wgt::Features::SHADER_EARLY_DEPTH_TEST)
+    .union(wgt::Features::VERTEX_WRITABLE_STORAGE)
+    .union(wgt::Features::MAPPABLE_PRIMARY_BUFFERS);
 
 /// deko3d's DkStageFlag bits for the stages this backend compiles, in `Stage` order.
 const STAGE_FLAGS: [u32; 3] = [dk::DkStageFlag_Vertex, dk::DkStageFlag_Fragment, dk::DkStageFlag_Compute];
@@ -592,8 +599,16 @@ impl hal::Device for Context {
         {
             return Err(unsupported("buffer descriptor"));
         }
-        let mappable = desc.usage.intersects(wgt::BufferUses::MAP_READ | wgt::BufferUses::MAP_WRITE);
-        let handle = Handle::new(unsafe { ffi::dkp_buffer(self.ptr(), desc.size, mappable) })
+        let host = wgt::BufferUses::MAP_READ | wgt::BufferUses::MAP_WRITE;
+        let copies = wgt::BufferUses::COPY_SRC | wgt::BufferUses::COPY_DST;
+        let mappable = desc.usage.intersects(host);
+        // Mapped buffers that only copies touch (staging, readback) bypass the GPU's L2. Mapped
+        // buffers the GPU also draws or computes with (MAPPABLE_PRIMARY_BUFFERS) keep it: the GPU
+        // memory is CPU mapped too, the CPU writes them only between submissions, each of which
+        // starts by invalidating L2 (dkQueueFlush), and the fence wgpu-core waits on before a
+        // MAP_READ mapping flushes L2 (dkp_submit).
+        let uncached = mappable && (desc.usage - host - copies).is_empty();
+        let handle = Handle::new(unsafe { ffi::dkp_buffer(self.ptr(), desc.size, uncached) })
             .ok_or(hal::DeviceError::OutOfMemory)?;
         let address = unsafe { ffi::dkp_buffer_address(handle.ptr()) };
         Ok(Buffer { handle, size: desc.size, address, mappable, mapped: AtomicBool::new(false) })
@@ -613,7 +628,7 @@ impl hal::Device for Context {
         let base = NonNull::new(unsafe { ffi::dkp_buffer_data(buffer.handle.ptr()) }.cast::<u8>())
             .ok_or(hal::DeviceError::Unexpected)?;
         assert!(!buffer.mapped.swap(true, Ordering::Relaxed), "deko3d buffer is already mapped");
-        // Mappable memory is CPU and GPU uncached: this maps the allocation itself, no shadow copy.
+        // Every buffer's memory is CPU mapped and CPU uncached: this maps the allocation itself, no shadow copy.
         Ok(hal::BufferMapping { ptr: unsafe { base.add(range.start as usize) }, is_coherent: true })
     }
 

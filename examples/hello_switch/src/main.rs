@@ -5,6 +5,7 @@ use bevy::input::gamepad::{
 use bevy::prelude::*;
 
 mod checks;
+mod feature_checks;
 
 #[derive(Component)]
 struct RotatingCube {
