@@ -148,7 +148,7 @@ impl Context {
         hal::DeviceError::Lost
     }
 
-    /// Distinct shader programs compiled on the console so far.
+    /// Distinct shader programs loaded so far, compiled on the console or read from the shader cache.
     pub fn compiled_shaders(&self) -> usize {
         self.raw.shaders.len()
     }
@@ -1108,7 +1108,7 @@ pub fn take_stats() -> [(u64, u64); STAT_NAMES.len()] {
     std::array::from_fn(|i| (raw[2 * i], raw[2 * i + 1]))
 }
 
-/// Distinct programs the device has compiled on the console.
+/// Distinct programs the device has loaded, compiled on the console or read from the shader cache.
 pub fn compiled_programs(device: &wgpu::Device) -> usize {
     unsafe { device.as_hal::<Api>() }.map_or(0, |device| device.compiled_shaders())
 }

@@ -1574,13 +1574,51 @@ void dkp_barrier(void *command, uint32_t invalidate) {
 
 // Presentation
 
-void *dkp_swapchain(void *ptr, void *native_window, void *const *textures, uint32_t count) {
+// Clears the images to opaque black. A frame presented before anything draws to it (Bevy's first,
+// while its blit pipeline compiles) otherwise shows whatever the memory last held, such as a frame
+// of the previous app. Best effort: if this fails, the images keep their old contents.
+static void clear_swapchain_images(Context *ctx, const DkImage *const *images, uint32_t count, uint32_t width,
+                                   uint32_t height) {
+    DkMemBlock memory = make_memory(ctx->device, DK_MEMBLOCK_ALIGNMENT, gpu_flags);
+    if (!memory)
+        return;
+    DkCmdBufMaker maker;
+    dkCmdBufMakerDefaults(&maker, ctx->device);
+    DkCmdBuf buffer = dkCmdBufCreate(&maker);
+    if (buffer) {
+        dkCmdBufAddMemory(buffer, memory, 0, DK_MEMBLOCK_ALIGNMENT);
+        const DkViewport viewport = {0, 0, (float)width, (float)height, 0, 1};
+        const DkScissor scissor = {0, 0, width, height};
+        for (uint32_t i = 0; i < count; ++i) {
+            DkImageView view;
+            dkImageViewDefaults(&view, images[i]);
+            dkCmdBufBindRenderTarget(buffer, &view, NULL);
+            dkCmdBufSetViewports(buffer, 0, &viewport, 1);
+            dkCmdBufSetScissors(buffer, 0, &scissor, 1);
+            dkCmdBufClearColorFloat(buffer, 0, DkColorMask_RGBA, 0.0f, 0.0f, 0.0f, 1.0f);
+        }
+        DkCmdList list = dkCmdBufFinishList(buffer);
+        mutexLock(&ctx->queue_lock);
+        if (queue_healthy_locked(ctx)) {
+            dkQueueSubmitCommands(ctx->queue, list);
+            dkQueueWaitIdle(ctx->queue);
+            queue_healthy_locked(ctx); // marks the queue lost if the clear faulted
+        }
+        mutexUnlock(&ctx->queue_lock);
+        dkCmdBufDestroy(buffer);
+    }
+    destroy_memory(memory);
+}
+
+void *dkp_swapchain(void *ptr, void *native_window, void *const *textures, uint32_t count, uint32_t width,
+                    uint32_t height) {
     Context *ctx = ptr;
-    if (!ctx || !native_window || !textures || !count || count > 8)
+    if (!ctx || !native_window || !textures || !count || count > 8 || !width || !height)
         return NULL;
     const DkImage *images[8];
     for (uint32_t i = 0; i < count; ++i)
         images[i] = &((const Texture *)textures[i])->image;
+    clear_swapchain_images(ctx, images, count, width, height);
     Swapchain *swapchain = malloc(sizeof(*swapchain));
     if (!swapchain)
         return NULL;
