@@ -26,6 +26,7 @@ mod conv;
 mod dk;
 mod ffi;
 mod shader;
+mod shader_cache;
 mod surface;
 
 use commands::{CommandBuffer, Encoder};

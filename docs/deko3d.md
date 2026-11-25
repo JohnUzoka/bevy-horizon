@@ -5,7 +5,7 @@ This page is for anyone who wants a Bevy game to draw through [deko3d](https://g
 ## In short
 
 - **Turn on bevy_horizon's `deko3d` feature instead of `vulkan`, and give Bevy's `RenderPlugin` `bevy_horizon::deko3d::render_creation()`.** [hello_switch](glossary.md#hello_switch) does this with its own `deko3d` feature: `FEATURES=deko3d scripts/build_example.sh`.
-- **Build UAM and deko3d first:** `scripts/build_uam.sh` leaves `deko3d/lib/libuam.a`, deko3d's shader compiler as a library, and `deko3d/lib/libdeko3d_bh.a`, deko3d itself with a blend fix (below). Shaders are compiled on the console, from the GLSL naga writes for each pipeline, and kept for the run.
+- **Build UAM and deko3d first:** `scripts/build_uam.sh` leaves `deko3d/lib/libuam.a`, deko3d's shader compiler as a library, and `deko3d/lib/libdeko3d_bh.a`, deko3d itself with a blend fix (below). Shaders are compiled on the console, from the GLSL naga writes for each pipeline, the first time a game uses them; the [shader cache](#shader-cache) keeps them on the SD card for later launches.
 - **The game's code doesn't change.** `crates/wgpu_deko3d` is a [wgpu](glossary.md#wgpu)-hal backend, so Bevy and the game use wgpu as usual.
 - **What doesn't work yet** is listed under [Limits](#limits): above all, a depth texture that a shader both compares against and reads directly.
 
@@ -15,6 +15,7 @@ This page is for anyone who wants a Bevy game to draw through [deko3d](https://g
 |---|---|
 | `crates/wgpu_deko3d/native/bridge.c` | Thin C over deko3d with plain structs: devices, the queue and fences, memory, images, samplers, pipelines, command recording, swapchains. deko3d's state structs are bitfields, which Rust can't build directly |
 | `crates/wgpu_deko3d/src` | The `wgpu_hal::Api`: bind group slots, texture/sampler pairing, immediates, queries, surface |
+| `crates/wgpu_deko3d/src/shader_cache.rs` | Keeps UAM's output on the SD card, so launches after the first skip compiling ([Shader cache](#shader-cache)) |
 | `patches/uam/console-library.patch` | UAM v1.1.0 as a static library with a C API, and three scheduling fixes (below) |
 | `patches/deko3d` | deko3d v0.5.0, the source of devkitPro's package, with its alpha blend factor fixed (below) |
 | `crates/bevy_horizon/src/deko3d.rs` | Creates the device and queue Bevy's automatic setup would, on deko3d's one adapter |
@@ -38,6 +39,28 @@ This page is for anyone who wants a Bevy game to draw through [deko3d](https://g
 One backend source serves two wgpu releases. `crates/wgpu_deko3d/Cargo.toml`, which bevy-horizon builds, is on wgpu 29 (Bevy 0.19). `Cargo.wgpu-30.toml` is the same package on wgpu, wgpu-hal, naga and wgpu-types 30.0.1 with the `wgpu-30` feature on; that feature selects the few places where wgpu-hal 30 differs (renamed dispatches, ray-tracing pipelines this backend reports unsupported, a shared submit fence, `Queue::wait_for_idle`, per-format surface color spaces, gaps in a pipeline's vertex buffers). Cargo never reads that manifest here; enabling `wgpu-30` with the wgpu 29 manifest doesn't build.
 
 A game on wgpu 30 vendors the crate: `scripts/vendor_deko3d.sh <game checkout>` replaces `<game>/third_party/wgpu_deko3d` with `src/`, `native/`, `build.rs` and the wgpu 30 manifest as its `Cargo.toml`, plus a README naming the commit it came from. Change the backend here and run the script again rather than editing the copy. The game patches crates.io's wgpu-hal 30 with the same two accessors as `patches/wgpu-hal`, and builds with `BEVY_HORIZON_UAM_LIB` pointing at this repository's `deko3d/lib`.
+
+## Shader cache
+
+UAM compiles a shader on the console in 5 ms to 3 s; Bevy's PBR fragment shader, 96 KB of GLSL, takes 2.9 s. Bevy without `multi_threaded` creates pipelines on the main thread as it first needs them, so each compile holds up a frame. hello_switch compiles 33 programs (21 of them compute) in its first three frames, 6.1 s of UAM, and without a cache the screen keeps its first frame for 6.4 s.
+
+The backend therefore keeps every program it compiles in `sdmc:/.deko3d/shader_cache/uam-<UAM>-v<format>/`, one file per program, as NVK keeps its own in `sdmc:/.mesa`. Games share it: a program is found by a hash of everything that decides UAM's output, which is the GLSL, the stage, the bytes of the linked `libuam.a` (`<UAM>` in the directory name) and the cache's format. A new UAM build or format starts a new directory and leaves the old one.
+
+- **Writes are atomic:** a file is written under a temporary name and renamed into place.
+- **Reads are checked:** a file is used only if its header, key, length and checksum all match. Otherwise, and on any SD card error, the shader is compiled as if there were no cache, a damaged file is replaced, and `log.txt` says why.
+- **To clear it,** delete `sdmc:/.deko3d/shader_cache` (or one `uam-…` directory in it). Nothing else refers to it.
+- **`log.txt` shows each program** under `deko3d::shader_cache`: compiled (and how long it took) or read (and how much time that saved), with running totals. Programs created while `DefaultPlugins` are being added, before Bevy's log is set up, don't appear (two of hello_switch's), but the totals count them.
+- **Writing costs about 28 ms a program** on the SD card, on the thread that compiled it: 0.9 s of hello_switch's first launch. A writer thread would hide it, but one still running when the game exits keeps its stack locked, and the homebrew loader can't load the next program into a locked heap.
+
+hello_switch on the console, in seconds from the device opening at the start of `main` (loading the NRO comes before that):
+
+| Launch | First frame | First 60 frames | Stall after the first frame | Shaders |
+|---|---|---|---|---|
+| Before the cache | 2.06 | 9.56 | 6.45 | 33 compiled, 6.13 s |
+| First, empty cache | 2.27 | 10.42 | 7.07 | 33 compiled (6.12 s) and stored (0.91 s) |
+| Later, warm cache | 1.30–1.32 | 3.56–3.58 | 1.27 | 33 read in 0.19 s; 5.9 s saved |
+
+Most of what remains of the stall, about 1.1 s, comes before the backend sees a shader: Bevy composing its shaders and wgpu parsing and validating the WGSL (0.4 s for the PBR shader alone). NVK does the same work. The backend's part, writing GLSL and reading programs, is 0.18 s.
 
 ## Limits
 

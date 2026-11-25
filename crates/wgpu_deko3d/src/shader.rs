@@ -25,7 +25,8 @@ pub struct Stage {
     pub textures: Vec<CombinedTexture>,
 }
 
-/// Compiled DKSH by stage and GLSL text. Pipelines that share a shader (most of Bevy's) compile it once.
+/// Compiled DKSH by stage and GLSL text. Pipelines that share a shader (most of Bevy's) compile it
+/// once, and a later launch reads it from the SD card (shader_cache).
 #[derive(Debug, Default)]
 pub struct Cache(Mutex<HashMap<(i32, String), Arc<[u8]>>>);
 
@@ -35,14 +36,17 @@ impl Cache {
         if let Some(dksh) = self.0.lock().unwrap().get(&key) {
             return Ok(dksh.clone());
         }
-        let source = CString::new(glsl).map_err(|_| "GLSL contains a NUL byte".to_string())?;
-        let mut size = 0;
-        let raw = unsafe { ffi::dkp_uam_compile(stage, source.as_ptr(), &mut size) };
-        if raw.is_null() {
-            return Err("UAM rejected the GLSL (its messages go to stderr)".into());
-        }
-        let dksh: Arc<[u8]> = Arc::from(unsafe { std::slice::from_raw_parts(raw, size) });
-        unsafe { ffi::dkp_uam_free(raw.cast()) };
+        let dksh = super::shader_cache::get_or_compile(stage, glsl, || {
+            let source = CString::new(glsl).map_err(|_| "GLSL contains a NUL byte".to_string())?;
+            let mut size = 0;
+            let raw = unsafe { ffi::dkp_uam_compile(stage, source.as_ptr(), &mut size) };
+            if raw.is_null() {
+                return Err("UAM rejected the GLSL (its messages go to stderr)".into());
+            }
+            let dksh: Arc<[u8]> = Arc::from(unsafe { std::slice::from_raw_parts(raw, size) });
+            unsafe { ffi::dkp_uam_free(raw.cast()) };
+            Ok(dksh)
+        })?;
         self.0.lock().unwrap().insert(key, dksh.clone());
         Ok(dksh)
     }
