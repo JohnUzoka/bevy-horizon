@@ -137,9 +137,9 @@ On deko3d all four pass on the console ([Features beyond WebGPU's](deko3d.md#how
 
 ## render_check
 
-`examples/render_check` checks Bevy's 3D path on the Vulkan stack: six cameras, each with one render setting changed, draw the same four cubes, and it checks every cube on a screenshot. Build it with `scripts/build_example.sh render_check` and copy it to `sdmc:/switch/render_check/render_check.nro`, where it also reads `options.txt` and saves its screenshots.
+`examples/render_check` checks Bevy's 3D path: six cameras, each with one render setting changed, draw the same four cubes, and it checks every cube on a screenshot. Build it with `scripts/build_example.sh render_check` for the Vulkan stack, or `FEATURES=deko3d scripts/build_example.sh render_check "Render Check (deko3d)"` for [deko3d](deko3d.md), and copy it to `sdmc:/switch/render_check/render_check.nro`, where it also reads `options.txt` and saves its screenshots.
 
-At frame 240 it logs one `[Check]` line per camera and a total such as `[Check] screenshot 1: 24/24 cubes drawn, mesh preprocessing on the GPU`, and saves `render_check_1.png`. (A) checks again; (+) exits. On a Switch Lite all 24 cubes draw; stock Ryujinx can't run it. Its options and results are in [rendering](rendering.md#render_check).
+At frame 240 it logs one `[Check]` line per camera and a total such as `[Check] screenshot 1: 24/24 cubes drawn, mesh preprocessing on the GPU`, and saves `render_check_1.png`. (A) checks again; (+) exits. On a Switch Lite all 24 cubes draw, on both renderers; stock Ryujinx can't run it. Its options and results are in [rendering](rendering.md#render_check).
 
 ## Testing in an emulator
 
