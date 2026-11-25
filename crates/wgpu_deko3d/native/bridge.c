@@ -15,6 +15,17 @@ enum {
     // Descriptor heaps, bound once per command list. Sampler ids are 12 bits in a texture handle.
     image_descriptor_count = 4096,
     sampler_descriptor_count = 1024,
+    // libnx's GPU channel holds GPFIFO_QUEUE_SIZE (0x800) gpfifo entries, and the GPU's ring the
+    // same. deko3d appends a command list's entries to the channel at submission and kicks them
+    // off only when the channel is nearly full or the queue is flushed, so one submission of a
+    // list with thousands of entries (every DkBarrier_Full ends two: a write_texture per layer of
+    // a texture array) failed in Queue::appendGpfifoEntries. Recordings are cut into segments of
+    // about segment_entries entries, and dkp_submit kicks off at most gpfifo_batch_entries at a
+    // time, keeping at most two batches on the ring. Entries are estimated from the commands that
+    // end one in deko3d (maxwell/gpu_base.cpp, gpu_3d_base.cpp, gpu_compute.cpp, dk_cmdbuf.cpp),
+    // generously, so the true count stays far below the ring's size.
+    segment_entries = 128,
+    gpfifo_batch_entries = 384,
 };
 
 // Retired command-memory chunks kept for reuse. 0 restores per-encoder create/destroy.
@@ -218,10 +229,18 @@ typedef struct {
 typedef struct {
     Context *ctx;
     DkCmdBuf buffer;
-    DkCmdList list;
+    // The recording is cut into deko3d command lists (segments) of about segment_entries gpfifo
+    // entries each, so dkp_submit can kick them off in batches (see gpfifo_batch_entries).
+    DkCmdList *lists;
+    uint32_t *list_entries; // each segment's estimated gpfifo entries
+    uint32_t list_count, list_capacity;
+    uint32_t entries; // estimated gpfifo entries in the open segment
     CommandChunk *chunk;
     uint32_t remaining_words;
     bool failed, in_pass, started, finished;
+    // A Full barrier waiting for the next command, with what it invalidates.
+    bool barrier_pending;
+    uint32_t barrier_invalidate;
     Pipeline *pipeline;
     uint32_t stencil_ref;
     uint32_t discard_mask;
@@ -832,16 +851,43 @@ static bool reserve(Command *cmd, uint32_t words) {
         cmd->chunk = chunk;
         dkCmdBufAddMemory(cmd->buffer, chunk->memory, 0, command_chunk_size);
         cmd->remaining_words = command_chunk_size / sizeof(uint32_t) - 64;
+        cmd->entries += 1; // ends the entry the last chunk was filling
     }
     cmd->remaining_words -= words;
     return true;
 }
 
+// Ends the open segment: what was recorded since becomes one deko3d command list.
+static bool end_segment(Command *cmd) {
+    if (cmd->list_count == cmd->list_capacity) {
+        uint32_t capacity = cmd->list_capacity ? cmd->list_capacity * 2 : 4;
+        DkCmdList *lists = realloc(cmd->lists, capacity * sizeof(*lists));
+        if (lists)
+            cmd->lists = lists;
+        uint32_t *entries = lists ? realloc(cmd->list_entries, capacity * sizeof(*entries)) : NULL;
+        if (!require(cmd, entries != NULL))
+            return false;
+        cmd->list_entries = entries;
+        cmd->list_capacity = capacity;
+    }
+    DkCmdList list = dkCmdBufFinishList(cmd->buffer);
+    if (list) {
+        cmd->lists[cmd->list_count] = list;
+        cmd->list_entries[cmd->list_count] = cmd->entries + 1; // and the entry FinishList ends
+        ++cmd->list_count;
+    }
+    cmd->entries = 0;
+    return true;
+}
+
 // Every recording entry point starts here. The first command in a list binds the descriptor
 // heaps and invalidates the descriptor cache: descriptors may have been rewritten since the
-// last list ran (only for slots no submitted work still uses).
+// last list ran (only for slots no submitted work still uses). The GPU runs a recording's
+// segments back to back, so its state carries across them.
 static bool begin(Command *cmd, uint32_t words) {
     if (!require(cmd, true))
+        return false;
+    if (cmd->entries >= segment_entries && !end_segment(cmd))
         return false;
     if (!cmd->started) {
         if (!reserve(cmd, 32))
@@ -854,6 +900,14 @@ static bool begin(Command *cmd, uint32_t words) {
         // Also drop constant-cache lines: arena and buffer slots are reused across lists.
         dkCmdBufBarrier(cmd->buffer, DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_Shader);
         cmd->started = true;
+    }
+    if (cmd->barrier_pending) {
+        if (!reserve(cmd, 16))
+            return false;
+        dkCmdBufBarrier(cmd->buffer, DkBarrier_Full, cmd->barrier_invalidate);
+        cmd->entries += 2; // a Full barrier ends two entries (maxwell/gpu_base.cpp)
+        cmd->barrier_pending = false;
+        cmd->barrier_invalidate = 0;
     }
     return reserve(cmd, words);
 }
@@ -908,6 +962,8 @@ void dkp_cmd_free(void *ptr) {
             free(chunk);
         }
     }
+    free(cmd->lists);
+    free(cmd->list_entries);
     free(cmd);
     stat_end(stat_cmd_free, started);
 }
@@ -915,14 +971,12 @@ void dkp_cmd_free(void *ptr) {
 static bool finish(Command *cmd) {
     if (cmd->failed || cmd->in_pass)
         return false;
-    if (!cmd->finished && cmd->started) {
-        if (!reserve(cmd, 16))
+    if (!cmd->finished && (cmd->started || cmd->barrier_pending)) {
+        // Complete copy-engine operations before the graphics queue's fence: begin records the
+        // Full barrier, merged with one the recording ended on.
+        cmd->barrier_pending = true;
+        if (!begin(cmd, 0) || !end_segment(cmd))
             return false;
-        // Complete copy-engine operations before the graphics queue's fence.
-        dkCmdBufBarrier(cmd->buffer, DkBarrier_Full, 0);
-        cmd->list = dkCmdBufFinishList(cmd->buffer);
-        if (!cmd->list)
-            return require(cmd, false);
     }
     cmd->finished = true;
     return true;
@@ -1069,6 +1123,26 @@ done:
     return result;
 }
 
+// Kicks off what the queue holds and, so the GPU's gpfifo ring never holds more than two batches,
+// waits for the batch before it. fences[i] is signaled when signaled[i].
+static bool end_batch_locked(Context *ctx, DkFence fences[2], bool signaled[2], int *batch) {
+    const int current = *batch, previous = current ^ 1;
+    dkQueueSignalFence(ctx->queue, &fences[current], false);
+    if (!queue_healthy_locked(ctx))
+        return false;
+    dkQueueFlush(ctx->queue);
+    if (!queue_healthy_locked(ctx))
+        return false;
+    signaled[current] = true;
+    if (signaled[previous]) {
+        if (dkFenceWait(&fences[previous], -1) != DkResult_Success || !queue_healthy_locked(ctx))
+            return false;
+        signaled[previous] = false;
+    }
+    *batch = previous;
+    return true;
+}
+
 bool dkp_submit(void *ptr, const void *const *commands, size_t count, void *fence_ptr, uint64_t value) {
     Context *ctx = ptr;
     Fence *fence = fence_ptr;
@@ -1094,12 +1168,25 @@ bool dkp_submit(void *ptr, const void *const *commands, size_t count, void *fenc
         goto done;
     pending->next = NULL;
     pending->value = value;
+    // Segments go to the queue in batches of at most gpfifo_batch_entries gpfifo entries.
+    DkFence batch_fences[2];
+    bool batch_signaled[2] = {false, false};
+    int batch = 0;
+    uint32_t batched = 0;
     for (size_t i = 0; i < count; ++i) {
-        Command *cmd = (Command *)commands[i];
-        if (cmd->list) {
-            dkQueueSubmitCommands(ctx->queue, cmd->list);
+        const Command *cmd = commands[i];
+        for (uint32_t j = 0; j < cmd->list_count; ++j) {
+            // The queue adds an entry or two of its own per list.
+            const uint32_t entries = cmd->list_entries[j] + 2;
+            if (batched && batched + entries > gpfifo_batch_entries) {
+                if (!end_batch_locked(ctx, batch_fences, batch_signaled, &batch))
+                    goto done;
+                batched = 0;
+            }
+            dkQueueSubmitCommands(ctx->queue, cmd->lists[j]);
             if (!queue_healthy_locked(ctx))
                 goto done;
+            batched += entries;
         }
     }
     if (fence->tail)
@@ -1363,6 +1450,7 @@ void dkp_draw_indirect(void *command, bool indexed, uint64_t address, uint32_t c
             dkCmdBufDrawIndexedIndirect(cmd->buffer, cmd->pipeline->primitive, address);
         else
             dkCmdBufDrawIndirect(cmd->buffer, cmd->pipeline->primitive, address);
+        cmd->entries += 2; // the draw, then its parameters (maxwell/gpu_3d_base.cpp)
     }
 }
 
@@ -1380,6 +1468,7 @@ void dkp_dispatch(void *command, uint32_t x, uint32_t y, uint32_t z) {
     if (!require(cmd, !cmd->in_pass) || !x || !y || !z || !begin(cmd, 64))
         return;
     dkCmdBufDispatchCompute(cmd->buffer, x, y, z);
+    cmd->entries += 2; // a control command here, and the queue's own commands for the job
 }
 
 void dkp_dispatch_indirect(void *command, uint64_t address) {
@@ -1387,6 +1476,7 @@ void dkp_dispatch_indirect(void *command, uint64_t address) {
     if (!require(cmd, !cmd->in_pass) || !begin(cmd, 64))
         return;
     dkCmdBufDispatchComputeIndirect(cmd->buffer, address);
+    cmd->entries += 8; // as dkp_dispatch, and each of the three parameters (maxwell/gpu_compute.cpp)
 }
 
 // Queries: counter reports are 16 bytes, {u64 value, u64 timestamp}, 16-byte aligned.
@@ -1471,12 +1561,15 @@ void dkp_copy_image(void *command, void *src_ptr, const DkpRegion *src_region, v
     dkCmdBufCopyImage(cmd->buffer, &src_view, &src_rect, &dst_view, &dst_rect, 0);
 }
 
-// invalidate: DkInvalidateFlags bits for what the next commands read.
+// invalidate: DkInvalidateFlags bits for what the next commands read. The barrier is recorded
+// before the next command, so back-to-back barriers (wgpu-core transitions buffers, then
+// textures) cost one.
 void dkp_barrier(void *command, uint32_t invalidate) {
     Command *cmd = command;
-    if (!begin(cmd, 16))
+    if (!require(cmd, true))
         return;
-    dkCmdBufBarrier(cmd->buffer, DkBarrier_Full, invalidate);
+    cmd->barrier_pending = true;
+    cmd->barrier_invalidate |= invalidate;
 }
 
 // Presentation

@@ -12,6 +12,9 @@
 //!   compares it with the copy compiled in. That proves bevy_horizon mounted the NRO's RomFS.
 //!   It also keeps Ryujinx alive: there libnx asks for the process's data storage, and Ryujinx
 //!   throws instead of failing the call when the NRO has no RomFS.
+//! - upload: at frame 90 of the render world, 6000 `queue.write_texture` calls go to the GPU in
+//!   one submission, then the texture is read back and compared. Each write has its own staging
+//!   copy and barriers, as when a game uploads a large texture array layer by layer.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -22,6 +25,13 @@ use bevy::asset::io::file::FileAssetReader;
 use bevy::asset::{AssetLoader, LoadContext, LoadState};
 use bevy::prelude::*;
 use bevy::reflect::TypePath;
+use bevy::render::render_resource::{
+    BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Extent3d, MapMode, Origin3d, PollType, TexelCopyBufferInfo,
+    TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor, TextureDimension, TextureFormat,
+    TextureUsages,
+};
+use bevy::render::renderer::{RenderDevice, RenderQueue};
+use bevy::render::{Render, RenderApp};
 
 pub struct ChecksPlugin;
 
@@ -31,6 +41,9 @@ impl Plugin for ChecksPlugin {
             .init_asset_loader::<CheckTextLoader>()
             .add_systems(Startup, (start_asset_check, romfs_check))
             .add_systems(Update, (finish_asset_check, thread_check));
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.add_systems(Render, upload_check);
+        }
     }
 }
 
@@ -274,5 +287,94 @@ fn romfs_check() {
         }
         Ok(text) => println!("[Check] romfs: FAIL, {ROMFS_FILE} reads {text:?}, not {expected:?}"),
         Err(err) => println!("[Check] romfs: FAIL, can't read {ROMFS_FILE}: {err}"),
+    }
+}
+
+const UPLOAD_CHECK_FRAME: u32 = 90;
+const UPLOAD_WRITES: u32 = 6000;
+const UPLOAD_LAYERS: u32 = 64;
+const UPLOAD_SIZE: u32 = 16;
+
+/// The texel bytes write `index` puts in its layer.
+fn upload_texel(index: u32, layer: u32) -> [u8; 4] {
+    [index as u8, (index >> 8) as u8, layer as u8, 0xa5]
+}
+
+/// Thousands of `queue.write_texture` calls land in one submission (wgpu records them all in its
+/// pending-writes command buffer), each with its own staging copy and barriers. A game's texture
+/// atlas upload does the same. Then reads every layer back and checks it holds its last write.
+fn upload_check(mut frame: Local<u32>, device: Res<RenderDevice>, queue: Res<RenderQueue>) {
+    let this_frame = *frame;
+    *frame += 1;
+    if this_frame != UPLOAD_CHECK_FRAME {
+        return;
+    }
+    let device = device.wgpu_device();
+    let size = Extent3d { width: UPLOAD_SIZE, height: UPLOAD_SIZE, depth_or_array_layers: UPLOAD_LAYERS };
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("upload check"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8Unorm,
+        usage: TextureUsages::COPY_DST | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let started = Instant::now();
+    let layer_bytes = (UPLOAD_SIZE * UPLOAD_SIZE * 4) as usize;
+    for index in 0..UPLOAD_WRITES {
+        let layer = index % UPLOAD_LAYERS;
+        let data = upload_texel(index, layer).repeat(layer_bytes / 4);
+        queue.write_texture(
+            TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: Origin3d { x: 0, y: 0, z: layer }, aspect: TextureAspect::All },
+            &data,
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(UPLOAD_SIZE * 4), rows_per_image: Some(UPLOAD_SIZE) },
+            Extent3d { width: UPLOAD_SIZE, height: UPLOAD_SIZE, depth_or_array_layers: 1 },
+        );
+    }
+    // Rows of a texture-to-buffer copy are 256-byte aligned.
+    let row = 256u32;
+    let readback = device.create_buffer(&BufferDescriptor {
+        label: Some("upload check readback"),
+        size: u64::from(row * UPLOAD_SIZE * UPLOAD_LAYERS),
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("upload check") });
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(UPLOAD_SIZE) },
+        },
+        size,
+    );
+    // The pending writes go to the GPU in this submission, ahead of the copy.
+    queue.submit([encoder.finish()]);
+    readback.slice(..).map_async(MapMode::Read, |_| {});
+    if let Err(err) = device.poll(PollType::wait_indefinitely()) {
+        println!("[Check] upload: FAIL in frame {this_frame}, waiting for the GPU failed: {err}");
+        return;
+    }
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    let bytes = readback.slice(..).get_mapped_range();
+    let mut wrong = 0;
+    for layer in 0..UPLOAD_LAYERS {
+        let last = layer + UPLOAD_LAYERS * ((UPLOAD_WRITES - 1 - layer) / UPLOAD_LAYERS);
+        let expected = upload_texel(last, layer);
+        for y in 0..UPLOAD_SIZE {
+            let start = ((layer * UPLOAD_SIZE + y) * row) as usize;
+            if bytes[start..start + (UPLOAD_SIZE * 4) as usize].chunks(4).any(|texel| texel != expected) {
+                wrong += 1;
+            }
+        }
+    }
+    if wrong == 0 {
+        println!(
+            "[Check] upload: PASS in frame {this_frame}, {UPLOAD_WRITES} write_texture calls into {UPLOAD_LAYERS} layers went in one submission and read back right ({ms:.1} ms)"
+        );
+    } else {
+        println!("[Check] upload: FAIL in frame {this_frame}, {wrong} of {} rows read back wrong ({ms:.1} ms)", UPLOAD_SIZE * UPLOAD_LAYERS);
     }
 }
