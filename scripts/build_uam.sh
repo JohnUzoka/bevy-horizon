@@ -121,8 +121,10 @@ EOF
     fi
     ninja -C build
     # Meson makes a thin archive for an uninstalled library; the linker needs the objects themselves.
+    # D (deterministic: no timestamps) keeps the archive byte-identical across rebuilds of the same
+    # source, so the shader cache, keyed by a hash of libuam.a, survives a rebuild that changes nothing.
     rm -f lib/libuam.a
-    aarch64-none-elf-gcc-ar crs lib/libuam.a build/libuam.a.p/*.o
+    aarch64-none-elf-gcc-ar crsD lib/libuam.a build/libuam.a.p/*.o
 '
 
 echo "==> Building deko3d for the console..."
