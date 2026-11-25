@@ -7,7 +7,7 @@ This page is for anyone who wants a Bevy game to draw through [deko3d](https://g
 - **Turn on bevy_horizon's `deko3d` feature instead of `vulkan`, and give Bevy's `RenderPlugin` `bevy_horizon::deko3d::render_creation()`.** [hello_switch](glossary.md#hello_switch) does this with its own `deko3d` feature: `FEATURES=deko3d scripts/build_example.sh`.
 - **Build UAM and deko3d first:** `scripts/build_uam.sh` leaves `deko3d/lib/libuam.a`, deko3d's shader compiler as a library, and `deko3d/lib/libdeko3d_bh.a`, deko3d itself with a blend fix (below). Shaders are compiled on the console, from the GLSL naga writes for each pipeline, the first time a game uses them; the [shader cache](#shader-cache) keeps them on the SD card for later launches.
 - **The game's code doesn't change.** `crates/wgpu_deko3d` is a [wgpu](glossary.md#wgpu)-hal backend, so Bevy and the game use wgpu as usual.
-- **It saves most where the driver costs CPU time.** In Horizon's GPU-bound benchmark deko3d runs at 25.7 fps against NVK's 24.4, with better lows; CPU-bound ports have run about twice as fast ([Performance in a game](#performance-in-a-game)). A wgpu 30 game vendors the backend ([Using it from a wgpu 30 game](#using-it-from-a-wgpu-30-game)).
+- **It saves most where the driver costs CPU time.** In Horizon's GPU-bound benchmark deko3d's render thread needs as little CPU as NVK's, but its terrain pass takes about 18 ms more GPU per heavy frame for the same draws, so NVK runs the flight at 36.9 fps against deko3d's 25.7 ([Performance in a game](#performance-in-a-game)). CPU-bound ports have run about twice as fast. A wgpu 30 game vendors the backend ([Using it from a wgpu 30 game](#using-it-from-a-wgpu-30-game)).
 - **What doesn't work yet** is listed under [Limits](#limits): above all, a depth texture that a shader both compares against and reads directly.
 
 ## How it fits together
@@ -91,13 +91,15 @@ Most of what remains of the stall, about 1.1 s, comes before the backend sees a 
 
 Horizon's forest benchmark (`--benchmark forest`: seed 1234, render distance 12, 1280×720, a fixed 12 s flight, a fixed player name so the same skins load) on a Switch Lite at stock handheld clocks, measured with `hx-bench.py` (outside this repo). "Before" is the backend before the changes listed under the table.
 
-| | NVK (3 runs) | deko3d before (2 runs) | deko3d now (2 runs) |
-|---|---|---|---|
-| Average fps | 24.4 | 21.2 | 25.7 |
-| 1% low fps | 14.3 | 11.6 | 16.1 |
-| Frame time, p50 / p99 (ms) | 35.8 / 69.5 | 49.6 / 83.2 | 34.7 / 60.0 |
-| Render thread CPU, p50 (ms) | 7.1 | 31.1 | 6.6 |
-| GPU, p50 (ms) | 34.2 | 32.4 | 33.8 |
+| | NVK, packed terrain vertices (3 runs) | NVK, wide terrain vertices (1 run) | Build 40, NVK (1 run) | deko3d before (2 runs) | deko3d now (2 runs) |
+|---|---|---|---|---|---|
+| Average fps | 24.4 | 36.9 | 42.2 | 21.2 | 25.7 |
+| 1% low fps | 14.3 | 23.3 | 24.4 | 11.6 | 16.1 |
+| Frame time, p50 / p99 (ms) | 35.8 / 69.5 | 24.2 / 42.7 | 20.1 / 40.2 | 49.6 / 83.2 | 34.7 / 60.0 |
+| Render thread CPU, p50 (ms) | 7.1 | 6.3 | 5.2 | 31.1 | 6.6 |
+| GPU, p50 (ms) | 34.2 | 23.0 | 16.4 | 32.4 | 33.8 |
+
+Horizon packs its terrain vertices by default on the `deko3d` branch (`HORIZON_PACKED_QUADS=0` turns it off). Packed vertices cost NVK about 11 ms of median GPU and make no difference on deko3d (25.6 fps with wide ones), so the fair comparison is NVK with wide vertices. Against it, deko3d is slower: solid terrain, 93% of the heavy frame on both backends, takes about 56 ms on deko3d against about 38 ms on NVK for the same 650–775 draws. Build 40, with a simpler terrain shader, takes 24–27 ms. Finding where deko3d's terrain time goes is open (ZCULL and depth compression, UAM's code for the terrain shaders, vertex fetch).
 
 What moved the numbers, each described under [How it fits together](#how-it-fits-together):
 

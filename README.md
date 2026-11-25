@@ -14,7 +14,7 @@ bevy-horizon is young. All of its testing on hardware has been on one Switch Lit
 |---|---|
 | Bevy versions | 0.19 (the default) and 0.18. |
 | Rendering | Bevy draws through wgpu's Vulkan backend and NVK. hello_switch runs at 60 fps, Breakout plays to the end at about 59 fps, and render_check draws all 24 of its cubes. |
-| Rendering on deko3d | The `deko3d` feature draws through deko3d instead of NVK ([deko3d.md](docs/deko3d.md)). hello_switch's console checks pass on it, and in Horizon, a wgpu 30 game that vendors the backend, a benchmark flight runs at 25.7 fps against NVK's 24.4 ([Performance in a game](docs/deko3d.md#performance-in-a-game)). |
+| Rendering on deko3d | The `deko3d` feature draws through deko3d instead of NVK ([deko3d.md](docs/deko3d.md)). hello_switch's and render_check's console checks pass on it. In Horizon, a wgpu 30 game that vendors the backend, a benchmark flight runs at 25.7 fps: about the same as NVK with Horizon's default packed terrain vertices (24.4), slower than NVK with wide ones (36.9), because deko3d's terrain pass costs more GPU time ([Performance in a game](docs/deko3d.md#performance-in-a-game)). |
 | A full game | [Skate 3 Rust Engine](https://github.com/JohnUzoka/skate-3-rust-engine/tree/horizon-port), a Bevy 0.18 game, plays at about 30 fps with sound. It takes 40–70 s to start. |
 | Input | The console's controllers arrive as Bevy gamepads. |
 | Audio | `bevy_audio` plays through cpal, patched to use libnx's audio renderer. With Bevy 0.18 this is tested on the console; the Bevy 0.19 version has only run in an emulator. |
