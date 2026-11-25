@@ -193,10 +193,15 @@ unsafe extern "C" {
 
     pub fn dkp_copy_buffer(cmd: *mut c_void, from: u64, to: u64, size: u64);
     pub fn dkp_clear_buffer(cmd: *mut c_void, to: u64, size: u64);
+    /// Zeroes memory from the 3D engine's command stream (`size` a multiple of 4).
+    pub fn dkp_zero(cmd: *mut c_void, to: u64, size: u32);
     pub fn dkp_copy_buffer_image(cmd: *mut c_void, to_image: bool, address: u64, row_bytes: u32, layer_bytes: u32,
                                  texture: *mut c_void, region: *const Region);
     pub fn dkp_copy_image(cmd: *mut c_void, src: *mut c_void, src_region: *const Region, dst: *mut c_void, dst_region: *const Region);
-    pub fn dkp_barrier(cmd: *mut c_void, invalidate: u32);
+    /// mode: a DkBarrier; invalidate: DkInvalidateFlags.
+    pub fn dkp_barrier(cmd: *mut c_void, mode: u32, invalidate: u32);
+    /// Takes the recording counters (bridge.c's count_* order) and resets them; returns how many there are.
+    pub fn dkp_counters(out: *mut u64, capacity: u32) -> u32;
 
     /// Clears the images to opaque black, then makes a swapchain of them.
     pub fn dkp_swapchain(ctx: *mut c_void, native_window: *mut c_void, textures: *const *mut c_void, count: u32, width: u32, height: u32) -> *mut c_void;
