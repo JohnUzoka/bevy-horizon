@@ -5,7 +5,7 @@ This page takes you from an empty folder to bevy-horizon's `hello_switch` exampl
 ## In short
 
 - **You need** an x86_64 Linux PC (or WSL2 on Windows) with Docker or Podman, about 20 GB of free disk, and a Switch running Atmosphère with a homebrew menu such as [sphaira](glossary.md#sphaira).
-- **Build in this order:** the toolchain image, then NVK (the Vulkan driver), then the example. You build the image and NVK once.
+- **Build in this order:** the toolchain image, then NVK (the Vulkan driver), then the example. You build the image and NVK once. To draw through [deko3d](deko3d.md) instead, build deko3d and its shader compiler with `scripts/build_uam.sh` in place of NVK ([deko3d instead of NVK](#deko3d-instead-of-nvk)).
 - **The build leaves** `hello_switch.nro` in the repository's root. Copy it to `sdmc:/switch/hello_switch/hello_switch.nro`.
 - **Start it with a game's memory:** hold R while you start any game, or use a sphaira [forwarder](glossary.md#forwarder) on the HOME menu. Don't start it from the Album.
 - **Read `log.txt`** in the same folder. After you press (+) to exit, a good run ends with `[Exit] PASS`.
@@ -110,6 +110,19 @@ bevy_horizon's `vulkan` feature links .../nvk/lib/libvulkan_bh.a, which is missi
 `BEVY_HORIZON_NVK_LIB` is read at build time, but it only takes effect when you run Cargo yourself: `build_example.sh` and `build_game.sh` don't pass it into their containers, so with the scripts the library must be in `nvk/lib/`. [toolchain.md](toolchain.md#linking-nvk-the-vulkan-feature) has the details of the build and the link.
 
 `switch_captest` doesn't use the `vulkan` feature, so it builds without NVK. A game that draws but leaves the feature out panics when Bevy creates its renderer, with `Unable to find a GPU! Make sure you have installed required drivers!`.
+
+### deko3d instead of NVK
+
+bevy_horizon's `deko3d` feature draws through [deko3d](glossary.md#deko3d), the Switch's own GPU API, instead of Vulkan and NVK ([deko3d.md](deko3d.md)). It links two libraries that one script builds:
+
+```sh
+scripts/build_uam.sh
+FEATURES=deko3d scripts/build_example.sh hello_switch "Hello Switch (deko3d)"
+```
+
+- **`scripts/build_uam.sh`** clones [UAM](glossary.md#uam) v1.1.0, deko3d v0.5.0 and fincs's dekotools into `deko3d/src/`, applies `patches/uam/` and `patches/deko3d/`, and builds them in an image of its own, `bevy-horizon-uam:local`, made from the toolchain image (which it builds if it's missing). It writes `deko3d/lib/libuam.a`, the shader compiler as a library, `deko3d/lib/libdeko3d_bh.a` and `libdeko3dd_bh.a`, deko3d's release and debug builds, and `deko3d/BUILD_INFO`, which records the tags and patches. `deko3d/` isn't in git; run the script again when those patches change.
+- **NVK isn't needed** for a `deko3d` build. Without the libraries, the build stops with ``wgpu_deko3d links …/deko3d/lib/libuam.a, which is missing: run scripts/build_uam.sh, or set BEVY_HORIZON_UAM_LIB to the directory that has it``. As with `BEVY_HORIZON_NVK_LIB`, the build scripts don't pass `BEVY_HORIZON_UAM_LIB` into their containers.
+- **`FEATURES=deko3d`** builds hello_switch with its `deko3d` feature instead of its default `vulkan`. Its log then names deko3d as the adapter (`bevy_horizon: rendering through …`), and the [GPU checks](testing.md#hello_switchs-gpu-checks) run on it.
 
 ## 4. Build hello_switch
 

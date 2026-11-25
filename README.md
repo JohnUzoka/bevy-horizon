@@ -2,7 +2,7 @@
 
 Run [Bevy](https://bevyengine.org) games on a Nintendo Switch as homebrew.
 
-bevy-horizon has two parts. `bevy_horizon` is a Bevy plugin that takes the place of winit and gilrs on the Switch: it runs the frame loop, opens the window, reads the controllers, handles HOME, sleep and exit, and writes a log to the SD card. The crate patches in `patches/` add Horizon, the Switch's operating system (`target_os = "horizon"`), to the crates a Bevy game pulls in, so the game builds for it and draws through Vulkan with NVK, Mesa's open-source driver for NVIDIA GPUs, as ported to the Switch by [mesa-switch](https://github.com/danfromtico/mesa-switch).
+bevy-horizon has two parts. `bevy_horizon` is a Bevy plugin that takes the place of winit and gilrs on the Switch: it runs the frame loop, opens the window, reads the controllers, handles HOME, sleep and exit, and writes a log to the SD card. The crate patches in `patches/` add Horizon, the Switch's operating system (`target_os = "horizon"`), to the crates a Bevy game pulls in, so the game builds for it and draws through Vulkan with NVK, Mesa's open-source driver for NVIDIA GPUs, as ported to the Switch by [mesa-switch](https://github.com/danfromtico/mesa-switch). Instead of Vulkan, a game can draw through [deko3d](docs/deko3d.md), the Switch's own homebrew GPU API, with `crates/wgpu_deko3d`, a wgpu backend on it.
 
 The NROs it builds are homebrew. They run on a Switch with Atmosphère custom firmware, not on an unmodified console.
 
@@ -14,6 +14,7 @@ bevy-horizon is young. All of its testing on hardware has been on one Switch Lit
 |---|---|
 | Bevy versions | 0.19 (the default) and 0.18. |
 | Rendering | Bevy draws through wgpu's Vulkan backend and NVK. hello_switch runs at 60 fps, Breakout plays to the end at about 59 fps, and render_check draws all 24 of its cubes. |
+| Rendering on deko3d | The `deko3d` feature draws through deko3d instead of NVK ([deko3d.md](docs/deko3d.md)). hello_switch's console checks pass on it, and in Horizon, a wgpu 30 game that vendors the backend, a benchmark flight runs at 25.7 fps against NVK's 24.4 ([Performance in a game](docs/deko3d.md#performance-in-a-game)). |
 | A full game | [Skate 3 Rust Engine](https://github.com/JohnUzoka/skate-3-rust-engine/tree/horizon-port), a Bevy 0.18 game, plays at about 30 fps with sound. It takes 40–70 s to start. |
 | Input | The console's controllers arrive as Bevy gamepads. |
 | Audio | `bevy_audio` plays through cpal, patched to use libnx's audio renderer. With Bevy 0.18 this is tested on the console; the Bevy 0.19 version has only run in an emulator. |
@@ -94,6 +95,17 @@ scripts/build_game.sh ../my-game my-game my-game "My Game"
 
 The arguments are the game's folder, the package with its binary, the binary, and the title the HOME menu shows. The script applies the patches for the game's Bevy version, so the game needs no `[patch]` table, and it writes the NRO to the game's `target/aarch64-nintendo-horizon/release/`. It also moves each patched crate in the game's `Cargo.lock` to the patch's version. [Porting a Bevy game](docs/porting-a-bevy-game.md) covers the rest: which Bevy features to use, memory, files, and the settings that tune a port.
 
+To draw through deko3d instead of NVK, turn on bevy_horizon's `deko3d` feature in place of `vulkan`, build deko3d and its shader compiler once with `scripts/build_uam.sh`, and hand Bevy's `RenderPlugin` the device bevy_horizon makes (Bevy 0.19):
+
+```rust
+app.add_plugins(DefaultPlugins.set(bevy::render::RenderPlugin {
+    render_creation: bevy_horizon::deko3d::render_creation(),
+    ..default()
+}));
+```
+
+[deko3d](docs/deko3d.md) says when that is worth it and what it doesn't support yet.
+
 ## Examples
 
 | Example | What it is | On a Switch Lite |
@@ -111,7 +123,7 @@ In reading order:
 
 1. [Getting started](docs/building.md): set up the build, build NVK and the examples, and run them on a Switch.
 2. [Porting a Bevy game](docs/porting-a-bevy-game.md): Cargo features, `build_game.sh`, environment variables, and a real port as an example.
-3. [Rendering](docs/rendering.md): the Vulkan path, its settings, and the FPS overlay.
+3. [Rendering](docs/rendering.md): the Vulkan path, its settings, and the FPS overlay. [deko3d](docs/deko3d.md): the alternative renderer on the Switch's own GPU API, its design, performance and limits.
 4. [Input and audio](docs/input-and-audio.md): controllers and the audio host.
 5. [Lifecycle and exit](docs/lifecycle-and-exit.md): HOME, sleep, focus and quitting.
 6. [Logging and crash reports](docs/logging-and-crash-reports.md): `log.txt`, its heartbeat lines, and reading a crash report.

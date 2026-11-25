@@ -7,7 +7,7 @@ This page explains the Switch, homebrew, build, Bevy and graphics terms used acr
 - **Terms are grouped by topic:** the Switch, loading and running a homebrew program, building, Bevy, graphics, and this project. Each entry says what a term is, why it matters to `bevy_horizon`, and which page covers it.
 - **New to the Switch?** Start with [Horizon](#horizon), [Atmosphère](#atmosphère), [NRO](#nro), [sdmc](#sdmc) and [Heap](#heap).
 - **Reading a crash?** See [Crash report](#crash-report), [hbloader](#hbloader), [Result code](#result-code) and [Heap check](#heap-check).
-- **Working on rendering?** See [wgpu](#wgpu), [Vulkan](#vulkan), [NVK](#nvk), [NAK](#nak) and [mesa-switch](#mesa-switch). Don't confuse mesa-switch with [switch-mesa](#switch-mesa), an older Mesa that only captest's OpenGL ES checks use.
+- **Working on rendering?** See [wgpu](#wgpu), [Vulkan](#vulkan), [NVK](#nvk), [NAK](#nak) and [mesa-switch](#mesa-switch), or for the alternative renderer [deko3d](#deko3d) and [UAM](#uam). Don't confuse mesa-switch with [switch-mesa](#switch-mesa), an older Mesa that only captest's OpenGL ES checks use.
 
 ## The Switch
 
@@ -385,19 +385,19 @@ SDL2 is a C library for cross-platform audio, input and windows, and devkitPro s
 
 ### wgpu
 
-wgpu is the Rust graphics library Bevy renders through; it maps one API onto Vulkan, Metal, DirectX 12 or OpenGL. On Horizon its only backend is [Vulkan](#vulkan), driven by [NVK](#nvk), which the `vulkan` feature links into the NRO. bevy-horizon patches wgpu, wgpu-core and wgpu-hal so that they build and run on Horizon ([rendering.md](rendering.md)).
+wgpu is the Rust graphics library Bevy renders through; it maps one API onto Vulkan, Metal, DirectX 12 or OpenGL. On Horizon it draws through [Vulkan](#vulkan), driven by [NVK](#nvk), which the `vulkan` feature links into the NRO, or with the `deko3d` feature through `wgpu_deko3d`, a wgpu-hal backend on [deko3d](#deko3d) that lives in this repository. bevy-horizon patches wgpu, wgpu-core and wgpu-hal so that they build and run on Horizon ([rendering.md](rendering.md), [deko3d.md](deko3d.md)).
 
 ### naga
 
-naga is wgpu's shader translator: it turns Bevy's WGSL shaders into SPIR-V for Vulkan, which [NAK](#nak) then compiles for the GPU. Its index clamping is how the default [buffer robustness](#buffer-robustness) mode, `clamp`, keeps shaders' buffer accesses in range ([buffer robustness](rendering.md#buffer-robustness)).
+naga is wgpu's shader translator. For Vulkan it turns Bevy's WGSL shaders into SPIR-V, which [NAK](#nak) then compiles for the GPU; for [deko3d](#deko3d) it writes [GLSL](#glsl), which [UAM](#uam) compiles, and bevy-horizon patches its GLSL writer for depth reads ([deko3d.md](deko3d.md#how-it-fits-together)). Its index clamping is how the default [buffer robustness](#buffer-robustness) mode, `clamp`, keeps shaders' buffer accesses in range ([buffer robustness](rendering.md#buffer-robustness)).
 
 ### Vulkan
 
-Vulkan is a low-level, cross-platform graphics API from Khronos. Bevy on the Switch draws through it: wgpu's Vulkan backend calls [NVK](#nvk), which the `vulkan` feature links into the NRO, so there's no driver to install ([linking NVK](toolchain.md#linking-nvk-the-vulkan-feature)).
+Vulkan is a low-level, cross-platform graphics API from Khronos. Bevy on the Switch draws through it by default: wgpu's Vulkan backend calls [NVK](#nvk), which the `vulkan` feature links into the NRO, so there's no driver to install ([linking NVK](toolchain.md#linking-nvk-the-vulkan-feature)). [deko3d](#deko3d) is the alternative.
 
 ### NVK
 
-NVK is [Mesa](#mesa)'s open-source Vulkan driver for NVIDIA GPUs. `scripts/build_nvk.sh` builds it for the Switch's GM20B from [mesa-switch](#mesa-switch), as a static `nvk/lib/libvulkan.a` that the `vulkan` feature links into the NRO. Every frame your game draws goes through it, and it takes GPU memory from the top of the [heap](#heap) ([linking NVK](toolchain.md#linking-nvk-the-vulkan-feature), [NVK takes GPU memory from the top of the heap](platform-notes.md#nvk-takes-gpu-memory-from-the-top-of-the-heap)).
+NVK is [Mesa](#mesa)'s open-source Vulkan driver for NVIDIA GPUs. `scripts/build_nvk.sh` builds it for the Switch's GM20B from [mesa-switch](#mesa-switch), as a static `nvk/lib/libvulkan.a` that the `vulkan` feature links into the NRO. Every frame a `vulkan` build draws goes through it, and it takes GPU memory from the top of the [heap](#heap) ([linking NVK](toolchain.md#linking-nvk-the-vulkan-feature), [NVK takes GPU memory from the top of the heap](platform-notes.md#nvk-takes-gpu-memory-from-the-top-of-the-heap)).
 
 ### NAK
 
@@ -405,19 +405,19 @@ NAK is NVK's shader compiler, written in Rust. It compiles the SPIR-V that [naga
 
 ### Shader cache
 
-The shader cache is where NVK keeps compiled shaders between launches, under `sdmc:/.mesa/mesa_shader_cache_sf/`, in a folder per driver build that every app with that build shares. The first launch compiles each shader it meets and later launches load them, so judge start-up time and hitches from a second launch; `MESA_SHADER_CACHE_DISABLE=true` turns the cache off ([rendering.md](rendering.md)).
+The shader cache is where NVK keeps compiled shaders between launches, under `sdmc:/.mesa/mesa_shader_cache_sf/`, in a folder per driver build that every app with that build shares. The first launch compiles each shader it meets and later launches load them, so judge start-up time and hitches from a second launch; `MESA_SHADER_CACHE_DISABLE=true` turns the cache off ([rendering.md](rendering.md)). The [deko3d](#deko3d) backend keeps [UAM](#uam)'s output in a cache of its own, under `sdmc:/.deko3d/shader_cache/` ([deko3d.md](deko3d.md#shader-cache)).
 
 ### OpenGL ES
 
-OpenGL ES is the embedded-systems version of OpenGL. Bevy on the Switch doesn't use it; it draws through [Vulkan](#vulkan). Only captest's GPU checks use OpenGL ES, through [switch-mesa](#switch-mesa) and [EGL](#egl), as a test of the GPU that doesn't involve wgpu or NVK ([testing.md](testing.md)).
+OpenGL ES is the embedded-systems version of OpenGL. Bevy on the Switch doesn't use it; it draws through [Vulkan](#vulkan) or [deko3d](#deko3d). Only captest's GPU checks use OpenGL ES, through [switch-mesa](#switch-mesa) and [EGL](#egl), as a test of the GPU that doesn't involve wgpu or NVK ([testing.md](testing.md)).
 
 ### EGL
 
-EGL is the API that creates an [OpenGL ES](#opengl-es) context and connects it to a native window. captest's GPU checks use switch-mesa's EGL on the default [NWindow](#nwindow); the Vulkan path doesn't use EGL ([testing.md](testing.md)).
+EGL is the API that creates an [OpenGL ES](#opengl-es) context and connects it to a native window. captest's GPU checks use switch-mesa's EGL on the default [NWindow](#nwindow); neither the Vulkan path nor deko3d uses EGL ([testing.md](testing.md)).
 
 ### GLSL
 
-GLSL is OpenGL's shading language. captest's GPU checks compile small GLSL ES shaders through switch-mesa; Bevy's own shaders are WGSL, which [naga](#naga) translates for Vulkan ([testing.md](testing.md)).
+GLSL is OpenGL's shading language. captest's GPU checks compile small GLSL ES shaders through switch-mesa. Bevy's own shaders are WGSL, which [naga](#naga) translates: to SPIR-V for Vulkan, and to GLSL 4.50 for [deko3d](#deko3d), which [UAM](#uam) compiles on the console ([testing.md](testing.md), [deko3d.md](deko3d.md#how-it-fits-together)).
 
 ### Mesa
 
@@ -437,15 +437,23 @@ NVN is Nintendo's own graphics API, which official Switch games use. [Ryujinx](#
 
 ### deko3d
 
-deko3d is a low-level homebrew graphics API made for the Switch's GPU. wgpu has no deko3d backend, so `bevy_horizon` draws through [Vulkan](#vulkan) and [NVK](#nvk) instead ([rendering.md](rendering.md)).
+deko3d is fincs's low-level homebrew graphics API for the Switch's GPU, part of devkitPro. bevy-horizon's `wgpu_deko3d` is a wgpu-hal backend on it, and bevy_horizon's `deko3d` feature, with `bevy_horizon::deko3d::render_creation()`, draws a Bevy game through it instead of [Vulkan](#vulkan) and [NVK](#nvk). It needs no NVK build; its shaders are compiled on the console by [UAM](#uam). bevy-horizon builds a patched deko3d 0.5.0 with `scripts/build_uam.sh` ([deko3d.md](deko3d.md)).
+
+### UAM
+
+UAM is deko3d's shader compiler (fincs; built on Mesa's GLSL frontend and nouveau's code generator). It turns GLSL into [DKSH](#dksh). devkitPro ships it as a PC tool; `scripts/build_uam.sh` builds it as `deko3d/lib/libuam.a`, with scheduling fixes, so the [deko3d](#deko3d) backend compiles the GLSL naga writes on the console, the first time a game uses each shader ([deko3d.md](deko3d.md#how-it-fits-together)).
+
+### DKSH
+
+DKSH is deko3d's shader binary: a compiled program with the header deko3d reads (its stage, resources, and flags such as a forced early depth test). [UAM](#uam) writes it, and the deko3d backend keeps it in its [shader cache](deko3d.md#shader-cache) on the SD card.
 
 ### khronos-egl
 
-khronos-egl is a Rust crate that binds the EGL API, used by wgpu's OpenGL backend. Bevy on the Switch draws through Vulkan, so neither the crate nor that backend is used ([rendering.md](rendering.md)).
+khronos-egl is a Rust crate that binds the EGL API, used by wgpu's OpenGL backend. Bevy on the Switch draws through Vulkan or deko3d, so neither the crate nor that backend is used ([rendering.md](rendering.md)).
 
 ### glow
 
-glow is the Rust OpenGL bindings crate that wgpu's OpenGL backend uses. Bevy on the Switch draws through Vulkan, so glow isn't used ([rendering.md](rendering.md)).
+glow is the Rust OpenGL bindings crate that wgpu's OpenGL backend uses. Bevy on the Switch draws through Vulkan or deko3d, so glow isn't used ([rendering.md](rendering.md)).
 
 ### FBO
 
