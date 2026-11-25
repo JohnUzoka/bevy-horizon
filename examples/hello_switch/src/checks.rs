@@ -15,6 +15,8 @@
 //! - upload: at frame 90 of the render world, 6000 `queue.write_texture` calls go to the GPU in
 //!   one submission, then the texture is read back and compared. Each write has its own staging
 //!   copy and barriers, as when a game uploads a large texture array layer by layer.
+//! - features: early depth tests, vertex shader storage writes and mappable primary buffers
+//!   (feature_checks.rs).
 
 use std::cell::Cell;
 use std::path::Path;
@@ -42,7 +44,7 @@ impl Plugin for ChecksPlugin {
             .add_systems(Startup, (start_asset_check, romfs_check))
             .add_systems(Update, (finish_asset_check, thread_check));
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            render_app.add_systems(Render, upload_check);
+            render_app.add_systems(Render, (upload_check, crate::feature_checks::features_check));
         }
     }
 }
