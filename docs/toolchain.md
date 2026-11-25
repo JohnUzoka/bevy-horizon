@@ -7,8 +7,8 @@ This page is the reference for everything between `cargo build` and an [NRO](glo
 - **Target:** `aarch64-nintendo-horizon.json` is a custom [target specification](glossary.md#target-specification) for Switch [homebrew](glossary.md#homebrew). It links with `rust-lld` and aborts on a [panic](glossary.md#panic).
 - **Nightly only.** The toolchain image pins `nightly-2026-10-04`, and every build compiles std from source with [build-std](glossary.md#build-std).
 - **C libraries:** `bevy_horizon`'s build script links [libnx](glossary.md#libnx), [newlib](glossary.md#newlib) and libgcc from [devkitA64](glossary.md#devkita64), so your game needs no build script for them.
-- **GPU driver:** the `vulkan` feature links [NVK](glossary.md#nvk) into the NRO. Build it once, in this order: the toolchain image, `scripts/build_nvk.sh`, `scripts/localize_nvk.sh`.
-- **[Crate patches](glossary.md#crate-patch):** 17 for Bevy 0.19 and 13 for Bevy 0.18, libc included. `scripts/build_game.sh` passes them to Cargo, so your game's `Cargo.toml` needs no `[patch]`.
+- **GPU driver:** the `vulkan` feature links [NVK](glossary.md#nvk) into the NRO. Build it once, in this order: the toolchain image, `scripts/build_nvk.sh`, `scripts/localize_nvk.sh`. The `deko3d` feature links deko3d and [UAM](glossary.md#uam) instead, from `scripts/build_uam.sh` ([deko3d.md](deko3d.md)).
+- **[Crate patches](glossary.md#crate-patch):** 18 for Bevy 0.19 and 13 for Bevy 0.18, libc included. `scripts/build_game.sh` passes them to Cargo, so your game's `Cargo.toml` needs no `[patch]`.
 - **A patch is used only if `Cargo.lock` locks its exact version.** Otherwise Cargo only warns, so both build scripts check and stop.
 - **Build in release mode,** as both build scripts do.
 - **After any change to `patches/libc`,** run `scripts/check_libc_abi.sh`.
@@ -165,6 +165,7 @@ Stock crates assume a desktop, mobile or web OS. Horizon is close enough to Unix
 | `libc` | 0.2.190 | devkitA64 newlib's types, struct layouts and constants for AArch64 Horizon, sockets included. std uses it too. |
 | `lua-src` | 551.0.2 | Builds [Lua](glossary.md#lua) as plain ISO C, for games that embed it through `mlua`: no `dlopen`, and `io.popen` reports "not supported". |
 | `memmap2` | 0.9.11 | Holds maps in the heap, since Horizon has no `mmap` ([below](#what-the-larger-patches-change)). |
+| [`naga`](glossary.md#naga) | 29.0.4 | Its GLSL writer, for the [deko3d](deko3d.md) backend: depth textures no shader compares against become plain samplers, and level-0 cube-array shadow lookups use core `texture` ([Depth reads](deko3d.md#how-it-fits-together)). Vulkan builds use naga's SPIR-V writer, which the patch doesn't change. |
 | `polling` | 3.10.0 | Uses its plain-pipe fallback, since rustix has no `pipe_with` on Horizon. |
 | `raw-window-handle` | 0.6.2 | Adds `HorizonWindowHandle`, which holds the [NWindow](glossary.md#nwindow) pointer that `bevy_horizon` fills in, and an empty `HorizonDisplayHandle`. |
 | `ring` | 0.17.14 | Builds ring's AArch64 assembly for Horizon with the `linux64` [perlasm](glossary.md#perlasm) flavour. |
@@ -172,7 +173,7 @@ Stock crates assume a desktop, mobile or web OS. Horizon is close enough to Unix
 | `wgpu` | 29.0.4 | Builds the Vulkan backend for Horizon; a DRM surface target returns an error. |
 | `wgpu-core` | 29.0.4 | Adds Horizon to the Vulkan platforms, keeps [indirect-call validation](rendering.md#indirect-call-validation) only with `VALIDATION`, and logs which call [lost the device](glossary.md#device-lost). |
 | `wgpu-core-deps-windows-linux-android` | 29.0.4 | Adds Horizon to the targets that pull in wgpu-hal's Vulkan backend. |
-| `wgpu-hal` | 29.0.4 | Calls the linked driver directly, makes the Switch's surface, and sizes memory blocks and buffer checks for the Switch ([below](#what-the-larger-patches-change)). |
+| `wgpu-hal` | 29.0.4 | Calls the linked driver directly, makes the Switch's surface, and sizes memory blocks and buffer checks for the Switch ([below](#what-the-larger-patches-change)). Adds the two accessors the out-of-tree deko3d backend needs, `BufferBinding::buffer` and `InstanceError::new`. |
 
 ### The Bevy 0.18 set
 

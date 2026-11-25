@@ -23,6 +23,10 @@ getrandom02 = { path = "patches/getrandom-0.2", package = "getrandom" }
 inventory = { path = "patches/inventory" }
 lua-src = { path = "patches/lua-src" }
 memmap2 = { path = "patches/memmap2" }
+# For bevy_horizon's `deko3d` feature: naga's GLSL writer reads uncompared depth through plain
+# samplers and samples level 0 of cube-array shadows with core `texture` (docs/deko3d.md, "Depth
+# reads"). A Vulkan game builds naga too; the patch changes only its GLSL output.
+naga = { path = "patches/naga" }
 polling = { path = "patches/polling" }
 raw-window-handle = { path = "patches/raw-window-handle" }
 ring = { path = "patches/ring" }
