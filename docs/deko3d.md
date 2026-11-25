@@ -5,7 +5,7 @@ This page is for anyone who wants a Bevy game to draw through [deko3d](https://g
 ## In short
 
 - **Turn on bevy_horizon's `deko3d` feature instead of `vulkan`, and give Bevy's `RenderPlugin` `bevy_horizon::deko3d::render_creation()`.** [hello_switch](glossary.md#hello_switch) does this with its own `deko3d` feature: `FEATURES=deko3d scripts/build_example.sh`.
-- **Build UAM first:** `scripts/build_uam.sh` leaves `deko3d/lib/libuam.a`, deko3d's shader compiler as a library. Shaders are compiled on the console, from the GLSL naga writes for each pipeline, and kept for the run.
+- **Build UAM and deko3d first:** `scripts/build_uam.sh` leaves `deko3d/lib/libuam.a`, deko3d's shader compiler as a library, and `deko3d/lib/libdeko3d_bh.a`, deko3d itself with a blend fix (below). Shaders are compiled on the console, from the GLSL naga writes for each pipeline, and kept for the run.
 - **The game's code doesn't change.** `crates/wgpu_deko3d` is a [wgpu](glossary.md#wgpu)-hal backend, so Bevy and the game use wgpu as usual.
 - **What doesn't work yet** is listed under [Limits](#limits): above all, a depth texture that a shader both compares against and reads directly.
 
@@ -16,6 +16,7 @@ This page is for anyone who wants a Bevy game to draw through [deko3d](https://g
 | `crates/wgpu_deko3d/native/bridge.c` | Thin C over deko3d with plain structs: devices, the queue and fences, memory, images, samplers, pipelines, command recording, swapchains. deko3d's state structs are bitfields, which Rust can't build directly |
 | `crates/wgpu_deko3d/src` | The `wgpu_hal::Api`: bind group slots, texture/sampler pairing, immediates, queries, surface |
 | `patches/uam/console-library.patch` | UAM v1.1.0 as a static library with a C API, and three scheduling fixes (below) |
+| `patches/deko3d` | deko3d v0.5.0, the source of devkitPro's package, with its alpha blend factor fixed (below) |
 | `crates/bevy_horizon/src/deko3d.rs` | Creates the device and queue Bevy's automatic setup would, on deko3d's one adapter |
 | `patches/wgpu-hal` | Two accessors an out-of-tree backend needs: `BufferBinding::buffer` and `InstanceError::new` |
 | `patches/naga` | naga 29.0.4's GLSL writer, changed for the depth reads below |
@@ -28,16 +29,19 @@ This page is for anyone who wants a Bevy game to draw through [deko3d](https://g
 
 **UAM fixes.** Upstream UAM read an instruction's scheduling data before setting it, so stall counts depended on heap contents and the console's output differed from the host tool's; ended a block with a stall of 1 after an instruction that sets a barrier, where Mesa uses 2; and dual-issued instructions, which Mesa never does on GM107 and which has been reported to corrupt lighting. With the patch, the console and a host build of the same source produce identical bytes.
 
+**deko3d fix.** devkitPro's deko3d 0.5.0 writes a blend state's alpha destination factor from its color one ([devkitPro/deko3d#27](https://github.com/devkitPro/deko3d/issues/27), open and unfixed on master), so a blend whose two differ, such as color blended over while alpha keeps the destination's, came out wrong. `scripts/build_uam.sh` builds v0.5.0 with the one-line fix, and its debug library, under `_bh` names so the link can't pick devkitPro's copies in `libnx/lib`.
+
 ## Limits
 
 - **A depth texture one shader both compares against and reads directly fails pipeline creation,** as does reading depth in a module that passes a depth texture to a function: GLSL would need two sampler types for one binding. None of hello_switch's pipelines do either.
 - **UAM emulates non-constant integer division in floating point** and warns about it in `log.txt` (`program uses non-constant integer division/modulo`): one of hello_switch's shaders divides integers this way, and results lose precision past 2^24.
 - **One texture with two samplers in one shader fails pipeline creation:** GLSL combines them at the texture's binding.
 - **Not supported:** atomic storage textures, binding arrays, pipeline-statistics queries, multiview, conservative rasterization, rendering into a 3D texture's slice, gaps in a pass's color attachments, dual-source blending, `multi_draw_indirect_count`.
-- **deko3d's blend state writes the alpha destination factor from the color one,** so blend modes whose two differ come out wrong. Alpha and premultiplied blending are unaffected.
 
 ## Testing
 
 `~/wgpu-deko-proof` (outside this repo) runs the same wgpu program on deko3d and NVK and compares their output: a lit, textured scene, and twelve feature tests (compute, storage textures, MSAA, immediates, queries, cube/array/3D textures, depth comparison, stencil, copies, indirect draws). Every one matched NVK byte for byte on the console.
+
+**The blend fix** was checked with a small deko3d program (outside this repo) that blends with differing color and alpha destination factors over a known clear and reads the target back: devkitPro's library gave alpha 0 where the destination's 0.5 should survive and 0.75 where 0.25 was expected; the patched one gives 127 and 64 of 255, as expected, with the same color results.
 
 **When the GPU faults,** the bridge appends deko3d's report to `sdmc:/switch/deko3d.log`: the engine class and the method it rejected. `BEVY_HORIZON_DEKO3D_DEBUG=1` at build time links deko3d's debug library, which also reports API misuse there.

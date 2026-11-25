@@ -1,0 +1,18 @@
+deko3d v0.5.0 (devkitPro's deko3d 0.5.0-1) writes FuncAlphaDst from dstColorBlendFactor, so a
+blend state whose alpha destination factor differs from its color one blends alpha with the
+color factor. Reported upstream: https://github.com/devkitPro/deko3d/issues/27 (open; master
+373bfd4 still has it).
+
+diff --git a/source/maxwell/gpu_3d_state.cpp b/source/maxwell/gpu_3d_state.cpp
+index 0a689d1..e6c864d 100644
+--- a/source/maxwell/gpu_3d_state.cpp
++++ b/source/maxwell/gpu_3d_state.cpp
+@@ -127,7 +127,7 @@ void dkCmdBufBindBlendStates(DkCmdBuf obj, uint32_t firstId, DkBlendState const
+ 			getBlendFactorSetting(state.dstColorBlendFactor), // FuncRgbDst
+ 			state.alphaBlendOp,                               // EquationAlpha
+ 			getBlendFactorSetting(state.srcAlphaBlendFactor), // FuncAlphaSrc
+-			getBlendFactorSetting(state.dstColorBlendFactor)  // FuncAlphaDst
++			getBlendFactorSetting(state.dstAlphaBlendFactor)  // FuncAlphaDst
+ 		);
+ 	}
+ }

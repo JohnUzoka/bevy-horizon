@@ -2,13 +2,17 @@
 set -euo pipefail
 
 # Usage: scripts/build_uam.sh
-#   Builds UAM, devkitPro's deko3d shader compiler (https://github.com/devkitPro/uam, fincs; zlib,
-#   with Mesa's MIT GLSL frontend and nouveau codegen), as a static library for the console, so the
-#   deko3d backend (crates/wgpu_deko3d) can compile the GLSL that naga writes from a game's WGSL:
-#     deko3d/lib/libuam.a     UAM's compiler plus dkp_uam_compile/dkp_uam_free (patches/uam)
-#     deko3d/BUILD_INFO       the UAM tag and patch
-#   The source is UAM v1.1.0, the version devkitPro ships as its host `uam` tool, cloned into
-#   deko3d/src/uam with patches/uam/console-library.patch applied:
+#   Builds the two native libraries the deko3d backend (crates/wgpu_deko3d) links on the console:
+#     deko3d/lib/libuam.a         UAM's compiler plus dkp_uam_compile/dkp_uam_free (patches/uam)
+#     deko3d/lib/libdeko3d_bh.a   deko3d (patches/deko3d), named apart from devkitPro's libdeko3d.a,
+#     deko3d/lib/libdeko3dd_bh.a  and its debug build
+#     deko3d/BUILD_INFO           the tags and patches they were built from
+#
+#   UAM is devkitPro's deko3d shader compiler (https://github.com/devkitPro/uam, fincs; zlib, with
+#   Mesa's MIT GLSL frontend and nouveau codegen), built as a static library so the backend can
+#   compile the GLSL that naga writes from a game's WGSL. The source is UAM v1.1.0, the version
+#   devkitPro ships as its host `uam` tool, cloned into deko3d/src/uam with
+#   patches/uam/console-library.patch applied:
 #     - meson builds a static library with a C API in a cross build, and DKSH comes back in memory;
 #     - Instruction::init initializes its scheduling data, which the GM107 scheduler read before
 #       it was set, so stall counts depended on heap contents;
@@ -16,6 +20,13 @@ set -euo pipefail
 #       block's waits aren't known yet;
 #     - no dual issue: Mesa never dual-issues on GM107+, and UAM's experimental scheduling of it
 #       has been reported to corrupt lighting on hardware.
+#
+#   deko3d (https://github.com/devkitPro/deko3d, fincs; zlib) is v0.5.0, the source of devkitPro's
+#   deko3d 0.5.0-1 package, cloned into deko3d/src/deko3d with patches/deko3d applied:
+#     - alpha-dst-blend-factor.patch: blend states write the alpha destination factor from
+#       dstAlphaBlendFactor, not dstColorBlendFactor (devkitPro/deko3d#27).
+#   Its build generates headers with dekomme/dekodef (https://github.com/fincs/dekotools), which
+#   devkitPro doesn't package; they are built for the container from deko3d/src/dekotools.
 IMAGE_NAME="bevy-horizon-uam:local"
 ENGINE="${CONTAINER_ENGINE:-$(command -v docker >/dev/null && echo docker || echo podman)}"
 BASE_IMAGE="bevy-horizon-toolchain:local"
@@ -24,6 +35,13 @@ OUT_DIR="$WORKSPACE_DIR/deko3d"
 SRC_DIR="$OUT_DIR/src/uam"
 PATCH="$WORKSPACE_DIR/patches/uam/console-library.patch"
 UAM_TAG="v1.1.0"
+DEKO3D_SRC_DIR="$OUT_DIR/src/deko3d"
+DEKO3D_PATCH="$WORKSPACE_DIR/patches/deko3d/alpha-dst-blend-factor.patch"
+DEKO3D_TAG="v0.5.0"
+DEKOTOOLS_SRC_DIR="$OUT_DIR/src/dekotools"
+# dekotools has no tags; this is its master, whose only change since 2019 is an include newer
+# compilers need.
+DEKOTOOLS_COMMIT="c15523cea963c04fad77a46f23c3a96d26a86ab9"
 
 if ! "$ENGINE" image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
     "$ENGINE" build -t "$BASE_IMAGE" -f "$WORKSPACE_DIR/Containerfile" "$WORKSPACE_DIR"
@@ -36,17 +54,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends bison flex meso
 EOF
 fi
 
-if [ ! -d "$SRC_DIR/.git" ]; then
-    echo "==> Cloning UAM $UAM_TAG..."
-    mkdir -p "$OUT_DIR/src"
-    git clone -q --branch "$UAM_TAG" https://github.com/devkitPro/uam "$SRC_DIR"
-fi
-if git -C "$SRC_DIR" apply --check "$PATCH" 2>/dev/null; then
-    git -C "$SRC_DIR" apply "$PATCH"
-elif ! git -C "$SRC_DIR" apply --check --reverse "$PATCH" 2>/dev/null; then
-    echo "error: $PATCH applies neither forwards nor backwards to $SRC_DIR" >&2
-    exit 1
-fi
+# clone_patched <dir> <url> <tag or commit> <patch>: clones the source once and applies the patch,
+# accepting a source that already has it.
+clone_patched() {
+    local dir="$1" url="$2" rev="$3" patch="$4"
+    if [ ! -d "$dir/.git" ]; then
+        echo "==> Cloning $url $rev..."
+        mkdir -p "$(dirname "$dir")"
+        git clone -q "$url" "$dir"
+        git -C "$dir" -c advice.detachedHead=false checkout -q "$rev"
+    fi
+    [ -n "$patch" ] || return 0
+    if git -C "$dir" apply --check "$patch" 2>/dev/null; then
+        git -C "$dir" apply "$patch"
+    elif ! git -C "$dir" apply --check --reverse "$patch" 2>/dev/null; then
+        echo "error: $patch applies neither forwards nor backwards to $dir" >&2
+        exit 1
+    fi
+}
+clone_patched "$SRC_DIR" https://github.com/devkitPro/uam "$UAM_TAG" "$PATCH"
+clone_patched "$DEKO3D_SRC_DIR" https://github.com/devkitPro/deko3d "$DEKO3D_TAG" "$DEKO3D_PATCH"
+clone_patched "$DEKOTOOLS_SRC_DIR" https://github.com/fincs/dekotools "$DEKOTOOLS_COMMIT" ""
 
 echo "==> Cross-compiling UAM for the console..."
 mkdir -p "$OUT_DIR/lib"
@@ -86,8 +114,23 @@ EOF
     rm -f lib/libuam.a
     aarch64-none-elf-gcc-ar crs lib/libuam.a build/libuam.a.p/*.o
 '
+
+echo "==> Building deko3d for the console..."
+"$ENGINE" run --rm --network none -v "$OUT_DIR:/deko3d:z" -w /deko3d "$IMAGE_NAME" bash -euo pipefail -c '
+    if [[ ! -d build-dekotools ]]; then
+        meson setup build-dekotools src/dekotools
+    fi
+    ninja -C build-dekotools
+    export PATH=/deko3d/build-dekotools:/opt/devkitpro/devkitA64/bin:$PATH
+    make -C src/deko3d -j"$(nproc)"
+    cp src/deko3d/lib/libdeko3d.a lib/libdeko3d_bh.a
+    cp src/deko3d/lib/libdeko3dd.a lib/libdeko3dd_bh.a
+'
 {
     echo "uam $UAM_TAG $(git -C "$SRC_DIR" rev-parse HEAD)"
     echo "patch $(sha256sum "$PATCH" | cut -d' ' -f1) patches/uam/console-library.patch"
+    echo "deko3d $DEKO3D_TAG $(git -C "$DEKO3D_SRC_DIR" rev-parse HEAD)"
+    echo "patch $(sha256sum "$DEKO3D_PATCH" | cut -d' ' -f1) patches/deko3d/alpha-dst-blend-factor.patch"
+    echo "dekotools $(git -C "$DEKOTOOLS_SRC_DIR" rev-parse HEAD)"
 } > "$OUT_DIR/BUILD_INFO"
-echo "==> Done: $OUT_DIR/lib/libuam.a"
+echo "==> Done: $OUT_DIR/lib/{libuam.a,libdeko3d_bh.a,libdeko3dd_bh.a}"

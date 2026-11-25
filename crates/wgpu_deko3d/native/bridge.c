@@ -700,8 +700,8 @@ void *dkp_pipeline(void *ptr, const DkpPipelineDesc *desc) {
     p->color_count = desc->color_count;
     for (uint32_t i = 0; i < desc->color_count; ++i) {
         // The hardware rejects a zero blend equation even for targets with blending off, so
-        // those keep deko3d's defaults. (deko3d writes FuncAlphaDst from dstColorBlendFactor,
-        // so the alpha destination factor always equals the color one.)
+        // those keep deko3d's defaults. The alpha destination factor needs patches/deko3d:
+        // devkitPro's deko3d 0.5.0 writes it from dstColorBlendFactor.
         dkBlendStateDefaults(&p->blends[i]);
         if (desc->blend_enable_mask >> i & 1) {
             const DkpBlend *b = &desc->blend[i];
