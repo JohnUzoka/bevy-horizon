@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: [JOBS=n] scripts/build_example.sh [example] [title]
+# Usage: [JOBS=n] [FEATURES=...] scripts/build_example.sh [example] [title]
 #   example  a package under examples/ (default hello_switch)
 #   title    the name the HOME menu and sphaira show (default: from the example's name)
 #   JOBS     caps cargo's parallel jobs; each rustc on a Bevy crate can take 1-2 GB of RAM
+#   FEATURES builds with these of the example's features instead of its defaults
+#            (FEATURES=deko3d draws hello_switch through deko3d; docs/deko3d.md)
 # examples/<example>/romfs, if it exists, is packed into the NRO as its romfs.
 IMAGE_NAME="bevy-horizon-toolchain:local"
 # Docker or Podman: CONTAINER_ENGINE picks one, otherwise docker if it's installed.
@@ -35,7 +37,7 @@ echo "==> Compiling $EXAMPLE for Nintendo Switch (Horizon OS)..."
 # crates.io libc that lock pins, so first move the lock onto our libc. That lock is the container's
 # copy, thrown away with it (--rm). The grep stops the build if std would still use crates.io's.
 "$ENGINE" run --rm --log-driver=none \
-    -e EXAMPLE="$EXAMPLE" -e JOBS="${JOBS:-}" \
+    -e EXAMPLE="$EXAMPLE" -e JOBS="${JOBS:-}" -e FEATURES="${FEATURES:-}" \
     -v "$REGISTRY_VOLUME" \
     -v "$WORKSPACE_DIR:/workspace:z" \
     -w /workspace \
@@ -50,6 +52,7 @@ echo "==> Compiling $EXAMPLE for Nintendo Switch (Horizon OS)..."
         cargo build --release ${JOBS:+-j "$JOBS"} \
             -Z build-std=core,alloc,std,panic_abort -Z json-target-spec \
             --target /workspace/aarch64-nintendo-horizon.json \
+            ${FEATURES:+--no-default-features --features "$FEATURES"} \
             --package "$EXAMPLE"'
 
 echo "==> Checking every crate patch replaced its crates.io version..."

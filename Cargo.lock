@@ -974,6 +974,7 @@ dependencies = [
  "bevy_window 0.19.1",
  "raw-window-handle",
  "tracing",
+ "wgpu_deko3d",
 ]
 
 [[package]]
@@ -3892,8 +3893,6 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "29.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2bf919621e7975acb27d881bae2fb993e0d45c8e0446e85e6272971e00dc8df"
 dependencies = [
  "arrayvec",
  "bit-set 0.9.1",
@@ -6068,13 +6067,18 @@ dependencies = [
  "cfg_aliases",
  "document-features",
  "hashbrown 0.16.1",
+ "js-sys",
  "log",
  "naga 29.0.4",
+ "parking_lot",
  "portable-atomic",
  "profiling",
  "raw-window-handle",
  "smallvec",
  "static_assertions",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "wgpu-core 29.0.4",
  "wgpu-hal 29.0.4",
  "wgpu-types 29.0.4",
@@ -6298,6 +6302,18 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "web-sys",
+]
+
+[[package]]
+name = "wgpu_deko3d"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "naga 29.0.4",
+ "raw-window-handle",
+ "wgpu 29.0.4",
+ "wgpu-hal 29.0.4",
+ "wgpu-types 29.0.4",
 ]
 
 [[package]]

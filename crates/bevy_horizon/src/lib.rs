@@ -52,6 +52,8 @@ extern crate bevy_mesh_018 as bevy_mesh;
 extern crate bevy_render_018 as bevy_render;
 
 pub mod compat;
+#[cfg(all(target_os = "horizon", feature = "deko3d"))]
+pub mod deko3d;
 pub mod display;
 #[cfg(feature = "fps_overlay")]
 pub mod fps_overlay;

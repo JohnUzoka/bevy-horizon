@@ -24,6 +24,12 @@ bevy = { version = "0.19", default-features = false, features = [
     "ktx2",
     "zstd_rust",
 ] }
-# `vulkan` links NVK, so bevy_render draws through wgpu's Vulkan backend.
 # `fps_overlay` adds Bevy's FPS overlay: hold (−) and press (+) to show or hide it.
-bevy_horizon = { path = "../../crates/bevy_horizon", features = ["vulkan", "fps_overlay", "render"] }
+bevy_horizon = { path = "../../crates/bevy_horizon", features = ["fps_overlay", "render"] }
+
+[features]
+default = ["vulkan"]
+# Links NVK, so bevy_render draws through wgpu's Vulkan backend.
+vulkan = ["bevy_horizon/vulkan"]
+# Draws through deko3d instead (docs/deko3d.md): FEATURES=deko3d scripts/build_example.sh
+deko3d = ["bevy_horizon/deko3d"]

@@ -67,7 +67,12 @@ vulkan = []
 # queue for malloc's one lock (allocator/small_blocks.rs; BH_ALLOC_CACHE=0 turns it off). This sets
 # the `#[global_allocator]`, so a game with its own can't use it.
 top_down_alloc = ["vulkan"]
+# Draws through deko3d, the Switch's own GPU API, instead of Vulkan and NVK: crates/wgpu_deko3d is
+# a wgpu-hal backend on it, and deko3d::render_creation() hands Bevy a device on it. It links
+# deko3d/lib/libuam.a (scripts/build_uam.sh) to compile shaders on the console. docs/deko3d.md.
+deko3d = ["render", "dep:wgpu_deko3d"]
 
 [target.'cfg(target_os = "horizon")'.dependencies]
 # window.rs: the Horizon handles come from patches/raw-window-handle.
 raw-window-handle = { version = "0.6", default-features = false }
+wgpu_deko3d = { path = "../wgpu_deko3d", optional = true }

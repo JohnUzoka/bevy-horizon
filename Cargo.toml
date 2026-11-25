@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/bevy_horizon",
+    "crates/wgpu_deko3d",
     "examples/breakout",
     "examples/hello_switch",
     "examples/render_check",
@@ -41,6 +42,11 @@ getrandom02 = { path = "patches/getrandom-0.2", package = "getrandom" }
 libc = { path = "patches/libc" }
 lua-src = { path = "patches/lua-src" }
 memmap2 = { path = "patches/memmap2" }
+# naga's GLSL backend declares every depth texture `sampler2DShadow`, so deko3d's UAM rejects
+# Bevy's depth loads, gathers and plain samples (SSAO, depth prepass) and its level-0 point-light
+# shadow lookups (GL_EXT_texture_shadow_lod). The patch reads uncompared depth through plain
+# samplers and samples samplerCubeArrayShadow with core `texture` at level 0.
+naga = { path = "patches/naga" }
 polling = { path = "patches/polling" }
 # Vulkan through NVK (mesa-switch): raw-window-handle gains Horizon handles holding libnx's NWindow;
 # wgpu-hal makes a VK_NN_vi_surface from them and calls the statically linked driver's

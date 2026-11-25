@@ -46,8 +46,14 @@ fn main() {
             }),
             ..default()
         });
-    // RenderPlugin keeps its defaults: on Horizon, wgpu's only backend is Vulkan
+    // RenderPlugin keeps its defaults with `vulkan`: on Horizon, wgpu's only backend is Vulkan
     // (patches/wgpu-hal), drawing through NVK, which bevy_horizon's `vulkan` feature links.
+    // With `deko3d`, bevy_horizon hands it a device on deko3d instead.
+    #[cfg(all(target_os = "horizon", feature = "deko3d"))]
+    let plugins = plugins.set(bevy::render::RenderPlugin {
+        render_creation: bevy_horizon::deko3d::render_creation(),
+        ..default()
+    });
     app.add_plugins(plugins);
     println!("[Init] Step 2: DefaultPlugins added");
 

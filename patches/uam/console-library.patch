@@ -1,0 +1,223 @@
+diff --git a/mesa-imported/codegen/nv50_ir.cpp b/mesa-imported/codegen/nv50_ir.cpp
+index a7adec0..142f309 100644
+--- a/mesa-imported/codegen/nv50_ir.cpp
++++ b/mesa-imported/codegen/nv50_ir.cpp
+@@ -590,6 +590,11 @@ void Instruction::init()
+    predSrc = -1;
+    flagsDef = -1;
+    flagsSrc = -1;
++
++   // wgpu-deko-proof patch: the GM107 scheduler can read the next block's first instruction
++   // before scheduling that block; uninitialised, its stall counts depended on heap contents.
++   // 0x7e0: no read/write barrier, nothing to wait on.
++   sched = 0x7e0;
+ }
+ 
+ Instruction::Instruction()
+diff --git a/mesa-imported/codegen/nv50_ir_emit_gm107.cpp b/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
+index 04717c8..11ee7cd 100644
+--- a/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
++++ b/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
+@@ -4119,7 +4119,9 @@ SchedDataCalculatorGM107::setDelay(Instruction *insn, int delay,
+    if (delay <= GM107_MIN_ISSUE_DELAY && (wr & rd) != 7) {
+       // Barriers take one additional clock cycle to become active on top of
+       // the clock consumed by the instruction producing it.
+-      if (!next) {
++      // wgpu-deko-proof patch: a next instruction in another block may not have its waits
++      // yet (they are added when that block is visited), so assume it waits, as Mesa does.
++      if (!next || next->bb != insn->bb) {
+          delay = 0x2;
+       } else {
+          int wt = getWtDepBar(next);
+@@ -4128,17 +4130,12 @@ SchedDataCalculatorGM107::setDelay(Instruction *insn, int delay,
+       }
+    }
+ 
+-   if (lastDualIssued || !next || delay > 1 || !targ->canDualIssue(insn, next)) {
+-      delay = CLAMP(delay, GM107_MIN_ISSUE_DELAY, GM107_MAX_ISSUE_DELAY);
+-      lastDualIssued = false;
+-   } else {
+-      delay = 0x0; // dual-issue
+-      lastDualIssued = true;
+-   }
++   // wgpu-deko-proof patch: no dual issue. UAM's experimental dual-issue scheduling has been
++   // reported to corrupt lighting on hardware; Mesa never dual-issues on GM107+.
++   delay = CLAMP(delay, GM107_MIN_ISSUE_DELAY, GM107_MAX_ISSUE_DELAY);
++   lastDualIssued = false;
+ 
+    emitStall(insn, delay);
+-   if (lastDualIssued)
+-      emitYield(insn);
+ }
+ 
+ 
+diff --git a/meson.build b/meson.build
+index 1486cbc..dad0383 100644
+--- a/meson.build
++++ b/meson.build
+@@ -78,9 +78,14 @@ uam_incs = []
+ subdir('source')
+ subdir('mesa-imported')
+ 
+-uam = executable(
+-	'uam',
+-	uam_files,
+-	include_directories: uam_incs,
+-	install: true,
+-)
++# wgpu-deko-proof patch: a cross build (the console) makes a static library with dkp_uam.cpp's C API.
++if meson.is_cross_build()
++	static_library('uam', uam_files + uam_lib_files, include_directories: uam_incs)
++else
++	uam = executable(
++		'uam',
++		uam_files + uam_main,
++		include_directories: uam_incs,
++		install: true,
++	)
++endif
+diff --git a/source/compiler_iface.cpp b/source/compiler_iface.cpp
+index 7ce5809..5005eb5 100644
+--- a/source/compiler_iface.cpp
++++ b/source/compiler_iface.cpp
+@@ -623,6 +623,17 @@ void DekoCompiler::GenerateHeaders()
+ }
+ 
+ void DekoCompiler::OutputDksh(const char* dkshFile)
++{
++	FILE* f = fopen(dkshFile, "wb");
++	if (f)
++	{
++		WriteDksh(f);
++		fclose(f);
++	}
++}
++
++// wgpu-deko-proof patch: OutputDksh's bytes to any stream (e.g. open_memstream on the console).
++void DekoCompiler::WriteDksh(FILE* f)
+ {
+ 	DkshHeader hdr = {};
+ 	hdr.magic        = DKSH_MAGIC;
+@@ -632,30 +643,24 @@ void DekoCompiler::OutputDksh(const char* dkshFile)
+ 	hdr.programs_off = sizeof(DkshHeader);
+ 	hdr.num_programs = 1;
+ 
+-	FILE* f = fopen(dkshFile, "wb");
+-	if (f)
++	fwrite(&hdr, 1, sizeof(hdr), f);
++	fwrite(&m_dkph, 1, sizeof(m_dkph), f);
++	FileAlign256(f);
++
++	if (m_stage != pipeline_stage_compute)
+ 	{
+-		fwrite(&hdr, 1, sizeof(hdr), f);
+-		fwrite(&m_dkph, 1, sizeof(m_dkph), f);
+-		FileAlign256(f);
++		static const char s_padding[s_shaderStartOffset] = "lol nvidia why did you make us waste space here";
++		fwrite(s_padding, 1, sizeof(s_padding), f);
++		fwrite(&m_nvsh, 1, sizeof(m_nvsh), f);
++	}
+ 
+-		if (m_stage != pipeline_stage_compute)
+-		{
+-			static const char s_padding[s_shaderStartOffset] = "lol nvidia why did you make us waste space here";
+-			fwrite(s_padding, 1, sizeof(s_padding), f);
+-			fwrite(&m_nvsh, 1, sizeof(m_nvsh), f);
+-		}
++	fwrite(m_code, 1, m_codeSize, f);
++	FileAlign256(f);
+ 
+-		fwrite(m_code, 1, m_codeSize, f);
++	if (m_dataSize)
++	{
++		fwrite(m_data, 1, m_dataSize, f);
+ 		FileAlign256(f);
+-
+-		if (m_dataSize)
+-		{
+-			fwrite(m_data, 1, m_dataSize, f);
+-			FileAlign256(f);
+-		}
+-
+-		fclose(f);
+ 	}
+ }
+ 
+diff --git a/source/compiler_iface.h b/source/compiler_iface.h
+index 63e1042..f1760c5 100644
+--- a/source/compiler_iface.h
++++ b/source/compiler_iface.h
+@@ -39,6 +39,7 @@ public:
+ 
+ 	bool CompileGlsl(const char* glsl);
+ 	void OutputDksh(const char* dkshFile);
++	void WriteDksh(FILE* f);
+ 	void OutputRawCode(const char* rawFile);
+ 	void OutputTgsi(const char* tgsiFile);
+ };
+diff --git a/source/dkp_uam.cpp b/source/dkp_uam.cpp
+new file mode 100644
+index 0000000..04eba84
+--- /dev/null
++++ b/source/dkp_uam.cpp
+@@ -0,0 +1,46 @@
++// wgpu-deko-proof addition: compiles GLSL to DKSH in memory, for the console build (static library).
++#include "compiler_iface.h"
++
++#include <pthread.h>
++
++// Mesa's GLSL frontend keeps global state, so compiles are serialized.
++static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
++
++extern "C" {
++
++// stage is a pipeline_stage value. Returns a malloc'd DKSH image (free with dkp_uam_free), or NULL
++// when the GLSL does not compile; the frontend reports why on stderr.
++uint8_t* dkp_uam_compile(int stage, const char* glsl, size_t* size)
++{
++	if (stage < pipeline_stage_vertex || stage > pipeline_stage_compute || !glsl || !size)
++		return nullptr;
++	char* bytes = nullptr;
++	size_t length = 0;
++	pthread_mutex_lock(&s_lock);
++	{
++		DekoCompiler compiler(static_cast<pipeline_stage>(stage));
++		if (compiler.CompileGlsl(glsl))
++		{
++			FILE* f = open_memstream(&bytes, &length);
++			if (f)
++			{
++				compiler.WriteDksh(f);
++				if (fclose(f) != 0)
++				{
++					free(bytes);
++					bytes = nullptr;
++				}
++			}
++		}
++	}
++	pthread_mutex_unlock(&s_lock);
++	*size = bytes ? length : 0;
++	return reinterpret_cast<uint8_t*>(bytes);
++}
++
++void dkp_uam_free(void* dksh)
++{
++	free(dksh);
++}
++
++}
+diff --git a/source/meson.build b/source/meson.build
+index ea60677..f237914 100644
+--- a/source/meson.build
++++ b/source/meson.build
+@@ -2,7 +2,8 @@
+ uam_files += files(
+ 	'compiler_iface.cpp',
+ 	'glsl_frontend.cpp',
+-	'main.cpp',
+ 	'mini-os.c',
+ 	'tgsi_support.cpp',
+ )
++uam_main = files('main.cpp')
++uam_lib_files = files('dkp_uam.cpp')
