@@ -4,7 +4,8 @@ This page covers controllers and sound: how bevy_horizon turns the Switch's butt
 
 ## In short
 
-- **Input is one Bevy gamepad.** `HorizonPlugin` spawns it at startup and fills it from the Switch's [HID](glossary.md#hid) service every frame. Read it with Bevy's `Gamepad`, as on any platform.
+- **Input is one Bevy gamepad.** `HorizonPlugin` spawns it at startup and fills it from the Switch's [HID](glossary.md#hid) service. Read it with Bevy's `Gamepad`, as on any platform.
+- **Every tap counts, even one shorter than a frame.** A thread reads the pad every 4 ms and queues each change; every frame, Bevy gets all of them in order ([taps shorter than a frame](#taps-shorter-than-a-frame)).
 - **Buttons map by position, not by letter.** Nintendo A is Bevy's `East` and B is `South`. A game that jumps on `South` gets the bottom button: B on the Switch, A on an Xbox pad.
 - **Give the sticks a dead zone of your own, about 0.1.** `Gamepad::left_stick()` returns the raw value, and released sticks on the tested Switch Lite read about 0.08.
 - **Touch, motion, rumble and keyboards aren't in bevy_horizon; the software keyboard is.** `bevy_horizon::keyboard::Keyboard { initial, header, max_chars, password }.show()` brings up the system's keyboard [applet](glossary.md#applet) and returns what the player typed. A game can call [libnx](glossary.md#libnx) for [touch](glossary.md#touch-screen) and [motion](glossary.md#motion-sensor), which work on the console. [Rumble](glossary.md#rumble) is untested, because a Switch Lite has no rumble motors.
@@ -15,7 +16,7 @@ This page covers controllers and sound: how bevy_horizon turns the Switch's butt
 
 ## Controllers
 
-`HorizonPlugin` adds `HorizonInputPlugin` (`crates/bevy_horizon/src/input.rs`). At startup, `setup_horizon_gamepad` spawns one gamepad entity, connected as "Nintendo Switch Controller" (vendor 0x057e, product 0x2009). Every frame, `poll_horizon_input` reads the [pad](glossary.md#pad) through libnx in `PreUpdate`, before Bevy's `InputSystems`, and writes Bevy's raw gamepad events, so `Gamepad` is up to date in the same frame:
+`HorizonPlugin` adds `HorizonInputPlugin` (`crates/bevy_horizon/src/input.rs`). At startup, `setup_horizon_gamepad` spawns one gamepad entity, connected as "Nintendo Switch Controller" (vendor 0x057e, product 0x2009). A thread of the plugin's reads the [pad](glossary.md#pad) through libnx every 4 ms. Every frame, `poll_horizon_input` takes what the thread saw since the last frame, in `PreUpdate`, before Bevy's `InputSystems`, and writes Bevy's raw gamepad events, so `Gamepad` is up to date in the same frame:
 
 ```rust
 fn player_input(gamepads: Query<&Gamepad>) {
@@ -52,33 +53,46 @@ fn player_input(gamepads: Query<&Gamepad>) {
 - **Range:** each axis is the HID value divided by 32767, clamped to −1.0..1.0, with +y up. On the tested Switch Lite both sticks reach 1.0 in every direction, and diagonals stay on a circle: the longest reading in any direction was 1.01.
 - **Changes under 0.01 aren't sent.**
 - **Use your own dead zone.** `Gamepad::left_stick()`, `right_stick()` and `get()` return the value as sent. Bevy's `GamepadSettings` dead zone (±0.05 by default) applies only to `GamepadAxisChangedEvent`. Released sticks on the tested console read 0.081, so a dead zone of about 0.1 keeps a character still.
+- **Sent once a frame, where the stick is then.** The thread queues button changes, not stick moves, so a flick that goes out and comes back within one frame isn't seen.
 
 ### Which controller is read
 
-- **One player.** On its first run, `poll_horizon_input` configures HID for one player and the standard controller styles (`hid_ffi::NPAD_STYLE_SET_STANDARD`: Pro Controller, handheld, dual Joy-Con, and a single left or right Joy-Con). It reads player 1 and the handheld controls together. libnx merges the two: a button held on either counts, and the first stick that is off center wins.
+- **One player.** On its first run, `poll_horizon_input` configures HID for one player and the standard controller styles (`hid_ffi::NPAD_STYLE_SET_STANDARD`: Pro Controller, handheld, dual Joy-Con, and a single left or right Joy-Con), and starts the thread that reads the pad. It reads player 1 and the handheld controls together. libnx merges the two: a button held on either counts, and the first stick that is off center wins.
 - **Always connected.** The gamepad exists from startup and is never disconnected. With no controller attached it reads zero.
 - **Styles seen:** the Switch Lite reports handheld (0x2); [Ryujinx](glossary.md#ryujinx) reports a Pro Controller (0x1).
 - **Other Bevy input stays empty.** Nothing fills `Touches`, keyboard or mouse input.
+
+### Taps shorter than a frame
+
+libnx's pad API gives only the pad's state at the moment it is read. Read once a frame, a press and release that both fall between two reads are lost: at 10 fps, a 50 ms tap is missed about half the time, and during a frame of several seconds (loading, building a pipeline) every tap is. So the plugin reads the pad on a thread of its own:
+
+- **Every 4 ms, it reads the pad and queues the read if the buttons or the controller style changed.** It runs at priority 0x2B, above the main thread's 0x2C, so a long frame on its core doesn't hold the reads back; each read takes microseconds.
+- **Every frame, `poll_horizon_input` sends Bevy each queued change in order**, so a game sees every press, however short, in the frame after it happens.
+- **A button pressed and released within one frame stays held for that frame.** Its release goes to Bevy at the start of the next frame, so `pressed` sees the tap as well as `just_pressed`, and `raw_pad()` shows it held. Two taps of one button within a frame still make one `just_pressed`, as Bevy's `ButtonInput` counts at most one per frame.
+- **A full queue holds new changes back.** If nothing reads it for 256 changes, the thread stops queuing until a frame does, so later changes fold together as a once-a-frame read would, and the frame also gets the latest read.
+- **At exit, a release hook stops the thread and joins it,** so its 64 KiB stack is back in the heap before the homebrew loader reads the next NRO into it ([rules for services](lifecycle-and-exit.md#rules-for-services-you-add-later)). `log.txt` then has `[Input] exit: the pad sampler stopped and was joined in N ms`, or, if it didn't stop within 100 ms, `... didn't stop within 100 ms`.
+
+On a Switch Lite, hello_switch with its frames stretched to 101 ms (8.9 fps) and 40 taps of (A), each held 40 ms: reading once a frame, 14 reached the game; with the thread, all 40 did, each as a press in one frame and its release in the next. Exit still ends with `[Exit] PASS`; the thread is joined in 2 to 4 ms.
 
 ### What it logs
 
 The plugin logs through Bevy's log, so with `LogPlugin` (part of `DefaultPlugins`) these lines reach `log.txt`:
 
 ```text
-[Input] HID configured: 1 player, standard controllers; reading player 1 and handheld
+[Input] HID configured: 1 player, standard controllers; reading player 1 and handheld every 4 ms on a thread of its own
 [Input] controller styles now 0x2 (0 = none, 0x1 = Pro Controller, 0x2 = handheld, 0x4 = dual Joy-Con)
 [Input] first button press read from HID (buttons 0x1)
 ```
 
-The styles line repeats whenever the connected controllers change. If you press buttons and no `first button press` line appears, HID input isn't reaching the game.
+The styles line repeats whenever the connected controllers change. If you press buttons and no `first button press` line appears, HID input isn't reaching the game. At exit, the thread's line is in [taps shorter than a frame](#taps-shorter-than-a-frame).
 
 ### Reading the pad yourself
 
-For a game with its own input layer, `bevy_horizon::raw_pad()` returns a `RawPad` with this frame's read:
+For a game with its own input layer, `bevy_horizon::raw_pad()` returns a `RawPad` with this frame's state:
 
 | Field | Holds |
 |---|---|
-| `buttons` | libnx's `HidNpadButton` bits held down. `bevy_horizon::npad_button` names the 16 the plugin maps |
+| `buttons` | libnx's `HidNpadButton` bits held down. `bevy_horizon::npad_button` names the 16 the plugin maps. A mapped button tapped within the last frame shows as held for this frame, as it does in Bevy's `Gamepad` |
 | `sticks` | Left, then right, as `[x, y]`, each −32767..=32767, with +y up |
 | `style_set` | The controller style: 0 none, 0x1 Pro Controller, 0x2 handheld, 0x4 dual Joy-Con |
 

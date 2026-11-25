@@ -69,7 +69,7 @@ Something has to run the frames: winit, which does on desktop, has no Switch bac
 | `FrameStart` and `FrameEnd`, around `First` to `Last` | frame timer | Times the `Main` schedule |
 | `First` | `attach_default_nwindow` | Attaches the screen, once |
 | `PreUpdate` | `check_applet_loop` | Applet messages: exit requests, HOME and focus |
-| `PreUpdate`, before `InputSystems` | `poll_horizon_input` | Reads the controller |
+| `PreUpdate`, before `InputSystems` | `poll_horizon_input` | Sends the controller's changes since the last frame, which its own thread read ([taps shorter than a frame](input-and-audio.md#taps-shorter-than-a-frame)) |
 | `PreUpdate` | `monitor_dock_status` | Follows the dock state |
 | `PostUpdate` | `flush_logs_system` | Heartbeat, closing exited threads, syncing `log.txt` |
 
@@ -132,7 +132,7 @@ If focus comes back within 100 ms of that switch, the system didn't suspend the 
 
 ### Input before Bevy input systems
 
-`poll_horizon_input` reads [HID](glossary.md#hid) in `PreUpdate`, before Bevy's `InputSystems`, as bevy_gilrs does on desktop, so a press reaches Bevy's gamepad state in the same frame. The first poll logs `[Input] HID configured: 1 player, standard controllers; reading player 1 and handheld`, and each controller change logs `[Input] controller styles now ...`. The mapping is in [input-and-audio.md](input-and-audio.md).
+`poll_horizon_input` sends what the controller did since the last frame in `PreUpdate`, before Bevy's `InputSystems`, as bevy_gilrs does on desktop, so a press reaches Bevy's gamepad state in the same frame. A thread of its own reads [HID](glossary.md#hid) every 4 ms, so a tap shorter than a frame isn't lost ([taps shorter than a frame](input-and-audio.md#taps-shorter-than-a-frame)). The first poll starts it and logs `[Input] HID configured: 1 player, standard controllers; reading player 1 and handheld every 4 ms on a thread of its own`, and each controller change logs `[Input] controller styles now ...`. The mapping is in [input-and-audio.md](input-and-audio.md).
 
 ### Dock-status check
 
@@ -202,6 +202,7 @@ When the NRO exits, the homebrew loader reads the next NRO into the same heap, w
 | GPU (nvdrv) | 8 MiB of transfer memory, and every NVK allocation ([GPU memory](platform-notes.md#nvk-takes-gpu-memory-from-the-top-of-the-heap)) | Mesa (`nvExit`), when the App drop destroys the last Vulkan device; otherwise the hook exits through AM ([step 7](#the-userappexit-hook)) |
 | Audio (audren) | Its work buffer, in transfer memory | The cpal host (`audrenExit`), when a stream closes or at exit ([the audio host](input-and-audio.md#the-audio-host)) |
 | The six-axis sensor | `hidInitializeSevenSixAxisSensor`'s transfer memory | You: `hidFinalizeSevenSixAxisSensor`. Ordinary input doesn't use it |
+| The controller's reader thread | Its 64 KiB stack | `bevy_horizon`'s release hook, which stops and joins it ([taps shorter than a frame](input-and-audio.md#taps-shorter-than-a-frame)) |
 | Threads you spawn | Each thread's stack, 2 MiB by default | You: join them before `main` returns. Detached threads are closed once they exit |
 | Bevy's [task pools](glossary.md#task-pool), with `multi_threaded` | Their threads' stacks | The exit hook, within 500 ms, through the patched `bevy_tasks` ([the crate patches](toolchain.md#the-crate-patches)); a task that never yields keeps its thread |
 | Anything else on transfer memory (`tmemCreate`), such as libnx's console | Its transfer memory | You: its exit function, such as `consoleExit`, before `main` returns, or a release hook |
@@ -219,7 +220,7 @@ if !bevy_horizon::register_release_hook(close_my_service) {
 }
 ```
 
-Hooks run newest first, once each, and each logs `[Exit] release hook N: done`; on other platforms they never run. Keep them quick, don't allocate in them ([why](#why-it-allocates-nothing)), and never panic. They don't run when `userAppExit` doesn't, but then the system ends the process and closes everything.
+Hooks run newest first, once each, and each logs `[Exit] release hook N: done`; on other platforms they never run. Keep them quick, don't allocate in them ([why](#why-it-allocates-nothing)), and never panic. They don't run when `userAppExit` doesn't, but then the system ends the process and closes everything. `bevy_horizon` takes one of the 8 slots for the controller's thread, and the [CPU profiler](logging-and-crash-reports.md#part-3-where-the-time-goes-the-cpu-profiler) one more while it runs.
 
 ## Logs to recognize
 
@@ -261,6 +262,8 @@ hello_switch, quit with (+):
 [Exit]   0x...-0x..., 2.20 MiB: memory type 0x5, permission 0x0, attributes 0x1: locked with no access, as an open transfer memory or a thread stack leaves it
 ...
 [Exit] Bevy's task pools: no threads of their own (bevy_tasks without multi_threaded runs tasks on the main thread)
+[Input] exit: the pad sampler stopped and was joined in ... ms
+[Exit] release hook 0: done
 [Exit] detached threads: closed ... now and ... while the app ran (... threads were created in all); 0 still running after ... ms
 [Exit] socketExit: done; the socket sessions and our handle to their transfer memory are closed
 [Exit] romfsUnmount: done
