@@ -137,7 +137,8 @@ impl hal::Surface for Surface {
             })));
         }
         let raw: Vec<*mut c_void> = textures.iter().map(Texture::ptr).collect();
-        let handle = Handle::new(unsafe { ffi::dkp_swapchain(device.ptr(), self.window.as_ptr(), raw.as_ptr(), count) })
+        // Cleared to black first: Bevy presents its first frame before drawing to it.
+        let handle = Handle::new(unsafe { ffi::dkp_swapchain(device.ptr(), self.window.as_ptr(), raw.as_ptr(), count, size.width, size.height) })
             .ok_or(hal::SurfaceError::Lost)?;
         unsafe { ffi::dkp_swapchain_interval(handle.ptr(), 1) };
         *swapchain = Some(Swapchain { handle, textures, _ctx: device.clone() });
