@@ -140,7 +140,7 @@ unsafe extern "C" {
     pub fn dkp_open() -> *mut c_void;
     pub fn dkp_close(ctx: *mut c_void);
 
-    pub fn dkp_buffer(ctx: *mut c_void, size: u64, mappable: bool) -> *mut c_void;
+    pub fn dkp_buffer(ctx: *mut c_void, size: u64, uncached: bool) -> *mut c_void;
     pub fn dkp_buffer_free(buffer: *mut c_void);
     pub fn dkp_buffer_data(buffer: *mut c_void) -> *mut c_void;
     pub fn dkp_buffer_address(buffer: *mut c_void) -> u64;

@@ -37,8 +37,10 @@ enum {
 #endif
 static const uint32_t chunk_pool_limit = DKP_CHUNK_POOL;
 
-// CPU-written memory (staging, readback, uploads): the GPU bypasses its L2, so neither side
-// needs cache maintenance. GPU-only memory is GPU cached; the CPU never touches it.
+// Memory only copies and the CPU touch (staging, readback, uploads): the GPU bypasses its L2, so
+// neither side needs cache maintenance. Other memory is GPU cached and CPU mapped too: mappable
+// buffers the GPU draws with (MAPPABLE_PRIMARY_BUFFERS) rely on each submission invalidating L2
+// and on submissions' fences flushing it (dkp_submit).
 static const uint32_t mappable_flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuUncached;
 static const uint32_t gpu_flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
 
@@ -461,7 +463,7 @@ static Slot *take_slot(Context *ctx, int pool, int class) {
     return &slots[0];
 }
 
-void *dkp_buffer(void *ptr, uint64_t size, bool mappable) {
+void *dkp_buffer(void *ptr, uint64_t size, bool uncached) {
     Context *ctx = ptr;
     if (!ctx)
         return NULL;
@@ -470,7 +472,7 @@ void *dkp_buffer(void *ptr, uint64_t size, bool mappable) {
         return NULL;
     buffer->ctx = ctx;
     buffer->size = size;
-    buffer->pool = mappable;
+    buffer->pool = uncached;
     buffer->size_class = size_class(size ? size : 1);
     if (buffer->size_class >= 0) {
         buffer->slot = take_slot(ctx, buffer->pool, buffer->size_class);
@@ -479,7 +481,7 @@ void *dkp_buffer(void *ptr, uint64_t size, bool mappable) {
             buffer->offset = buffer->slot->offset;
         }
     } else {
-        buffer->memory = make_memory(ctx->device, size, mappable ? mappable_flags : gpu_flags);
+        buffer->memory = make_memory(ctx->device, size, uncached ? mappable_flags : gpu_flags);
     }
     if (!buffer->memory) {
         free(buffer);
