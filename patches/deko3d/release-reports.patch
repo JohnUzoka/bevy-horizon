@@ -1,0 +1,102 @@
+deko3d's release library drops its error messages and warnings: DK_ERROR aborts with only the
+DkResult, so a failed kickoff or a GPU fault leaves LIBNX ABORT 2359-0001 and no reason. With this
+patch it hands them to dkBhReport, a weak function the program may define (wgpu_deko3d's bridge
+writes them to sdmc:/switch/deko3d.log), and a failed kickoff or gpfifo append reports libnx's
+result and how many entries were queued. Without dkBhReport it behaves as before.
+
+diff --git a/source/dk_device.cpp b/source/dk_device.cpp
+index d9c5a49..3521d17 100644
+--- a/source/dk_device.cpp
++++ b/source/dk_device.cpp
+@@ -241,11 +241,35 @@ void dk::detail::WarningMsg(const char* fmt, ...)
+ 
+ #else
+ 
++extern "C" void dkBhReport(DkResult result, const char* message) __attribute__((weak));
++
+ void dk::detail::RaiseError(DkResult result)
+ {
+ 	diagAbortWithResult(MAKERESULT(359, result));
+ }
+ 
++void dk::detail::RaiseError(DkResult result, const char* message)
++{
++	if (dkBhReport)
++		dkBhReport(result, message);
++	diagAbortWithResult(MAKERESULT(359, result));
++}
++
++void dk::detail::WarningMsg(const char* fmt, ...)
++{
++	if (!dkBhReport)
++		return;
++
++	char message[1024];
++
++	va_list va;
++	va_start(va, fmt);
++	vsnprintf(message, sizeof(message), fmt, va);
++	va_end(va);
++
++	dkBhReport(DkResult_Success, message);
++}
++
+ #endif
+ 
+ void* ObjBase::allocMem(size_t size, size_t alignment) const noexcept
+diff --git a/source/dk_private.h b/source/dk_private.h
+index 04f3036..40ad897 100644
+--- a/source/dk_private.h
++++ b/source/dk_private.h
+@@ -72,8 +72,10 @@
+ #else
+ 
+ #define DK_ENTRYPOINT(...) ((void)0)
+-#define DK_ERROR(_res,_msg) ::dk::detail::RaiseError(_res)
+-#define DK_WARNING(...)    ((void)0)
++// bevy-horizon: the release library also hands its fatal errors and warnings (a GPU fault's
++// details, from Queue::checkError) to dkBhReport, if the program defines it, before aborting.
++#define DK_ERROR(_res,_msg) ::dk::detail::RaiseError((_res),(_msg))
++#define DK_WARNING(...)    ::dk::detail::WarningMsg(__VA_ARGS__)
+ 
+ #define DK_ENTRYPOINT_NOT_IMPLEMENTED(...) \
+ 	::dk::detail::RaiseError(DkResult_NotImplemented)
+@@ -159,6 +161,8 @@ NX_CONSTEXPR bool IsMisaligned(uint32_t data, uint32_t align)
+ #else
+ 
+ [[noreturn]] void RaiseError(DkResult result);
++[[noreturn]] void RaiseError(DkResult result, const char* message);
++void WarningMsg(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+ 
+ #endif
+ 
+diff --git a/source/dk_queue.cpp b/source/dk_queue.cpp
+index 3f0953a..f1cc27c 100644
+--- a/source/dk_queue.cpp
++++ b/source/dk_queue.cpp
+@@ -175,8 +175,11 @@ void Queue::appendGpfifoEntries(CtrlCmdGpfifoEntry const* entries, uint32_t numE
+ #endif
+ 		u32 flags = GPFIFO_ENTRY_NOT_MAIN | ((ent.flags & CtrlCmdGpfifoEntry::NoPrefetch) ? GPFIFO_ENTRY_NO_PREFETCH : 0);
+ 		u32 threshold = (ent.flags & CtrlCmdGpfifoEntry::AutoKick) ? 8 : 0;
+-		if (R_FAILED(nvGpuChannelAppendEntry(&m_gpuChannel, ent.iova, ent.numCmds, flags, threshold)))
++		u32 queued = m_gpuChannel.num_entries;
++		Result rc = nvGpuChannelAppendEntry(&m_gpuChannel, ent.iova, ent.numCmds, flags, threshold);
++		if (R_FAILED(rc))
+ 		{
++			DK_WARNING("nvGpuChannelAppendEntry failed: 0x%x, with %u entries queued", rc, queued);
+ 			if (!checkError())
+ 				DK_ERROR(DkResult_Fail, "gpfifo entry append failed, but no error was reported");
+ 			return;
+@@ -342,8 +345,11 @@ void Queue::flush()
+ 		flushCmdBuf();
+ 		// TODO:
+ 		// - Do the ZBC shit
+-		if (R_FAILED(nvGpuChannelKickoff(&m_gpuChannel)))
++		u32 queued = m_gpuChannel.num_entries;
++		Result rc = nvGpuChannelKickoff(&m_gpuChannel);
++		if (R_FAILED(rc))
+ 		{
++			DK_WARNING("nvGpuChannelKickoff failed: 0x%x, with %u entries queued", rc, queued);
+ 			if (!checkError())
+ 				DK_ERROR(DkResult_Fail, "gpu channel kickoff failed, but no error was reported");
+ 			return;

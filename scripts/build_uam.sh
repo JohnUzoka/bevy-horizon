@@ -24,7 +24,10 @@ set -euo pipefail
 #   deko3d (https://github.com/devkitPro/deko3d, fincs; zlib) is v0.5.0, the source of devkitPro's
 #   deko3d 0.5.0-1 package, cloned into deko3d/src/deko3d with patches/deko3d applied:
 #     - alpha-dst-blend-factor.patch: blend states write the alpha destination factor from
-#       dstAlphaBlendFactor, not dstColorBlendFactor (devkitPro/deko3d#27).
+#       dstAlphaBlendFactor, not dstColorBlendFactor (devkitPro/deko3d#27);
+#     - release-reports.patch: the release library hands its fatal errors and warnings (a GPU
+#       fault's details, a failed kickoff's result) to dkBhReport, which the backend's bridge
+#       writes to sdmc:/switch/deko3d.log; upstream's release library aborts without a word.
 #   Its build generates headers with dekomme/dekodef (https://github.com/fincs/dekotools), which
 #   devkitPro doesn't package; they are built for the container from deko3d/src/dekotools.
 IMAGE_NAME="bevy-horizon-uam:local"
@@ -36,7 +39,8 @@ SRC_DIR="$OUT_DIR/src/uam"
 PATCH="$WORKSPACE_DIR/patches/uam/console-library.patch"
 UAM_TAG="v1.1.0"
 DEKO3D_SRC_DIR="$OUT_DIR/src/deko3d"
-DEKO3D_PATCH="$WORKSPACE_DIR/patches/deko3d/alpha-dst-blend-factor.patch"
+DEKO3D_PATCHES=("$WORKSPACE_DIR/patches/deko3d/alpha-dst-blend-factor.patch"
+                "$WORKSPACE_DIR/patches/deko3d/release-reports.patch")
 DEKO3D_TAG="v0.5.0"
 DEKOTOOLS_SRC_DIR="$OUT_DIR/src/dekotools"
 # dekotools has no tags; this is its master, whose only change since 2019 is an include newer
@@ -54,27 +58,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends bison flex meso
 EOF
 fi
 
-# clone_patched <dir> <url> <tag or commit> <patch>: clones the source once and applies the patch,
-# accepting a source that already has it.
+# clone_patched <dir> <url> <tag or commit> [patch...]: clones the source once and applies the
+# patches, accepting a source that already has them.
 clone_patched() {
-    local dir="$1" url="$2" rev="$3" patch="$4"
+    local dir="$1" url="$2" rev="$3" patch
+    shift 3
     if [ ! -d "$dir/.git" ]; then
         echo "==> Cloning $url $rev..."
         mkdir -p "$(dirname "$dir")"
         git clone -q "$url" "$dir"
         git -C "$dir" -c advice.detachedHead=false checkout -q "$rev"
     fi
-    [ -n "$patch" ] || return 0
-    if git -C "$dir" apply --check "$patch" 2>/dev/null; then
-        git -C "$dir" apply "$patch"
-    elif ! git -C "$dir" apply --check --reverse "$patch" 2>/dev/null; then
-        echo "error: $patch applies neither forwards nor backwards to $dir" >&2
-        exit 1
-    fi
+    for patch in "$@"; do
+        if git -C "$dir" apply --check "$patch" 2>/dev/null; then
+            git -C "$dir" apply "$patch"
+        elif ! git -C "$dir" apply --check --reverse "$patch" 2>/dev/null; then
+            echo "error: $patch applies neither forwards nor backwards to $dir" >&2
+            exit 1
+        fi
+    done
 }
 clone_patched "$SRC_DIR" https://github.com/devkitPro/uam "$UAM_TAG" "$PATCH"
-clone_patched "$DEKO3D_SRC_DIR" https://github.com/devkitPro/deko3d "$DEKO3D_TAG" "$DEKO3D_PATCH"
-clone_patched "$DEKOTOOLS_SRC_DIR" https://github.com/fincs/dekotools "$DEKOTOOLS_COMMIT" ""
+clone_patched "$DEKO3D_SRC_DIR" https://github.com/devkitPro/deko3d "$DEKO3D_TAG" "${DEKO3D_PATCHES[@]}"
+clone_patched "$DEKOTOOLS_SRC_DIR" https://github.com/fincs/dekotools "$DEKOTOOLS_COMMIT"
 
 echo "==> Cross-compiling UAM for the console..."
 mkdir -p "$OUT_DIR/lib"
@@ -130,7 +136,9 @@ echo "==> Building deko3d for the console..."
     echo "uam $UAM_TAG $(git -C "$SRC_DIR" rev-parse HEAD)"
     echo "patch $(sha256sum "$PATCH" | cut -d' ' -f1) patches/uam/console-library.patch"
     echo "deko3d $DEKO3D_TAG $(git -C "$DEKO3D_SRC_DIR" rev-parse HEAD)"
-    echo "patch $(sha256sum "$DEKO3D_PATCH" | cut -d' ' -f1) patches/deko3d/alpha-dst-blend-factor.patch"
+    for patch in "${DEKO3D_PATCHES[@]}"; do
+        echo "patch $(sha256sum "$patch" | cut -d' ' -f1) patches/deko3d/$(basename "$patch")"
+    done
     echo "dekotools $(git -C "$DEKOTOOLS_SRC_DIR" rev-parse HEAD)"
 } > "$OUT_DIR/BUILD_INFO"
 echo "==> Done: $OUT_DIR/lib/{libuam.a,libdeko3d_bh.a,libdeko3dd_bh.a}"

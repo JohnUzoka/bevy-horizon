@@ -15,17 +15,20 @@ enum {
     // Descriptor heaps, bound once per command list. Sampler ids are 12 bits in a texture handle.
     image_descriptor_count = 4096,
     sampler_descriptor_count = 1024,
-    // libnx's GPU channel holds GPFIFO_QUEUE_SIZE (0x800) gpfifo entries, and the GPU's ring the
-    // same. deko3d appends a command list's entries to the channel at submission and kicks them
-    // off only when the channel is nearly full or the queue is flushed, so one submission of a
-    // list with thousands of entries (every DkBarrier_Full ends two: a write_texture per layer of
-    // a texture array) failed in Queue::appendGpfifoEntries. Recordings are cut into segments of
-    // about segment_entries entries, and dkp_submit kicks off at most gpfifo_batch_entries at a
-    // time, keeping at most two batches on the ring. Entries are estimated from the commands that
+    // The GPU reads commands through a ring of GPFIFO_QUEUE_SIZE (0x800) gpfifo entries, which
+    // libnx's GPU channel fills and kicks off. deko3d appends a command list's entries to the
+    // channel at submission and kicks them off only when it is nearly full or the queue is
+    // flushed, and nothing waits for the ring to have room: a kickoff with more entries than the
+    // ring has free fails (LIBNX ABORT 2359-0001). So recordings are cut into segments of about
+    // segment_entries entries; dkp_submit kicks them off in batches of at most
+    // gpfifo_batch_entries, each with a fence, and before a batch waits until the kickoffs still
+    // running leave room for it within ring_budget. Entries are estimated from the commands that
     // end one in deko3d (maxwell/gpu_base.cpp, gpu_3d_base.cpp, gpu_compute.cpp, dk_cmdbuf.cpp),
-    // generously, so the true count stays far below the ring's size.
+    // generously; the budget leaves half the ring for what the estimates miss.
     segment_entries = 128,
     gpfifo_batch_entries = 384,
+    ring_budget = 1024,
+    kick_slots = 16,
 };
 
 // Retired command-memory chunks kept for reuse. 0 restores per-encoder create/destroy.
@@ -109,6 +112,12 @@ typedef struct {
     uint32_t free_samplers[sampler_descriptor_count], sampler_top;
     Slot *free_slots[2][slot_classes]; // [mappable][size class]
     Slab *slabs;
+    // Kickoffs whose gpfifo entries may still be on the GPU's ring, oldest first (queue_lock).
+    struct {
+        DkFence fence;
+        uint32_t entries;
+    } kicks[kick_slots];
+    uint32_t kick_head, kick_count, kick_entries;
 } Context;
 
 typedef struct {
@@ -271,6 +280,12 @@ static void debug_message(void *user, const char *context, DkResult result, cons
         fprintf(log, "%s: result %d: %s\n", context ? context : "?", (int)result, message ? message : "");
         fclose(log);
     }
+}
+
+// The release library (patches/deko3d/release-reports.patch) has no debug callback; it hands its
+// fatal errors and a GPU fault's details (Queue::checkError) here before aborting.
+void dkBhReport(DkResult result, const char *message) {
+    debug_message(NULL, "deko3d", result, message);
 }
 
 static DkMemBlock make_memory(DkDevice device, uint64_t size, uint32_t flags) {
@@ -1123,23 +1138,54 @@ done:
     return result;
 }
 
-// Kicks off what the queue holds and, so the GPU's gpfifo ring never holds more than two batches,
-// waits for the batch before it. fences[i] is signaled when signaled[i].
-static bool end_batch_locked(Context *ctx, DkFence fences[2], bool signaled[2], int *batch) {
-    const int current = *batch, previous = current ^ 1;
-    dkQueueSignalFence(ctx->queue, &fences[current], false);
+// Forgets kickoffs the GPU has finished, then waits for the oldest ones until `entries` more fit
+// in ring_budget and a kick slot is free.
+static bool make_room_locked(Context *ctx, uint32_t entries) {
+    while (ctx->kick_count) {
+        const bool full = ctx->kick_count == kick_slots || ctx->kick_entries + entries > ring_budget;
+        const uint32_t oldest = ctx->kick_head;
+        const uint64_t started = armGetSystemTick();
+        DkResult waited = dkFenceWait(&ctx->kicks[oldest].fence, full ? 2000000000 : 0);
+        if (waited == DkResult_Timeout && full) {
+            char message[160];
+            snprintf(message, sizeof(message), "the GPU has not finished a kickoff in 2 s; still waiting "
+                     "(%u entries in %u kickoffs outstanding)", (unsigned)ctx->kick_entries, (unsigned)ctx->kick_count);
+            debug_message(NULL, "dkp_submit", DkResult_Timeout, message);
+            waited = dkFenceWait(&ctx->kicks[oldest].fence, -1);
+        }
+        if (waited == DkResult_Timeout)
+            break;
+        if (waited != DkResult_Success || !queue_healthy_locked(ctx))
+            return false;
+        const uint64_t ms = armTicksToNs(armGetSystemTick() - started) / 1000000;
+        if (ms >= 500) {
+            char message[160];
+            snprintf(message, sizeof(message), "waited %u ms for the GPU to make room on the gpfifo ring "
+                     "(%u entries in %u kickoffs outstanding)", (unsigned)ms, (unsigned)ctx->kick_entries,
+                     (unsigned)ctx->kick_count);
+            debug_message(NULL, "dkp_submit", DkResult_Success, message);
+        }
+        ctx->kick_entries -= ctx->kicks[oldest].entries;
+        ctx->kick_head = (oldest + 1) % kick_slots;
+        --ctx->kick_count;
+    }
+    return true;
+}
+
+// Kicks off what the queue holds, counted as `entries` gpfifo entries, with a fence that says
+// when the GPU is past them. make_room_locked has left a slot free.
+static bool kick_locked(Context *ctx, uint32_t entries) {
+    const uint32_t slot = (ctx->kick_head + ctx->kick_count) % kick_slots;
+    dkQueueSignalFence(ctx->queue, &ctx->kicks[slot].fence, false);
     if (!queue_healthy_locked(ctx))
         return false;
     dkQueueFlush(ctx->queue);
     if (!queue_healthy_locked(ctx))
         return false;
-    signaled[current] = true;
-    if (signaled[previous]) {
-        if (dkFenceWait(&fences[previous], -1) != DkResult_Success || !queue_healthy_locked(ctx))
-            return false;
-        signaled[previous] = false;
-    }
-    *batch = previous;
+    // nvservices adds up to two entries of its own to each kickoff (its fence wait and increment).
+    ctx->kicks[slot].entries = entries + 2;
+    ++ctx->kick_count;
+    ctx->kick_entries += entries + 2;
     return true;
 }
 
@@ -1168,10 +1214,10 @@ bool dkp_submit(void *ptr, const void *const *commands, size_t count, void *fenc
         goto done;
     pending->next = NULL;
     pending->value = value;
-    // Segments go to the queue in batches of at most gpfifo_batch_entries gpfifo entries.
-    DkFence batch_fences[2];
-    bool batch_signaled[2] = {false, false};
-    int batch = 0;
+    // Segments go to the queue in batches of at most gpfifo_batch_entries gpfifo entries, each
+    // started once the ring has room for a whole batch.
+    if (!make_room_locked(ctx, gpfifo_batch_entries))
+        goto done;
     uint32_t batched = 0;
     for (size_t i = 0; i < count; ++i) {
         const Command *cmd = commands[i];
@@ -1179,7 +1225,7 @@ bool dkp_submit(void *ptr, const void *const *commands, size_t count, void *fenc
             // The queue adds an entry or two of its own per list.
             const uint32_t entries = cmd->list_entries[j] + 2;
             if (batched && batched + entries > gpfifo_batch_entries) {
-                if (!end_batch_locked(ctx, batch_fences, batch_signaled, &batch))
+                if (!kick_locked(ctx, batched) || !make_room_locked(ctx, gpfifo_batch_entries))
                     goto done;
                 batched = 0;
             }
@@ -1198,8 +1244,8 @@ bool dkp_submit(void *ptr, const void *const *commands, size_t count, void *fenc
     dkQueueSignalFence(ctx->queue, &pending->native, true);
     if (!queue_healthy_locked(ctx))
         goto done;
-    dkQueueFlush(ctx->queue);
-    if (!queue_healthy_locked(ctx))
+    // The fences add a few entries.
+    if (!kick_locked(ctx, batched + 4))
         goto done;
     fence->submitted = value;
     ok = true;
