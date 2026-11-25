@@ -5,7 +5,7 @@ This page takes a Bevy game that runs on PC and makes it run on the Switch as [h
 ## In short
 
 - **Get the game running on PC first,** on Bevy 0.19.1 or 0.18.1, with the Bevy features you'll use on the Switch.
-- **Add `bevy_horizon` for Horizon only,** with its `vulkan` feature and `render` (Bevy 0.19) or `render_0_18` (Bevy 0.18), and leave Bevy's `default_platform` features out of the Switch build. Add `top_down_alloc` if the game loads large assets.
+- **Add `bevy_horizon` for Horizon only,** with its `vulkan` feature and `render` (Bevy 0.19) or `render_0_18` (Bevy 0.18), and leave Bevy's `default_platform` features out of the Switch build. Add `top_down_alloc` if the game loads large assets. On Bevy 0.19, `deko3d` in place of `vulkan` draws through [deko3d](deko3d.md) instead of NVK.
 - **In `main`,** set any environment variables, call `init_switch_logging`, then add `DefaultPlugins` and `HorizonPlugin`, in that order.
 - **Build with `scripts/build_game.sh`** from bevy-horizon. It applies the patch set for your Bevy version, builds the [NRO](glossary.md#nro) and checks it.
 - **Copy the NRO and its `assets` folder to `sdmc:/switch/<game>/`,** and start it with a game's memory, about 3.1 GiB, which GPU memory shares.
@@ -110,10 +110,32 @@ The 0.18 list plays on the console in a full 3D game. The 0.19 list builds for H
 | `vulkan` | Links NVK (`nvk/lib/libvulkan_bh.a`), so wgpu draws through [Vulkan](glossary.md#vulkan). Without it, Bevy's renderer panics with `Unable to find a GPU! Make sure you have installed required drivers!` | The game draws |
 | `render` | Adds `HorizonUploadPlugin`, which [paces GPU uploads](platform-notes.md#pacing-uploads-the-render-feature) | The game draws, with Bevy 0.19 |
 | `render_0_18` | The same, for Bevy 0.18 | The game draws, with Bevy 0.18 |
-| `top_down_alloc` | Turns on `vulkan` and installs a global allocator: blocks of 256 KiB and up go in the region NVK takes GPU memory from, and freed blocks of up to 32 KiB are cached | The game loads large assets; not with your own `#[global_allocator]` |
+| `top_down_alloc` | Turns on `vulkan` and installs a global allocator: blocks of 256 KiB and up go in the region NVK takes GPU memory from, and freed blocks of up to 32 KiB are cached | The game loads large assets; not with your own `#[global_allocator]`, and not with `deko3d` |
+| `deko3d` | Turns on `render` and links `crates/wgpu_deko3d`, a wgpu-hal backend on [deko3d](glossary.md#deko3d), with deko3d and its shader compiler [UAM](glossary.md#uam) from `deko3d/lib`. Exports `bevy_horizon::deko3d::render_creation()`, which the game gives Bevy's `RenderPlugin` ([deko3d.md](deko3d.md)) | The game should draw through deko3d instead of NVK, with Bevy 0.19; in place of `vulkan` |
 | `fps_overlay` | Exports `HorizonFpsOverlayPlugin` ([the FPS overlay](rendering.md#the-fps-overlay)), which you add and toggle with (−)+(+), and `fps_chord_held`, which tells your (+) handler to ignore presses while (−) is held. Needs `bevy_ui_render`, `bevy_text` and `default_font` | You want a frame counter on the console; Bevy 0.19 only |
 
 A wrong combination stops the build with a message that starts `bevy_horizon:`, for example ``bevy_horizon: a Bevy 0.18 game turns on `render_0_18`; `render` is for Bevy 0.19`` ([Troubleshooting](troubleshooting.md)). With `vulkan`, the build also stops if NVK isn't built: ``bevy_horizon's `vulkan` feature links …/nvk/lib/libvulkan_bh.a, which is missing``. Build it with `scripts/build_nvk.sh`, then `scripts/localize_nvk.sh` ([Getting started](building.md)).
+
+With `deko3d`, build deko3d and UAM once, from bevy-horizon's folder, before the game:
+
+```sh
+scripts/build_uam.sh
+```
+
+It writes `deko3d/lib/libuam.a`, `deko3d/lib/libdeko3d_bh.a` and its debug build, and `deko3d/BUILD_INFO`; NVK isn't needed. Without them the build stops with ``wgpu_deko3d links …/deko3d/lib/libuam.a, which is missing``. Then give Bevy the device bevy_horizon makes, in place of its automatic setup:
+
+```rust
+let mut app = App::new();
+#[cfg(target_os = "horizon")]
+app.add_plugins(DefaultPlugins.set(bevy::render::RenderPlugin {
+    render_creation: bevy_horizon::deko3d::render_creation(),
+    ..default()
+}));
+#[cfg(not(target_os = "horizon"))]
+app.add_plugins(DefaultPlugins);
+```
+
+`examples/hello_switch/src/main.rs` does this behind its own `deko3d` feature. `scripts/build_game.sh` builds such a game as any other: the naga and wgpu-hal patches the backend needs are in the Bevy 0.19 set ([toolchain.md](toolchain.md#the-bevy-019-set)).
 
 ## 3. Set up main
 
@@ -450,6 +472,8 @@ Horizon has no shell and no launch arguments, so the game sets these itself, wit
 | `NVK_SWITCH_DEAD_COLOR` | `0` keeps a fragment shader's writes to missing color attachments | On | Once, at the first pipeline; part of the shader cache's key | [Linking NVK](toolchain.md#linking-nvk-the-vulkan-feature) |
 | `NAK_DEBUG` | Mesa's shader-compiler flags, comma-separated, for example `stats`; `-<flag>` turns a Switch default off | The Switch defaults | Once, when NVK first compiles a shader; part of the shader cache's key | [Logs and crash reports](logging-and-crash-reports.md), Part 4; [Linking NVK](toolchain.md#linking-nvk-the-vulkan-feature) |
 | `BEVY_HORIZON_NVK_LIB` | The folder that has `libvulkan_bh.a` | `nvk/lib` in bevy-horizon | At build time, by `bevy_horizon`'s build script; the build scripts don't pass it into the container | [Linking NVK](toolchain.md#linking-nvk-the-vulkan-feature) |
+| `BEVY_HORIZON_UAM_LIB` | The folder that has `libuam.a` and `libdeko3d_bh.a` | `deko3d/lib` in bevy-horizon | At build time, by `wgpu_deko3d`'s build script, with `deko3d`; the build scripts don't pass it into the container | [deko3d](deko3d.md#wgpu-versions) |
+| `BEVY_HORIZON_DEKO3D_DEBUG` | Set: link deko3d's debug library, which reports API misuse to `sdmc:/switch/deko3d.log` | Unset: the release library | At build time, by `wgpu_deko3d`'s build script; the build scripts don't pass it into the container | [deko3d](deko3d.md#testing) |
 
 Other variables a port may set:
 
@@ -486,7 +510,7 @@ BEVY=0.18 JOBS=16 CARGO_ARGS="--no-default-features" AUTHOR="Skate 3 Rust Engine
 It provides:
 
 - **The platform layer Bevy expects:** the run loop, the window on the screen, one controller as a Bevy gamepad, HOME, sleep and focus as Bevy's messages, the dock state, RomFS and sockets, the system's software keyboard for text (`keyboard`), and a text page for a game that can't start, shown before it has a window (`notice::show`: libnx's console, closed with A, B or +).
-- **Drawing,** through wgpu's Vulkan backend and NVK linked into the NRO (`vulkan`), with upload pacing (`render`, `render_0_18`) and an allocator for large assets (`top_down_alloc`).
+- **Drawing,** through wgpu's Vulkan backend and NVK linked into the NRO (`vulkan`) or through [deko3d](deko3d.md) (`deko3d`), with upload pacing (`render`, `render_0_18`) and an allocator for large assets (`top_down_alloc`).
 - **Sound,** through the patched cpal hosts.
 - **Logs:** `log.txt`, `panic.txt`, the heartbeat, `memory_report()`, a CPU profiler, and an [FPS overlay](rendering.md#the-fps-overlay) (`fps_overlay`, Bevy 0.19).
 - **A clean exit** back to the homebrew menu, with release hooks for your own services.

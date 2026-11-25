@@ -1,6 +1,6 @@
 # Testing
 
-This page covers [captest](glossary.md#captest) (`examples/switch_captest`), the capability-test [NRO](glossary.md#nro) that checks what a Bevy game needs from the console, along with render_check and testing in an [emulator](glossary.md#emulator). Read it before you trust a port on new ground, add a check, or rely on an emulator result.
+This page covers [captest](glossary.md#captest) (`examples/switch_captest`), the capability-test [NRO](glossary.md#nro) that checks what a Bevy game needs from the console, along with hello_switch's GPU checks, render_check and testing in an [emulator](glossary.md#emulator). Read it before you trust a port on new ground, add a check, or rely on an emulator result.
 
 ## In short
 
@@ -10,6 +10,7 @@ This page covers [captest](glossary.md#captest) (`examples/switch_captest`), the
 - **A crash or hang doesn't cost the run.** Start captest again: it records the check that was running as CRASH, skips it from then on, and carries on.
 - **On a Switch Lite: 179 pass, 0 fail, 2 warn.**
 - **Stock [Ryujinx](glossary.md#ryujinx) runs captest, but not the [Vulkan](glossary.md#vulkan) builds.** Set its memory manager mode to Software. An emulator finds bugs in your own code fast, but the console is the answer.
+- **hello_switch checks the GPU paths a renderer needs,** on NVK and, built with `FEATURES=deko3d`, on [deko3d](deko3d.md): a large upload in one submission and three device features, each a `[Check]` line in `log.txt` ([hello_switch's GPU checks](#hello_switchs-gpu-checks)).
 
 ## What captest checks
 
@@ -120,6 +121,19 @@ On a Switch Lite at [handheld](glossary.md#handheld-mode) clocks, with Bevy 0.19
 - **The skip** is `rumble-felt`: a Switch Lite has no rumble motors.
 
 That run predates the current audio host: its sound checks went through the SDL2-based host that the audren hosts replaced ([the audio host](input-and-audio.md#the-audio-host)). With the current Bevy 0.19 host, the `bevy-audio` stage and the App drop have passed only in the emulator. [Docked mode](glossary.md#docked-mode), a Pro Controller and detached Joy-Con are untested.
+
+## hello_switch's GPU checks
+
+Besides its asset, file, thread and RomFS checks ([Read log.txt](building.md#7-read-logtxt)), hello_switch tests the GPU through Bevy's render device, so the same lines check both renderers: build it with `scripts/build_example.sh hello_switch` for NVK, or `FEATURES=deko3d scripts/build_example.sh hello_switch "Hello Switch (deko3d)"` for [deko3d](deko3d.md). Each check logs one `[Check]` line with PASS or FAIL, or SKIP when the device lacks the feature it tests.
+
+| Line | What it does | What a PASS proves |
+|---|---|---|
+| `upload` | At frame 90, 6000 `queue.write_texture` calls into 64 layers of a texture go to the GPU in one submission, then the texture is read back and compared | A game can upload a large texture array layer by layer: each write has its own staging copy and barriers, so one submission makes thousands of command-list entries. On deko3d this failed in `Queue::appendGpfifoEntries` before the bridge split recordings ([Submission](deko3d.md#how-it-fits-together)) |
+| `early depth` | At frame 120, a quad writes depth 0.5, then fragment shaders that count themselves in a storage buffer draw behind it and in front, with `@early_depth_test(force)`; the same hidden quad without it is the control | `SHADER_EARLY_DEPTH_TEST` works: the hidden fragments ran 0 times and the visible ones once per pixel. Occlusion culling that writes storage from a box shader, such as Horizon's, needs it |
+| `vertex storage` | A vertex shader writes each point's index into a storage buffer | `VERTEX_WRITABLE_STORAGE`: all 256 writes from the vertex stage land |
+| `mappable primary` | A `VERTEX \| MAP_WRITE` buffer written through its mapping feeds a vertex shader that writes into a `STORAGE \| MAP_READ` buffer, read through its mapping, three rounds over the same buffers | `MAPPABLE_PRIMARY_BUFFERS`: the CPU's writes reach the GPU and the GPU's come back with no stale cache lines from the round before |
+
+On deko3d all four pass on the console ([Features beyond WebGPU's](deko3d.md#how-it-fits-together)). The checks are in `examples/hello_switch/src/checks.rs` (`upload`) and `feature_checks.rs` (the other three).
 
 ## render_check
 

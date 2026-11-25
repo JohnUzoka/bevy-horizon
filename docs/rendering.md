@@ -4,7 +4,7 @@ This page is for anyone whose Bevy game draws on the Switch: the Bevy features a
 
 ## In short
 
-- **Bevy draws through [wgpu](glossary.md#wgpu)'s [Vulkan](glossary.md#vulkan) backend and [NVK](glossary.md#nvk), which is linked into the [NRO](glossary.md#nro).** Turn on bevy_horizon's `vulkan` feature. NVK is [Mesa](glossary.md#mesa)'s Vulkan driver for NVIDIA GPUs, built for the Switch by [mesa-switch](glossary.md#mesa-switch); Horizon has no driver loader, so the driver is part of the executable ([Linking NVK](toolchain.md#linking-nvk-the-vulkan-feature)).
+- **Bevy draws through [wgpu](glossary.md#wgpu)'s [Vulkan](glossary.md#vulkan) backend and [NVK](glossary.md#nvk), which is linked into the [NRO](glossary.md#nro).** Turn on bevy_horizon's `vulkan` feature. NVK is [Mesa](glossary.md#mesa)'s Vulkan driver for NVIDIA GPUs, built for the Switch by [mesa-switch](glossary.md#mesa-switch); Horizon has no driver loader, so the driver is part of the executable ([Linking NVK](toolchain.md#linking-nvk-the-vulkan-feature)). The alternative is [deko3d](#deko3d-instead-of-vulkan), the Switch's own GPU API; this page describes the Vulkan path.
 - **It works on the console.** On a Switch Lite, [hello_switch](glossary.md#hello_switch)'s lit cube holds 60 fps, Bevy's [Breakout](glossary.md#breakout) plays to the end at about 59 fps, [render_check](#render_check) draws all 24 of its cubes, and a full 3D Bevy 0.18 game reaches about 30 fps in its heaviest view ([On the Switch](#on-the-switch)).
 - **A 3D game needs Bevy's `tonemapping_luts`, `ktx2` and `zstd_rust` features,** which Bevy's defaults include. Without them, whatever a camera with Bevy's default tonemapping draws comes out magenta ([Bevy features a game needs](#bevy-features-a-game-needs)).
 - **The default settings are safe; a 3D game should also set `BH_RT_COMPRESSION=1`,** which saves GPU time on the console. Set variables with `std::env::set_var` at the start of `main` ([Render settings](#render-settings)).
@@ -12,6 +12,14 @@ This page is for anyone whose Bevy game draws on the Switch: the Bevy features a
 - **When the GPU stops, the log says why.** Every Horizon build logs NVK's own messages, the Vulkan error and the wgpu call that lost the device. A [panic](glossary.md#panic) after a [lost device](glossary.md#device-lost) is a consequence, not a second bug ([Diagnosing a lost device or a GPU hang](#diagnosing-a-lost-device-or-a-gpu-hang)).
 - **Lit `StandardMaterial` used to hang the GPU in Bevy 0.18,** until Mesa patch 0032: a fragment shader's helper lanes looped between light-list bounds they couldn't load ([The helper-lane hang](#the-helper-lane-hang-fixed)).
 - **Stock [Ryujinx](glossary.md#ryujinx) can't run the Vulkan builds.** NVK hits emulator bugs at startup and on the first frames, and the project's fixes are local and unpublished. The emulator's speed says nothing about the console's ([What the emulator gets wrong](#what-the-emulator-gets-wrong)).
+
+## deko3d instead of Vulkan
+
+bevy_horizon's `deko3d` feature, with `bevy_horizon::deko3d::render_creation()` given to Bevy's `RenderPlugin`, draws through `crates/wgpu_deko3d`, a wgpu-hal backend on [deko3d](glossary.md#deko3d), instead of NVK. The game's rendering code doesn't change; it needs `scripts/build_uam.sh` instead of the NVK build ([deko3d.md](deko3d.md)).
+
+- **Pick it when the game is CPU-bound in the driver:** many draws or submissions a frame, where NVK's per-draw cost shows. Ports bound that way have run about twice as fast on deko3d ([Performance in a game](deko3d.md#performance-in-a-game)).
+- **Expect little when the game is GPU-bound,** as large 3D games are at handheld clocks ([Performance](#performance)): the shaders do the same work on either. In a wgpu 30 game whose GPU time is about 34 ms a frame, deko3d ran 25.7 fps against NVK's 24.4.
+- **Stay on Vulkan when the game needs what deko3d lacks** ([Limits](deko3d.md#limits)): a depth texture that one shader both compares against and reads, binding arrays, pipeline-statistics queries, and the other features listed there. The settings on this page that start with `BH_`, `NVK_`, `NAK_` or `MESA_`, and `BEVY_HORIZON_ZCULL_DIR`, are NVK's and do nothing on deko3d.
 
 ## Bevy features a game needs
 
@@ -58,11 +66,11 @@ fn main() {
 
 With `InstanceFlags::VALIDATION_INDIRECT_CALL`, wgpu checks every [indirect draw](glossary.md#indirect-draw) before the GPU runs it: a [compute](glossary.md#compute-shader) pass zeroes the arguments of any draw that breaks wgpu's rules, such as one whose indices or instances run past the end of their buffers. Without the check, such a draw is undefined behaviour (wgpu-types 29.0.4, `InstanceFlags::VALIDATION_INDIRECT_CALL`). Bevy draws each batch with an indirect call by default, so the pass runs every frame.
 
-- **On Horizon it's off in release builds and on in debug builds.** bevy_horizon's wgpu-core patch drops the flag unless `InstanceFlags::VALIDATION` is set too, as debug builds do (`Instance::new` in `patches/wgpu-core/src/instance.rs`, and in `patches/bevy-0.18/wgpu-core/src/instance.rs` for Bevy 0.18).
-- **That's Bevy's own rule, applied to the only backend the Switch has.** In release builds bevy_render removes the flag unless its backends include DX12, because "Removing this flag improves performance" (`bevy_render-0.19.1/src/settings.rs:130-139`). Bevy's default backends name DX12 on every platform, so upstream the flag stays on; wgpu on Horizon has only Vulkan.
+- **On Horizon it's off in release builds and on in debug builds.** bevy_horizon's wgpu-core patch drops the flag unless `InstanceFlags::VALIDATION` is set too, as debug builds do, both in `Instance::new` and for an instance made from a hal instance, as the [deko3d](deko3d.md#how-it-fits-together) backend's is (`patches/wgpu-core/src/instance.rs`; `Instance::new` in `patches/bevy-0.18/wgpu-core/src/instance.rs` for Bevy 0.18).
+- **That's Bevy's own rule, applied to the Switch.** In release builds bevy_render removes the flag unless its backends include DX12, because "Removing this flag improves performance" (`bevy_render-0.19.1/src/settings.rs:130-139`). Bevy's default backends name DX12 on every platform, so upstream the flag stays on; of wgpu's own backends, Horizon has only Vulkan.
 - **Bevy writes its indirect arguments itself, on the GPU,** so they should always be valid. If your game writes its own indirect draws, test them in a debug build or with the validation on.
 
-To turn it on in a release build, insert both flags, as render_check's `indirect_validation` option does. On its own, `VALIDATION` asks for the Khronos validation layer, which the Switch doesn't have, and wgpu carries on without it.
+To turn it on in a release build, insert both flags, as render_check's `indirect_validation` option does. On its own, `VALIDATION` asks for the Khronos validation layer, which the Switch doesn't have, and wgpu carries on without it. On deko3d, `render_creation()` makes the instance itself, so `WgpuSettings` don't reach it; use a debug build there.
 
 ```rust
 use bevy::render::RenderPlugin;
