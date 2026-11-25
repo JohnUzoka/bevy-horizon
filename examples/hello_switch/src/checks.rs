@@ -15,6 +15,11 @@
 //! - upload: at frame 90 of the render world, 6000 `queue.write_texture` calls go to the GPU in
 //!   one submission, then the texture is read back and compared. Each write has its own staging
 //!   copy and barriers, as when a game uploads a large texture array layer by layer.
+//! - draws: at frame 150 of the render world, 20 frames go to the GPU back to back, nothing
+//!   pacing them (as with VSync off). Each starts with a compute pass that keeps the GPU busy, so
+//!   the CPU runs ahead, then 5000 `draw_indirect` calls in 20 submissions, then a
+//!   `multi_draw_indirect` and a `multi_draw_indexed_indirect` of over 5000 draws each. Every
+//!   draw covers its own texel; the last frame's target is read back and compared.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -26,9 +31,12 @@ use bevy::asset::{AssetLoader, LoadContext, LoadState};
 use bevy::prelude::*;
 use bevy::reflect::TypePath;
 use bevy::render::render_resource::{
-    BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Extent3d, MapMode, Origin3d, PollType, TexelCopyBufferInfo,
-    TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor, TextureDimension, TextureFormat,
-    TextureUsages,
+    BindGroupDescriptor, BindGroupEntry, BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites,
+    CommandEncoderDescriptor, ComputePassDescriptor, Extent3d, IndexFormat, LoadOp, MapMode, MultisampleState,
+    Operations, Origin3d, PollType, PrimitiveState, RawComputePipelineDescriptor, RawFragmentState,
+    RawRenderPipelineDescriptor, RawVertexState, RenderPassColorAttachment, RenderPassDescriptor, ShaderModuleDescriptor,
+    ShaderSource, StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, WgpuTextureView,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::{Render, RenderApp};
@@ -42,7 +50,7 @@ impl Plugin for ChecksPlugin {
             .add_systems(Startup, (start_asset_check, romfs_check))
             .add_systems(Update, (finish_asset_check, thread_check));
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            render_app.add_systems(Render, upload_check);
+            render_app.add_systems(Render, (upload_check, draws_check));
         }
     }
 }
@@ -376,5 +384,302 @@ fn upload_check(mut frame: Local<u32>, device: Res<RenderDevice>, queue: Res<Ren
         );
     } else {
         println!("[Check] upload: FAIL in frame {this_frame}, {wrong} of {} rows read back wrong ({ms:.1} ms)", UPLOAD_SIZE * UPLOAD_LAYERS);
+    }
+}
+
+const DRAWS_CHECK_FRAME: u32 = 150;
+/// Frames of the draws check, sent back to back.
+const DRAWS_FRAMES: u32 = 20;
+/// Single draws per frame, and draws in each multi-draw besides the few that test instances.
+const DRAWS_PER_KIND: u32 = 5000;
+/// The single draws go in submissions of this many, as a game's passes go in several.
+const DRAWS_PER_SUBMIT: u32 = 250;
+/// Iterations of the compute shader that starts each frame, so the GPU falls behind the CPU.
+const DRAWS_SPIN: u32 = 10_000_000;
+/// The target is DRAWS_SIZE texels square; the grids of draws are DRAWS_COLUMNS wide.
+const DRAWS_SIZE: u32 = 128;
+const DRAWS_COLUMNS: u32 = 125;
+
+const DRAWS_SHADER: &str = r#"
+@group(0) @binding(0) var<storage, read_write> spin_data: array<u32>;
+
+@compute @workgroup_size(1)
+fn spin() {
+    var x = spin_data[1];
+    for (var i = 0u; i < spin_data[0]; i++) {
+        x = x * 1664525u + 1013904223u;
+    }
+    spin_data[2] = x;
+}
+
+// Vertex v of a triangle list is a corner of a triangle in column v / 3 and row instance_index,
+// placed 0.1 into its texel with legs 1.5 long: it covers that texel's center and no other.
+@vertex
+fn vs(@builtin(vertex_index) v: u32, @builtin(instance_index) row: u32) -> @builtin(position) vec4<f32> {
+    var p = vec2<f32>(f32(v / 3u) + 0.1, f32(row) + 0.1);
+    let corner = v % 3u;
+    if corner == 1u {
+        p.x += 1.5;
+    }
+    if corner == 2u {
+        p.y += 1.5;
+    }
+    return vec4<f32>(p.x / 64.0 - 1.0, 1.0 - p.y / 64.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0);
+}
+"#;
+
+/// A frame's indirect records and the texels they cover.
+struct DrawRecords {
+    /// {vertex count, instance count, first vertex, first instance}, one `draw_indirect` each.
+    single: Vec<[u32; 4]>,
+    /// The same, for one `multi_draw_indirect`.
+    multi: Vec<[u32; 4]>,
+    /// {index count, instance count, first index, base vertex, first instance}, for one
+    /// `multi_draw_indexed_indirect` with an index buffer that holds 0, 1, 2, ...
+    indexed: Vec<[u32; 5]>,
+    covered: Vec<bool>,
+}
+
+impl DrawRecords {
+    fn new() -> Self {
+        let mut records = DrawRecords {
+            single: Vec::new(),
+            multi: Vec::new(),
+            indexed: Vec::new(),
+            covered: vec![false; (DRAWS_SIZE * DRAWS_SIZE) as usize],
+        };
+        // Each multi-draw starts with draws of no instances (rows 120 and 121 stay clear) between
+        // draws of several, which must each start again at their first instance.
+        for column in 0..DRAWS_SIZE {
+            let (instances, row) = if column % 2 == 0 { (0, 120) } else { (2, 125) };
+            records.multi.push([3, instances, 3 * column, row]);
+            records.cover(column, row, instances);
+            let (instances, row) = if column % 2 == 0 { (0, 121) } else { (3, 122) };
+            records.indexed.push(Self::indexed(column, instances, row));
+            records.cover(column, row, instances);
+        }
+        // Then a grid of draws of one instance each, rows 0-39, 40-79 and 80-119.
+        for i in 0..DRAWS_PER_KIND {
+            let (column, row) = (i % DRAWS_COLUMNS, i / DRAWS_COLUMNS);
+            records.single.push([3, 1, 3 * column, row]);
+            records.multi.push([3, 1, 3 * column, row + 40]);
+            records.indexed.push(Self::indexed(column, 1, row + 80));
+            records.cover(column, row, 1);
+            records.cover(column, row + 40, 1);
+            records.cover(column, row + 80, 1);
+        }
+        records
+    }
+
+    /// An indexed draw of a column: half its first vertex comes from the first index, the rest
+    /// from the base vertex.
+    fn indexed(column: u32, instances: u32, row: u32) -> [u32; 5] {
+        [3, instances, 3 * (column / 2), 3 * (column - column / 2), row]
+    }
+
+    fn cover(&mut self, column: u32, row: u32, instances: u32) {
+        for row in row..row + instances {
+            self.covered[(row * DRAWS_SIZE + column) as usize] = true;
+        }
+    }
+}
+
+fn draws_attachment(view: &WgpuTextureView, clear: bool) -> [Option<RenderPassColorAttachment<'_>>; 1] {
+    let load = if clear { LoadOp::Clear(Default::default()) } else { LoadOp::Load };
+    [Some(RenderPassColorAttachment {
+        view,
+        depth_slice: None,
+        resolve_target: None,
+        ops: Operations { load, store: StoreOp::Store },
+    })]
+}
+
+/// Frames of thousands of indirect draws and multi-draws of thousands, sent faster than the GPU
+/// runs them, as a game with VSync off sends its frames. Every draw covers one texel of a target;
+/// after the last frame the target is read back and compared with the texels the draws cover.
+fn draws_check(mut frame: Local<u32>, device: Res<RenderDevice>, queue: Res<RenderQueue>) {
+    let this_frame = *frame;
+    *frame += 1;
+    if this_frame != DRAWS_CHECK_FRAME {
+        return;
+    }
+    let device = device.wgpu_device();
+    let records = DrawRecords::new();
+    let buffer = |label: &str, usage: BufferUsages, words: &[u32]| {
+        let buffer = device.create_buffer(&BufferDescriptor {
+            label: Some(label),
+            size: (words.len() * 4) as u64,
+            usage: usage | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        queue.write_buffer(&buffer, 0, &bytes);
+        buffer
+    };
+    let spin_data = buffer("draws check spin", BufferUsages::STORAGE, &[DRAWS_SPIN, 1, 0, 0]);
+    let single = buffer("draws check single", BufferUsages::INDIRECT, records.single.as_flattened());
+    let multi = buffer("draws check multi", BufferUsages::INDIRECT, records.multi.as_flattened());
+    let indexed = buffer("draws check indexed", BufferUsages::INDIRECT, records.indexed.as_flattened());
+    let indices: Vec<u32> = (0..3 * DRAWS_SIZE).collect();
+    let index = buffer("draws check indices", BufferUsages::INDEX, &indices);
+
+    let module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("draws check"),
+        source: ShaderSource::Wgsl(DRAWS_SHADER.into()),
+    });
+    let spin = device.create_compute_pipeline(&RawComputePipelineDescriptor {
+        label: Some("draws check spin"),
+        layout: None,
+        module: &module,
+        entry_point: Some("spin"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let spin_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("draws check spin"),
+        layout: &spin.get_bind_group_layout(0),
+        entries: &[BindGroupEntry { binding: 0, resource: spin_data.as_entire_binding() }],
+    });
+    let format = TextureFormat::Rgba8Unorm;
+    let pipeline = device.create_render_pipeline(&RawRenderPipelineDescriptor {
+        label: Some("draws check"),
+        layout: None,
+        vertex: RawVertexState {
+            module: &module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: MultisampleState::default(),
+        fragment: Some(RawFragmentState {
+            module: &module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::ALL })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    let size = Extent3d { width: DRAWS_SIZE, height: DRAWS_SIZE, depth_or_array_layers: 1 };
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("draws check"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    let row = DRAWS_SIZE * 4;
+    let readback = device.create_buffer(&BufferDescriptor {
+        label: Some("draws check readback"),
+        size: u64::from(row * DRAWS_SIZE),
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let started = Instant::now();
+    let mut submissions = 0;
+    for _ in 0..DRAWS_FRAMES {
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("draws check spin") });
+        {
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor { label: None, timestamp_writes: None });
+            pass.set_pipeline(&spin);
+            pass.set_bind_group(0, &spin_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        queue.submit([encoder.finish()]);
+        submissions += 1;
+        for first in (0..DRAWS_PER_KIND).step_by(DRAWS_PER_SUBMIT as usize) {
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("draws check single") });
+            {
+                let attachments = draws_attachment(&view, first == 0);
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &attachments,
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&pipeline);
+                for i in first..(first + DRAWS_PER_SUBMIT).min(DRAWS_PER_KIND) {
+                    pass.draw_indirect(&single, u64::from(i) * 16);
+                }
+            }
+            queue.submit([encoder.finish()]);
+            submissions += 1;
+        }
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("draws check multi") });
+        {
+            let attachments = draws_attachment(&view, false);
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: None,
+                color_attachments: &attachments,
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.multi_draw_indirect(&multi, 0, records.multi.len() as u32);
+            pass.set_index_buffer(index.slice(..), IndexFormat::Uint32);
+            pass.multi_draw_indexed_indirect(&indexed, 0, records.indexed.len() as u32);
+        }
+        queue.submit([encoder.finish()]);
+        submissions += 1;
+    }
+    let submitted_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("draws check readback") });
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(DRAWS_SIZE) },
+        },
+        size,
+    );
+    queue.submit([encoder.finish()]);
+    readback.slice(..).map_async(MapMode::Read, |_| {});
+    if let Err(err) = device.poll(PollType::wait_indefinitely()) {
+        println!("[Check] draws: FAIL in frame {this_frame}, waiting for the GPU failed: {err}");
+        return;
+    }
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    let bytes = readback.slice(..).get_mapped_range();
+    let wrong: Vec<usize> = (0..records.covered.len())
+        .filter(|&texel| (bytes[texel * 4] == 0xff) != records.covered[texel] || ![0, 0xff].contains(&bytes[texel * 4]))
+        .collect();
+    let what = format!(
+        "{DRAWS_FRAMES} frames, each a busy compute pass, {DRAWS_PER_KIND} draw_indirect calls in {} submissions, a multi_draw_indirect of {} and a multi_draw_indexed_indirect of {}",
+        DRAWS_PER_KIND.div_ceil(DRAWS_PER_SUBMIT),
+        records.multi.len(),
+        records.indexed.len()
+    );
+    if wrong.is_empty() {
+        println!(
+            "[Check] draws: PASS in frame {this_frame}, {what}; {submissions} submissions took {submitted_ms:.1} ms, the GPU was done {ms:.1} ms after the first, and the target read back right"
+        );
+    } else {
+        let first: Vec<String> = wrong
+            .iter()
+            .take(8)
+            .map(|&texel| format!("({}, {})", texel % DRAWS_SIZE as usize, texel / DRAWS_SIZE as usize))
+            .collect();
+        println!(
+            "[Check] draws: FAIL in frame {this_frame}, {what}; {} of {} texels read back wrong, first (column, row) {} ({ms:.1} ms)",
+            wrong.len(),
+            records.covered.len(),
+            first.join(" ")
+        );
     }
 }

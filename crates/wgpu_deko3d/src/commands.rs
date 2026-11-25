@@ -488,12 +488,12 @@ impl hal::CommandEncoder for Encoder {
 
     unsafe fn draw_indirect(&mut self, buffer: &Buffer, offset: wgt::BufferAddress, draw_count: u32) {
         self.flush(GRAPHICS);
-        unsafe { ffi::dkp_draw_indirect(self.ptr(), false, buffer.address(offset), draw_count, 16) };
+        unsafe { ffi::dkp_draw_indirect(self.ptr(), false, buffer.address(offset), draw_count) };
     }
 
     unsafe fn draw_indexed_indirect(&mut self, buffer: &Buffer, offset: wgt::BufferAddress, draw_count: u32) {
         self.flush(GRAPHICS);
-        unsafe { ffi::dkp_draw_indirect(self.ptr(), true, buffer.address(offset), draw_count, 20) };
+        unsafe { ffi::dkp_draw_indirect(self.ptr(), true, buffer.address(offset), draw_count) };
     }
 
     unsafe fn begin_compute_pass(&mut self, desc: &hal::ComputePassDescriptor<QuerySet>) {

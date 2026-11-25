@@ -1487,16 +1487,30 @@ void dkp_draw_indexed(void *command, uint32_t indices, uint32_t instances, uint3
                         first_instance);
 }
 
-void dkp_draw_indirect(void *command, bool indexed, uint64_t address, uint32_t count, uint32_t stride) {
+// patches/deko3d/multi-draw.patch adds these; devkitPro's deko3d.h doesn't declare them.
+void dkCmdBufMultiDrawIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect, uint32_t drawCount);
+void dkCmdBufMultiDrawIndexedIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect, uint32_t drawCount);
+
+// `count` back-to-back DkDraw(Indexed)IndirectData records: wgpu's indirect draws and multi-draws
+// have no stride. deko3d's dkCmdBufDraw(Indexed)Indirect ends two gpfifo entries per draw (the
+// commands, then the record the draw macro reads as its parameters), so a multi-draw of thousands
+// filled the ring with them; the patch's multi-draw macro reads a batch of records in two entries.
+void dkp_draw_indirect(void *command, bool indexed, uint64_t address, uint32_t count) {
     Command *cmd = command;
     if (!require(cmd, cmd->in_pass && cmd->pipeline))
         return;
-    for (uint32_t i = 0; i < count && begin(cmd, 16); ++i, address += stride) {
+    // As the patch batches them: a method header counts at most 0x1fff words, the primitive and
+    // draw count included.
+    const uint32_t words = indexed ? 5 : 4, batch = (0x1fff - 2) / words;
+    while (count && begin(cmd, 16)) {
+        const uint32_t draws = count < batch ? count : batch;
         if (indexed)
-            dkCmdBufDrawIndexedIndirect(cmd->buffer, cmd->pipeline->primitive, address);
+            dkCmdBufMultiDrawIndexedIndirect(cmd->buffer, cmd->pipeline->primitive, address, draws);
         else
-            dkCmdBufDrawIndirect(cmd->buffer, cmd->pipeline->primitive, address);
-        cmd->entries += 2; // the draw, then its parameters (maxwell/gpu_3d_base.cpp)
+            dkCmdBufMultiDrawIndirect(cmd->buffer, cmd->pipeline->primitive, address, draws);
+        cmd->entries += 2;
+        address += (uint64_t)draws * words * sizeof(uint32_t);
+        count -= draws;
     }
 }
 

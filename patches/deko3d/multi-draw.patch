@@ -1,0 +1,175 @@
+deko3d draws a multi-draw only as one dkCmdBufDraw(Indexed)Indirect per draw, and each of those
+ends two gpfifo entries (maxwell/gpu_3d_base.cpp): the commands so far, then the draw's record,
+which the GPU reads from the indirect buffer as the rest of the draw macro's parameters. A
+multi-draw of 5000 put 10000 entries through a ring of 0x800. With this patch,
+dkCmdBufMultiDrawIndirect and dkCmdBufMultiDrawIndexedIndirect hand the whole batch of records to
+new draw macros (DrawMulti, DrawIndexedMulti) that loop over them, two entries per up to 2047
+(1637 indexed) draws, as Mesa's NVK does before Turing. Every draw sets gl_BaseVertex and
+gl_BaseInstance; a draw of no instances draws nothing.
+
+diff --git a/include/deko3d.h b/include/deko3d.h
+--- a/include/deko3d.h
++++ b/include/deko3d.h
+@@ -1307,6 +1307,10 @@
+ void dkCmdBufDrawIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect);
+ void dkCmdBufDrawIndexed(DkCmdBuf obj, DkPrimitive prim, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
+ void dkCmdBufDrawIndexedIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect);
++// bevy-horizon: drawCount back-to-back DkDrawIndirectData (DkDrawIndexedIndirectData) records,
++// in two gpfifo entries per 2047 (1637) draws rather than two per draw.
++void dkCmdBufMultiDrawIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect, uint32_t drawCount);
++void dkCmdBufMultiDrawIndexedIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect, uint32_t drawCount);
+ void dkCmdBufDispatchCompute(DkCmdBuf obj, uint32_t numGroupsX, uint32_t numGroupsY, uint32_t numGroupsZ);
+ void dkCmdBufDispatchComputeIndirect(DkCmdBuf obj, DkGpuAddr indirect);
+ void dkCmdBufPushConstants(DkCmdBuf obj, DkGpuAddr uboAddr, uint32_t uboSize, uint32_t offset, uint32_t size, const void* data);
+diff --git a/source/maxwell/draw.mme b/source/maxwell/draw.mme
+--- a/source/maxwell/draw.mme
++++ b/source/maxwell/draw.mme
+@@ -100,3 +100,102 @@
+ 	0 to mem
+ 	*DrawBaseVertex'0 to addr'mem # just in case reset this
+ 	VertexIdBase'0 to addr'mem    # and this too
++
++# bevy-horizon: multi-draws. The caller sends the primitive and the draw count, then the draws'
++# records straight from the indirect buffer, so a multi-draw takes two gpfifo entries rather than
++# two per draw. Every draw sets gl_BaseInstance (and gl_BaseVertex) in the driver constbuf, which
++# the macro resets to 0 at the end; the caller used SelectDriverConstbuf. A draw of no instances
++# draws nothing, and each draw starts again at its first instance.
++
++# Non-indexed multi-draw
++# Arguments:
++# - 0: Primitive
++# - 1: Draw count (at least 1)
++# - then per draw (DkDrawIndirectData): vertex count, instance count, first vertex, first instance
++DrawMulti::
++	fetch r3 # Fetch draw count
++	1 to r2 # r2 = 1 (needed for later)
++.nextDraw
++	fetch r6 # Fetch vertex count
++	fetch r7 # Fetch instance count
++	DrawArraysFirst'0 to addr; fetch mem # Fetch first vertex
++	DrawBaseInstance'0 to addr; fetch r5 # Fetch base instance
++	r5 to mem # Update DrawBaseInstance
++	LoadConstbufOffset'1 to addr
++	0x004 to mem
++	r5 to mem # Update gl_BaseInstance
++	bz r7 .skipDraw # Skip the draw if its instance count is zero
++	dec r3 to r3 # (delay slot) one draw fewer to go
++
++.drawLoop
++	# Draw current instance
++	VertexBeginGl'0 to addr
++	r1 to mem
++	DrawArraysCount'0 to addr
++	r6 to mem
++	VertexEndGl'0 to addr'mem
++
++	# Decrement instance counter and loop if there are more instances to draw
++	dec r7 to r7
++	bnz r7 .drawLoop
++	ei VertexBeginGlInstanceNext_Shift:r1 0:r2 2 to r1 # i.e. r1 |= 1<<VertexBeginGlInstanceNext_Shift (and clear InstanceCont)
++	ei VertexBeginGlInstanceNext_Shift:r1 0:rz 2 to r1 # The next draw starts again at instance 0
++
++.skipDraw
++	bnz r3 .nextDraw
++	LoadConstbufOffset'1 to addr # (delay slot)
++
++	# We're done; now reset gl_BaseInstance back to 0
++	*0x004 to mem
++	0 to mem
++
++# Indexed multi-draw
++# Arguments:
++# - 0: Primitive
++# - 1: Draw count (at least 1)
++# - then per draw (DkDrawIndexedIndirectData): index count, instance count, first index,
++#   vertex offset, first instance
++DrawIndexedMulti::
++	fetch r2 # Fetch draw count
++.nextDraw
++	fetch r6 # Fetch index count
++	fetch r7 # Fetch instance count
++	DrawElementsFirst'0 to addr; fetch mem # Fetch first index
++	fetch r3 # Fetch vertex offset
++	DrawBaseVertex'1 to addr; fetch r4 # Fetch base instance
++	r3 to mem # Update DrawBaseVertex
++	r4 to mem # Update DrawBaseInstance
++	VertexIdBase'0 to addr
++	r3 to mem # Update VertexIdBase
++	LoadConstbufOffset'1 to addr
++	0x000 to mem
++	r3 to mem # Update gl_BaseVertex
++	r4 to mem # Update gl_BaseInstance
++	bz r7 .skipDraw # Skip the draw if its instance count is zero
++	dec r2 to r2 # (delay slot) one draw fewer to go
++	1 to r3 # r3 = 1 (needed for later; the vertex offset is no longer needed)
++
++.drawLoop
++	# Draw current instance
++	VertexBeginGl'0 to addr
++	r1 to mem
++	DrawElementsCount'0 to addr
++	r6 to mem
++	VertexEndGl'0 to addr'mem
++
++	# Decrement instance counter and loop if there are more instances to draw
++	dec r7 to r7
++	bnz r7 .drawLoop
++	ei VertexBeginGlInstanceNext_Shift:r1 0:r3 2 to r1 # i.e. r1 |= 1<<VertexBeginGlInstanceNext_Shift (and clear InstanceCont)
++	ei VertexBeginGlInstanceNext_Shift:r1 0:rz 2 to r1 # The next draw starts again at instance 0
++
++.skipDraw
++	bnz r2 .nextDraw
++	LoadConstbufOffset'1 to addr # (delay slot)
++
++	# We're done; now reset gl_BaseVertex and gl_BaseInstance back to 0
++	0x000 to mem
++	0 to mem
++	0 to mem
++	*DrawBaseVertex'0 to addr'mem # just in case reset this
++	VertexIdBase'0 to addr'mem    # and this too
+diff --git a/source/maxwell/gpu_3d_base.cpp b/source/maxwell/gpu_3d_base.cpp
+--- a/source/maxwell/gpu_3d_base.cpp
++++ b/source/maxwell/gpu_3d_base.cpp
+@@ -583,3 +583,42 @@
+ 	w.split(CtrlCmdGpfifoEntry::NoPrefetch);
+ 	w.addRaw(indirect, 5, CtrlCmdGpfifoEntry::AutoKick);
+ }
++
++// bevy-horizon: multi-draws. The draw macro reads the records straight from the indirect buffer,
++// so each batch of draws takes two gpfifo entries (the commands, then the records), where a
++// dkCmdBufDraw(Indexed)Indirect per draw takes two per draw.
++static void multiDrawIndirect(DkCmdBuf obj, uint32_t macro, uint32_t recordWords, DkPrimitive prim, DkGpuAddr indirect, uint32_t drawCount)
++{
++	// A method header counts at most 0x1FFF words: the primitive, the draw count, and the records.
++	const uint32_t maxDraws = (0x1FFF - 2) / recordWords;
++	while (drawCount)
++	{
++		const uint32_t numDraws = drawCount < maxDraws ? drawCount : maxDraws;
++		CmdBufWriter w{obj};
++		w.reserve(4);
++
++		w << MacroInline(SelectDriverConstbuf, 0); // needed for updating gl_BaseVertex/gl_BaseInstance in the driver constbuf
++		w << CmdList<3>{ MakeCmdHeader(IncreaseOnce, 2 + recordWords*numDraws, Subchannel3D, macro), prim, numDraws };
++		w.split(CtrlCmdGpfifoEntry::NoPrefetch);
++		w.addRaw(indirect, recordWords*numDraws, CtrlCmdGpfifoEntry::AutoKick);
++
++		indirect += recordWords*numDraws*sizeof(uint32_t);
++		drawCount -= numDraws;
++	}
++}
++
++void dkCmdBufMultiDrawIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect, uint32_t drawCount)
++{
++	DK_ENTRYPOINT(obj);
++	DK_DEBUG_BAD_INPUT(indirect == DK_GPU_ADDR_INVALID);
++	DK_DEBUG_DATA_ALIGN(indirect, 4);
++	multiDrawIndirect(obj, MmeMacroDrawMulti, sizeof(DkDrawIndirectData)/sizeof(uint32_t), prim, indirect, drawCount);
++}
++
++void dkCmdBufMultiDrawIndexedIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect, uint32_t drawCount)
++{
++	DK_ENTRYPOINT(obj);
++	DK_DEBUG_BAD_INPUT(indirect == DK_GPU_ADDR_INVALID);
++	DK_DEBUG_DATA_ALIGN(indirect, 4);
++	multiDrawIndirect(obj, MmeMacroDrawIndexedMulti, sizeof(DkDrawIndexedIndirectData)/sizeof(uint32_t), prim, indirect, drawCount);
++}

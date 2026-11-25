@@ -184,7 +184,7 @@ unsafe extern "C" {
     pub fn dkp_upload(cmd: *mut c_void, data: *const c_void, size: u32) -> u64;
     pub fn dkp_draw(cmd: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32);
     pub fn dkp_draw_indexed(cmd: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32);
-    pub fn dkp_draw_indirect(cmd: *mut c_void, indexed: bool, address: u64, count: u32, stride: u32);
+    pub fn dkp_draw_indirect(cmd: *mut c_void, indexed: bool, address: u64, count: u32);
     pub fn dkp_bind_compute(cmd: *mut c_void, pipeline: *mut c_void);
     pub fn dkp_dispatch(cmd: *mut c_void, x: u32, y: u32, z: u32);
     pub fn dkp_dispatch_indirect(cmd: *mut c_void, address: u64);

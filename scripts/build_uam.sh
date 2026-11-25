@@ -27,7 +27,10 @@ set -euo pipefail
 #       dstAlphaBlendFactor, not dstColorBlendFactor (devkitPro/deko3d#27);
 #     - release-reports.patch: the release library hands its fatal errors and warnings (a GPU
 #       fault's details, a failed kickoff's result) to dkBhReport, which the backend's bridge
-#       writes to sdmc:/switch/deko3d.log; upstream's release library aborts without a word.
+#       writes to sdmc:/switch/deko3d.log; upstream's release library aborts without a word;
+#     - multi-draw.patch: dkCmdBufMultiDraw(Indexed)Indirect draw a batch of indirect records
+#       with new draw macros that loop over them, two gpfifo entries per batch rather than per
+#       draw.
 #   Its build generates headers with dekomme/dekodef (https://github.com/fincs/dekotools), which
 #   devkitPro doesn't package; they are built for the container from deko3d/src/dekotools.
 IMAGE_NAME="bevy-horizon-uam:local"
@@ -40,7 +43,8 @@ PATCH="$WORKSPACE_DIR/patches/uam/console-library.patch"
 UAM_TAG="v1.1.0"
 DEKO3D_SRC_DIR="$OUT_DIR/src/deko3d"
 DEKO3D_PATCHES=("$WORKSPACE_DIR/patches/deko3d/alpha-dst-blend-factor.patch"
-                "$WORKSPACE_DIR/patches/deko3d/release-reports.patch")
+                "$WORKSPACE_DIR/patches/deko3d/release-reports.patch"
+                "$WORKSPACE_DIR/patches/deko3d/multi-draw.patch")
 DEKO3D_TAG="v0.5.0"
 DEKOTOOLS_SRC_DIR="$OUT_DIR/src/dekotools"
 # dekotools has no tags; this is its master, whose only change since 2019 is an include newer
