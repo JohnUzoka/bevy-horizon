@@ -134,6 +134,7 @@ A straight line through these puts about 17 ms of the 33.8 on the pixels and abo
 - **Not supported:** atomic storage textures, binding arrays, pipeline-statistics queries, multiview, conservative rasterization, rendering into a 3D texture's slice, gaps in a pass's color attachments, dual-source blending, `multi_draw_indirect_count`.
 - **Bevy 0.19 only:** the `deko3d` feature turns on `render`, which is for Bevy 0.19. A wgpu 30 game vendors the backend ([Using it from a wgpu 30 game](#using-it-from-a-wgpu-30-game)).
 - **The swapchain presents with Fifo only.** The surface reports no other present mode.
+- **Bevy's GPU culling is off; its mesh preprocessing stays on the GPU.** Bevy 0.19 turns on GPU culling only with at least 12 storage textures per shader stage (its depth downsampling for occlusion culling binds 12); deko3d binds 8 images per stage (`DK_NUM_IMAGE_BINDINGS`), so the backend reports 8 and Bevy logs `Some GPU preprocessing are limited on this device` and runs in preprocessing-only mode. render_check still draws all 24 cubes with mesh preprocessing on the GPU.
 
 Open questions, not measured yet:
 
