@@ -31,6 +31,12 @@ This page is for anyone who wants a Bevy game to draw through [deko3d](https://g
 
 **deko3d fix.** devkitPro's deko3d 0.5.0 writes a blend state's alpha destination factor from its color one ([devkitPro/deko3d#27](https://github.com/devkitPro/deko3d/issues/27), open and unfixed on master), so a blend whose two differ, such as color blended over while alpha keeps the destination's, came out wrong. `scripts/build_uam.sh` builds v0.5.0 with the one-line fix, and its debug library, under `_bh` names so the link can't pick devkitPro's copies in `libnx/lib`.
 
+## wgpu versions
+
+One backend source serves two wgpu releases. `crates/wgpu_deko3d/Cargo.toml`, which bevy-horizon builds, is on wgpu 29 (Bevy 0.19). `Cargo.wgpu-30.toml` is the same package on wgpu, wgpu-hal, naga and wgpu-types 30.0.1 with the `wgpu-30` feature on; that feature selects the few places where wgpu-hal 30 differs (renamed dispatches, ray-tracing pipelines this backend reports unsupported, a shared submit fence, `Queue::wait_for_idle`, per-format surface color spaces, gaps in a pipeline's vertex buffers). Cargo never reads that manifest here; enabling `wgpu-30` with the wgpu 29 manifest doesn't build.
+
+A game on wgpu 30 vendors the crate: `scripts/vendor_deko3d.sh <game checkout>` replaces `<game>/third_party/wgpu_deko3d` with `src/`, `native/`, `build.rs` and the wgpu 30 manifest as its `Cargo.toml`, plus a README naming the commit it came from. Change the backend here and run the script again rather than editing the copy. The game patches crates.io's wgpu-hal 30 with the same two accessors as `patches/wgpu-hal`, and builds with `BEVY_HORIZON_UAM_LIB` pointing at this repository's `deko3d/lib`.
+
 ## Limits
 
 - **A depth texture one shader both compares against and reads directly fails pipeline creation,** as does reading depth in a module that passes a depth texture to a function: GLSL would need two sampler types for one binding. None of hello_switch's pipelines do either.

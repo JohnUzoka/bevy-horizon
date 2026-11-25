@@ -80,7 +80,14 @@ impl Surface {
         let (mut width, mut height) = (0, 0);
         let rc = unsafe { ffi::nwindowGetDimensions(self.window.as_ptr(), &mut width, &mut height) };
         hal::SurfaceCapabilities {
+            #[cfg(not(feature = "wgpu-30"))]
             formats: FORMATS.to_vec(),
+            // wgpu-hal 30 lists each format's color spaces; the compositor shows sRGB.
+            #[cfg(feature = "wgpu-30")]
+            formats: FORMATS
+                .iter()
+                .map(|&format| wgt::SurfaceFormatCapabilities { format, color_spaces: wgt::SurfaceColorSpaces::SRGB })
+                .collect(),
             maximum_frame_latency: 1..=2,
             current_extent: (rc == 0 && width > 0).then_some(wgt::Extent3d { width, height, depth_or_array_layers: 1 }),
             usage: wgt::TextureUses::COLOR_TARGET | wgt::TextureUses::COPY_SRC | wgt::TextureUses::COPY_DST,
