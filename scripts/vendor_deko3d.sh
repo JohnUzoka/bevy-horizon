@@ -26,9 +26,10 @@ cp "$SOURCE/Cargo.wgpu-30.toml" "$DEST/Cargo.toml"
 cat > "$DEST/README.md" <<EOF
 # wgpu_deko3d
 
-Generated from bevy-horizon's \`crates/wgpu_deko3d\` (https://github.com/JohnUzoka/bevy-horizon,
-commit $COMMIT) by its \`scripts/vendor_deko3d.sh\`. Do not edit these files by hand: change the
-backend in bevy-horizon and run the script again.
+Generated from bevy-horizon's \`crates/wgpu_deko3d\` (https://github.com/JohnUzoka/bevy-horizon)
+by its \`scripts/vendor_deko3d.sh\`, at commit
+$COMMIT.
+Do not edit these files by hand: change the backend in bevy-horizon and run the script again.
 
 A wgpu-hal backend on deko3d, the Nintendo Switch's own GPU API; \`wgpu_deko3d::instance()\` makes a
 \`wgpu::Instance\` on it. Building it for the Switch needs \`BEVY_HORIZON_UAM_LIB\` set to a directory
