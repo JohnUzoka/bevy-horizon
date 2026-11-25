@@ -178,6 +178,21 @@ macro_rules! unsupported {
     };
 }
 
+// wgpu-hal 30 renamed dispatch and dispatch_indirect to dispatch_workgroups(_indirect).
+macro_rules! dispatches {
+    ($dispatch:ident, $indirect:ident) => {
+        unsafe fn $dispatch(&mut self, count: [u32; 3]) {
+            self.flush(DISPATCH);
+            unsafe { ffi::dkp_dispatch(self.ptr(), count[0], count[1], count[2]) };
+        }
+
+        unsafe fn $indirect(&mut self, buffer: &Buffer, offset: wgt::BufferAddress) {
+            self.flush(DISPATCH);
+            unsafe { ffi::dkp_dispatch_indirect(self.ptr(), buffer.address(offset)) };
+        }
+    };
+}
+
 /// A texture copy region in deko3d's terms: layers (or 3D slices) are depth.
 fn region(texture: &Texture, base: &hal::TextureCopyBase, size: &hal::CopyExtent) -> ffi::Region {
     let z = if texture.dimension() == wgt::TextureDimension::D3 { base.origin.z } else { base.array_layer };
@@ -495,15 +510,10 @@ impl hal::CommandEncoder for Encoder {
         self.state.textures_dirty[DISPATCH] = true;
     }
 
-    unsafe fn dispatch(&mut self, count: [u32; 3]) {
-        self.flush(DISPATCH);
-        unsafe { ffi::dkp_dispatch(self.ptr(), count[0], count[1], count[2]) };
-    }
-
-    unsafe fn dispatch_indirect(&mut self, buffer: &Buffer, offset: wgt::BufferAddress) {
-        self.flush(DISPATCH);
-        unsafe { ffi::dkp_dispatch_indirect(self.ptr(), buffer.address(offset)) };
-    }
+    #[cfg(not(feature = "wgpu-30"))]
+    dispatches!(dispatch, dispatch_indirect);
+    #[cfg(feature = "wgpu-30")]
+    dispatches!(dispatch_workgroups, dispatch_workgroups_indirect);
 
     unsafe fn build_acceleration_structures<'a, T>(&mut self, _count: u32, _descriptors: T)
     where
@@ -523,5 +533,13 @@ impl hal::CommandEncoder for Encoder {
         fn read_acceleration_structure_compact_size(&mut self, _structure: &Unsupported, _buf: &Buffer);
         fn copy_acceleration_structure_to_acceleration_structure(&mut self, _src: &Unsupported, _dst: &Unsupported, _copy: wgt::AccelerationStructureCopy);
         fn set_acceleration_structure_dependencies(_command_buffers: &[&CommandBuffer], _dependencies: &[&Unsupported]);
+    }
+
+    #[cfg(feature = "wgpu-30")]
+    unsupported! {
+        fn begin_ray_tracing_pass(&mut self, _desc: &hal::RayTracingPassDescriptor);
+        fn end_ray_tracing_pass(&mut self);
+        fn set_ray_tracing_pipeline(&mut self, _pipeline: &Unsupported);
+        fn trace_rays<'a>(&mut self, _count: [u32; 3], _ray_generation: hal::PipelineGroupData<'a, Buffer>, _miss: hal::PipelineGroupData<'a, Buffer>, _intersection: hal::PipelineGroupData<'a, Buffer>);
     }
 }

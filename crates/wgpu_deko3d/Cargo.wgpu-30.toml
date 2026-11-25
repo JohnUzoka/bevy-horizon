@@ -1,0 +1,21 @@
+# The manifest for wgpu 30. scripts/vendor_deko3d.sh installs it as Cargo.toml in a game's
+# third_party/wgpu_deko3d; bevy-horizon itself builds Cargo.toml, on wgpu 29. The sources are shared:
+# the `wgpu-30` feature selects the few places where wgpu-hal 30's API differs.
+[package]
+name = "wgpu_deko3d"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A wgpu-hal backend on deko3d, the Nintendo Switch's own GPU API"
+
+[features]
+default = ["wgpu-30"]
+wgpu-30 = []
+
+[dependencies]
+log = "0.4"
+naga = { version = "30.0.1", features = ["glsl-out"] }
+raw-window-handle = { version = "0.6", default-features = false }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl"] }
+wgpu-hal = "30.0.1"
+wgpu-types = "30.0.1"

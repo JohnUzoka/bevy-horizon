@@ -373,6 +373,8 @@ impl hal::Api for Api {
     type ComputePipeline = ComputePipeline;
     type PipelineCache = Unsupported;
     type AccelerationStructure = Unsupported;
+    #[cfg(feature = "wgpu-30")]
+    type RayTracingPipeline = Unsupported;
 }
 
 macro_rules! dyn_resources {
@@ -398,6 +400,8 @@ dyn_resources! {
 
 impl hal::DynPipelineCache for Unsupported {}
 impl hal::DynAccelerationStructure for Unsupported {}
+#[cfg(feature = "wgpu-30")]
+impl hal::DynRayTracingPipeline for Unsupported {}
 
 impl hal::Instance for Instance {
     type A = Api;
@@ -438,7 +442,12 @@ impl hal::Instance for Instance {
                 backend: <Api as hal::Api>::VARIANT,
                 subgroup_min_size: 0,
                 subgroup_max_size: 0,
+                #[cfg(not(feature = "wgpu-30"))]
                 transient_saves_memory: false,
+                #[cfg(feature = "wgpu-30")]
+                transient_saves_memory: Some(false),
+                #[cfg(feature = "wgpu-30")]
+                limit_bucket: None,
             },
             features: FEATURES,
             capabilities: hal::Capabilities {
@@ -449,6 +458,12 @@ impl hal::Instance for Instance {
                     uniform_bounds_check_alignment: wgt::BufferSize::MIN,
                     raw_tlas_instance_size: 0,
                     ray_tracing_scratch_buffer_alignment: 1,
+                    #[cfg(feature = "wgpu-30")]
+                    ray_tracing_pipeline_group_data_size: 0,
+                    #[cfg(feature = "wgpu-30")]
+                    ray_tracing_pipeline_group_data_alignment: 0,
+                    #[cfg(feature = "wgpu-30")]
+                    ray_tracing_pipeline_data_offset_alignment: 0,
                 },
                 downlevel: wgt::DownlevelCapabilities {
                     flags: downlevel,
@@ -505,10 +520,16 @@ fn synchronize_device_memory() {
     std::sync::atomic::fence(Ordering::SeqCst);
 }
 
+/// The fence `Queue::submit` signals: wgpu-hal 30 takes it shared (fences synchronize themselves).
+#[cfg(not(feature = "wgpu-30"))]
+type SignalFence<'a> = &'a mut Fence;
+#[cfg(feature = "wgpu-30")]
+type SignalFence<'a> = &'a Fence;
+
 impl hal::Queue for Context {
     type A = Api;
 
-    unsafe fn submit(&self, commands: &[&CommandBuffer], _surfaces: &[&SurfaceTexture], (fence, value): (&mut Fence, u64)) -> DeviceResult<()> {
+    unsafe fn submit(&self, commands: &[&CommandBuffer], _surfaces: &[&SurfaceTexture], (fence, value): (SignalFence<'_>, u64)) -> DeviceResult<()> {
         self.check_alive()?;
         let raw: Vec<*const c_void> = commands.iter().map(|cmd| cmd.ptr().cast_const()).collect();
         // The native queue signals its fence and flushes, but does not wait. Core retains all
@@ -528,6 +549,15 @@ impl hal::Queue for Context {
     unsafe fn get_timestamp_period(&self) -> f32 {
         // deko3d's GPU timestamps: dkTimestampToNs(ts) = ts * 625 / 384.
         625.0 / 384.0
+    }
+
+    #[cfg(feature = "wgpu-30")]
+    unsafe fn wait_for_idle(&self) -> DeviceResult<()> {
+        self.check_alive()?;
+        if !unsafe { ffi::dkp_wait_idle(self.ptr()) } {
+            return Err(self.lose());
+        }
+        Ok(())
     }
 }
 
@@ -880,6 +910,9 @@ impl hal::Device for Context {
         }
 
         for (index, buffer) in vertex_buffers.iter().enumerate() {
+            // wgpu-hal 30 leaves unused slots as gaps: `None`, which reads nothing.
+            #[cfg(feature = "wgpu-30")]
+            let Some(buffer) = buffer else { continue };
             native.strides[index] = buffer.array_stride as u32;
             native.divisors[index] = u32::from(buffer.step_mode == wgt::VertexStepMode::Instance);
             for attribute in buffer.attributes {
@@ -960,6 +993,19 @@ impl hal::Device for Context {
     }
     unsafe fn destroy_pipeline_cache(&self, cache: Unsupported) {
         match cache {}
+    }
+
+    #[cfg(feature = "wgpu-30")]
+    unsafe fn create_ray_tracing_pipeline(&self, _: &hal::RayTracingPipelineDescriptor<'_, PipelineLayout, ShaderModule, Unsupported>) -> Result<Unsupported, hal::PipelineError> {
+        Err(unsupported("ray tracing pipeline creation").into())
+    }
+    #[cfg(feature = "wgpu-30")]
+    unsafe fn destroy_ray_tracing_pipeline(&self, pipeline: Unsupported) {
+        match pipeline {}
+    }
+    #[cfg(feature = "wgpu-30")]
+    unsafe fn get_raytracing_pipeline_group_data(&self, pipeline: &Unsupported, _: std::ops::Range<u32>) -> DeviceResult<Vec<u8>> {
+        match *pipeline {}
     }
 
     unsafe fn create_query_set(&self, desc: &wgt::QuerySetDescriptor<hal::Label<'_>>) -> DeviceResult<QuerySet> {

@@ -28,6 +28,12 @@ This page is for anyone who wants a Bevy game to draw through [deko3d](https://g
 
 **UAM fixes.** Upstream UAM read an instruction's scheduling data before setting it, so stall counts depended on heap contents and the console's output differed from the host tool's; ended a block with a stall of 1 after an instruction that sets a barrier, where Mesa uses 2; and dual-issued instructions, which Mesa never does on GM107 and which has been reported to corrupt lighting. With the patch, the console and a host build of the same source produce identical bytes.
 
+## wgpu versions
+
+One backend source serves two wgpu releases. `crates/wgpu_deko3d/Cargo.toml`, which bevy-horizon builds, is on wgpu 29 (Bevy 0.19). `Cargo.wgpu-30.toml` is the same package on wgpu, wgpu-hal, naga and wgpu-types 30.0.1 with the `wgpu-30` feature on; that feature selects the few places where wgpu-hal 30 differs (renamed dispatches, ray-tracing pipelines this backend reports unsupported, a shared submit fence, `Queue::wait_for_idle`, per-format surface color spaces, gaps in a pipeline's vertex buffers). Cargo never reads that manifest here; enabling `wgpu-30` with the wgpu 29 manifest doesn't build.
+
+A game on wgpu 30 vendors the crate: `scripts/vendor_deko3d.sh <game checkout>` replaces `<game>/third_party/wgpu_deko3d` with `src/`, `native/`, `build.rs` and the wgpu 30 manifest as its `Cargo.toml`, plus a README naming the commit it came from. Change the backend here and run the script again rather than editing the copy. The game patches crates.io's wgpu-hal 30 with the same two accessors as `patches/wgpu-hal`, and builds with `BEVY_HORIZON_UAM_LIB` pointing at this repository's `deko3d/lib`.
+
 ## Limits
 
 - **A depth texture one shader both compares against and reads directly fails pipeline creation,** as does reading depth in a module that passes a depth texture to a function: GLSL would need two sampler types for one binding. None of hello_switch's pipelines do either.

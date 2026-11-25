@@ -1126,6 +1126,21 @@ done:
     return ok;
 }
 
+// Blocks until the queue has run everything submitted to it, presents included.
+bool dkp_wait_idle(void *ptr) {
+    Context *ctx = ptr;
+    if (!ctx)
+        return false;
+    mutexLock(&ctx->queue_lock);
+    bool ok = queue_healthy_locked(ctx);
+    if (ok) {
+        dkQueueWaitIdle(ctx->queue);
+        ok = queue_healthy_locked(ctx);
+    }
+    mutexUnlock(&ctx->queue_lock);
+    return ok;
+}
+
 // Render passes and state
 
 void dkp_pass(void *command, const DkpPassDesc *desc) {

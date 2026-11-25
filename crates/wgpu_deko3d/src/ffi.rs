@@ -166,6 +166,7 @@ unsafe extern "C" {
     pub fn dkp_fence_completed(fence: *mut c_void, completed: *mut u64) -> bool;
     pub fn dkp_fence_wait(fence: *mut c_void, value: u64, timeout_ns: i64) -> i32;
     pub fn dkp_submit(ctx: *mut c_void, commands: *const *const c_void, count: usize, fence: *mut c_void, value: u64) -> bool;
+    pub fn dkp_wait_idle(ctx: *mut c_void) -> bool;
 
     pub fn dkp_pass(cmd: *mut c_void, desc: *const PassDesc);
     pub fn dkp_end_pass(cmd: *mut c_void);

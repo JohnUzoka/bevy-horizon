@@ -12,3 +12,7 @@ raw-window-handle = { version = "0.6", default-features = false }
 wgpu = { version = "29.0.4", default-features = false, features = ["std", "parking_lot", "wgsl"] }
 wgpu-hal = "29.0.4"
 wgpu-types = "29.0.4"
+
+[features]
+# wgpu-hal 30's API; only with Cargo.wgpu-30.toml's dependencies (scripts/vendor_deko3d.sh).
+wgpu-30 = []
