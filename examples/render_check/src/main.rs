@@ -19,8 +19,9 @@
 //! the log tells a failing copy from a failing screenshot. `no_screenshot` skips both, to tell
 //! whether reading back is what stops the GPU; (A) still takes a screenshot.
 //!
-//! At startup it checks that NVK's error messages reach log.txt (`messenger_self_test`), and it
-//! logs the first frames one by one, so a log cut short shows how far rendering got.
+//! At startup it checks that NVK's error messages reach log.txt (`messenger_self_test`, with the
+//! `vulkan` feature), and it logs the first frames one by one, so a log cut short shows how far
+//! rendering got. The `deko3d` feature draws through deko3d instead (docs/deko3d.md).
 //!
 //! The viewport tiles with per-camera UI follow Bevy's `split_screen` example, and the depth-test
 //! material follows its `extended_material` and `clustered_decals` examples
@@ -193,10 +194,23 @@ fn main() {
     }
     let validation_on = flags.contains(InstanceFlags::VALIDATION_INDIRECT_CALL)
         && (cfg!(not(target_os = "horizon")) || flags.contains(InstanceFlags::VALIDATION));
-    println!(
-        "[Init] wgpu indirect-call validation: {}",
-        if validation_on { "on" } else { "off" }
-    );
+    // With `deko3d`, bevy_horizon makes the device, so the flags don't reach it.
+    #[cfg(all(target_os = "horizon", feature = "deko3d"))]
+    let render_creation = {
+        println!(
+            "[Init] rendering through deko3d; wgpu indirect-call validation: off{}",
+            if validation_on { " (options.txt asks for it, which the deko3d device doesn't take)" } else { "" }
+        );
+        bevy_horizon::deko3d::render_creation()
+    };
+    #[cfg(not(all(target_os = "horizon", feature = "deko3d")))]
+    let render_creation = {
+        println!(
+            "[Init] wgpu indirect-call validation: {}",
+            if validation_on { "on" } else { "off" }
+        );
+        wgpu_settings.into()
+    };
 
     let mut app = App::new();
     app.add_plugins(
@@ -219,7 +233,7 @@ fn main() {
                 ..default()
             })
             .set(RenderPlugin {
-                render_creation: wgpu_settings.into(),
+                render_creation,
                 ..default()
             }),
     );
@@ -453,7 +467,7 @@ fn log_renderer(
             "GPU compute (Bevy's default)"
         }
     );
-    #[cfg(target_os = "horizon")]
+    #[cfg(all(target_os = "horizon", feature = "vulkan"))]
     if let Some(device) = device {
         messenger_self_test(&device);
     }
@@ -465,7 +479,7 @@ fn log_renderer(
 /// (`vk_errorf`). Asking about an external memory handle type NVK doesn't know, a D3D11 texture,
 /// gets one such error (mesa `src/nouveau/vulkan/nvk_image.c`,
 /// `nvk_GetPhysicalDeviceImageFormatProperties2`) and changes nothing.
-#[cfg(target_os = "horizon")]
+#[cfg(all(target_os = "horizon", feature = "vulkan"))]
 fn messenger_self_test(device: &RenderDevice) {
     use ash::vk;
 

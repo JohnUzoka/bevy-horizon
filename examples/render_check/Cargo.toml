@@ -24,10 +24,17 @@ bevy = { version = "0.19", default-features = false, features = [
     "ktx2",
     "zstd_rust",
 ] }
-bevy_horizon = { path = "../../crates/bevy_horizon", features = ["vulkan", "fps_overlay", "render"] }
+bevy_horizon = { path = "../../crates/bevy_horizon", features = ["fps_overlay", "render"] }
 
 # For the debug messenger self-test, which asks NVK a question directly. Neither adds a feature
 # Bevy and wgpu-hal don't already turn on, so nothing else is rebuilt for this crate.
 [target.'cfg(target_os = "horizon")'.dependencies]
-ash = { version = "0.38", default-features = false, features = ["debug", "std"] }
-wgpu = { version = "29", default-features = false }
+ash = { version = "0.38", default-features = false, features = ["debug", "std"], optional = true }
+wgpu = { version = "29", default-features = false, optional = true }
+
+[features]
+default = ["vulkan"]
+# Links NVK, so bevy_render draws through wgpu's Vulkan backend, and runs the messenger self-test.
+vulkan = ["bevy_horizon/vulkan", "dep:ash", "dep:wgpu"]
+# Draws through deko3d instead (docs/deko3d.md): FEATURES=deko3d scripts/build_example.sh render_check
+deko3d = ["bevy_horizon/deko3d"]
