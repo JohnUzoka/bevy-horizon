@@ -7,6 +7,12 @@
 #include <string.h>
 #include <switch.h>
 
+// From patches/deko3d/multi-draw-indirect.patch; devkitPro's deko3d.h, which this file includes,
+// doesn't have them.
+#define DK_MAX_MULTI_DRAW_COUNT 1024
+void dkCmdBufMultiDrawIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect, uint32_t drawCount);
+void dkCmdBufMultiDrawIndexedIndirect(DkCmdBuf obj, DkPrimitive prim, DkGpuAddr indirect, uint32_t drawCount);
+
 enum {
     command_chunk_size = 16 * DK_MEMBLOCK_ALIGNMENT,
     zero_block_size = 16 * DK_MEMBLOCK_ALIGNMENT,
@@ -64,6 +70,25 @@ void dkp_stats(uint64_t *out) {
         out[2 * i] = __atomic_exchange_n(&stat_calls[i], 0, __ATOMIC_RELAXED);
         out[2 * i + 1] = armTicksToNs(__atomic_exchange_n(&stat_ticks[i], 0, __ATOMIC_RELAXED));
     }
+}
+
+// What recordings emitted, summed over every recording finished since the last dkp_counters:
+// barriers by kind, draws, binds and the gpfifo entries they end. Each recording keeps its own
+// counts and adds them here once, at its end. count_tile_fixes counts images made since.
+enum { count_barrier_full, count_barrier_primitives, count_barrier_fragments, count_barrier_none,
+       count_full_before, count_draws, count_indirect_draws, count_indirect_calls, count_binds,
+       count_passes, count_copies, count_dispatches, count_entries, count_tile_fixes, count_kinds };
+static uint64_t record_counts[count_kinds];
+
+// Engines that run beside the 3D engine: neither a Fragments nor a Primitives barrier waits for
+// the copy engine (copies, buffer clears) or the 2D engine (MSAA resolves), and the queue's fence
+// is signalled from the 3D engine. Compute jobs do finish before a Primitives barrier.
+enum { busy_copy = 1, busy_2d = 2, busy_compute = 4 };
+
+uint32_t dkp_counters(uint64_t *out, uint32_t capacity) {
+    for (uint32_t i = 0; i < count_kinds && i < capacity; ++i)
+        out[i] = __atomic_exchange_n(&record_counts[i], 0, __ATOMIC_RELAXED);
+    return count_kinds;
 }
 
 typedef struct PendingFence {
@@ -249,9 +274,13 @@ typedef struct {
     CommandChunk *chunk;
     uint32_t remaining_words;
     bool failed, in_pass, started, finished;
-    // A Full barrier waiting for the next command, with what it invalidates.
+    // A barrier waiting for the next command: the strongest DkBarrier asked for since the last
+    // command, and what it invalidates.
     bool barrier_pending;
-    uint32_t barrier_invalidate;
+    uint32_t barrier_mode, barrier_invalidate;
+    // Engines other than the 3D one (busy_* bits) given work since the last Full barrier.
+    uint32_t busy;
+    uint32_t counts[count_kinds];
     Pipeline *pipeline;
     uint32_t stencil_ref;
     uint32_t discard_mask;
@@ -519,6 +548,35 @@ uint64_t dkp_buffer_address(void *ptr) {
 
 // Textures and views
 
+// deko3d 0.5.0 picks an image's tile height from 1.5 times its level 0 height, then shrinks it
+// for level 0 where it lays the levels out (DkImageLayout::calcLevelOffset) but not in level 0's
+// descriptor. For a level 0 of 6 to 8 rows of blocks (6-8 pixels tall, 21-32 for BC) the two
+// disagree: level 0's second column of tiles lands on level 1, and level 1's upload overwrites
+// it. A custom tile size of the shrunk height makes both use it (SwitchWakerHD's
+// image_tile_size_fix, nfsmw-nx docs/HowToDeko3d.md section 6, item 3).
+static void fix_tile_size(DkImageLayoutMaker *maker) {
+    if (maker->flags & (DkImageFlags_PitchLinear | DkImageFlags_CustomTileSize | DkImageFlags_UsageVideo))
+        return;
+    if (maker->type == DkImageType_1D || maker->type == DkImageType_1DArray || maker->type == DkImageType_3D ||
+        maker->type == DkImageType_Buffer)
+        return;
+    // The backend makes no ASTC or ETC images; BC blocks are 4 rows tall.
+    const uint32_t block_height = maker->format >= DkImageFormat_RGB_BC1 &&
+                                  maker->format <= DkImageFormat_RGBA_BC6H_UF16_Float ? 4 : 1;
+    const uint32_t samples_y = maker->msMode == DkMsMode_4x || maker->msMode == DkMsMode_8x ? 2 : 1;
+    const uint32_t rows = (maker->dimensions[1] * samples_y + block_height - 1) / block_height;
+    const uint32_t gobs = (rows + rows / 2 + 7) / 8; // deko3d's pickTileSize
+    const uint32_t tile = gobs >= 16 ? 4 : gobs >= 8 ? 3 : gobs >= 4 ? 2 : gobs >= 2 ? 1 : 0;
+    uint32_t shrunk = tile; // its level 0 shrink (adjustTileSize)
+    while (shrunk && (8u << (shrunk - 1)) >= rows)
+        --shrunk;
+    if (shrunk != tile) {
+        maker->flags |= DkImageFlags_CustomTileSize;
+        maker->tileSize = (DkTileSize)shrunk;
+        __atomic_fetch_add(&record_counts[count_tile_fixes], 1, __ATOMIC_RELAXED);
+    }
+}
+
 void *dkp_texture(void *ptr, const DkpTextureDesc *desc) {
     Context *ctx = ptr;
     if (!ctx || !desc)
@@ -538,6 +596,7 @@ void *dkp_texture(void *ptr, const DkpTextureDesc *desc) {
     maker.dimensions[1] = desc->height;
     maker.dimensions[2] = desc->depth;
     maker.mipLevels = desc->mips;
+    fix_tile_size(&maker);
     dkImageLayoutInitialize(&layout, &maker);
     texture->memory = make_memory(ctx->device, dkImageLayoutGetSize(&layout), DkMemBlockFlags_Image | gpu_flags);
     if (!texture->memory) {
@@ -891,9 +950,40 @@ static bool end_segment(Command *cmd) {
     if (list) {
         cmd->lists[cmd->list_count] = list;
         cmd->list_entries[cmd->list_count] = cmd->entries + 1; // and the entry FinishList ends
+        cmd->counts[count_entries] += cmd->entries + 1;
         ++cmd->list_count;
     }
     cmd->entries = 0;
+    return true;
+}
+
+// Records the pending barrier. `compute`: the next command belongs to a dispatch, which a
+// Fragments barrier (a 3D engine method that waits for pixel work) doesn't hold back; a
+// Primitives barrier waits for all earlier work of the 3D engine and compute jobs. Work on the
+// 2D engine since the last Full barrier makes any barrier Full.
+static bool flush_barrier(Command *cmd, bool compute) {
+    uint32_t mode = cmd->barrier_mode;
+    if (mode == DkBarrier_Fragments && compute)
+        mode = DkBarrier_Primitives;
+    if (mode != DkBarrier_None && (cmd->busy & busy_2d))
+        mode = DkBarrier_Full;
+    cmd->barrier_pending = false;
+    cmd->counts[count_full_before] += 1; // every requested barrier used to be a Full one
+    if (mode == DkBarrier_None && !cmd->barrier_invalidate) {
+        cmd->counts[count_barrier_none] += 1;
+        return true;
+    }
+    if (!reserve(cmd, 16))
+        return false;
+    dkCmdBufBarrier(cmd->buffer, mode, cmd->barrier_invalidate);
+    if (mode == DkBarrier_Full) {
+        cmd->entries += 2; // a Full barrier ends two entries (maxwell/gpu_base.cpp)
+        cmd->busy = 0;
+    }
+    cmd->counts[mode == DkBarrier_Full ? count_barrier_full : mode == DkBarrier_Primitives ? count_barrier_primitives
+                : mode == DkBarrier_Fragments ? count_barrier_fragments : count_barrier_none] += 1;
+    cmd->barrier_mode = DkBarrier_None;
+    cmd->barrier_invalidate = 0;
     return true;
 }
 
@@ -901,7 +991,7 @@ static bool end_segment(Command *cmd) {
 // heaps and invalidates the descriptor cache: descriptors may have been rewritten since the
 // last list ran (only for slots no submitted work still uses). The GPU runs a recording's
 // segments back to back, so its state carries across them.
-static bool begin(Command *cmd, uint32_t words) {
+static bool begin_for(Command *cmd, uint32_t words, bool compute) {
     if (!require(cmd, true))
         return false;
     if (cmd->entries >= segment_entries && !end_segment(cmd))
@@ -918,15 +1008,18 @@ static bool begin(Command *cmd, uint32_t words) {
         dkCmdBufBarrier(cmd->buffer, DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_Shader);
         cmd->started = true;
     }
-    if (cmd->barrier_pending) {
-        if (!reserve(cmd, 16))
-            return false;
-        dkCmdBufBarrier(cmd->buffer, DkBarrier_Full, cmd->barrier_invalidate);
-        cmd->entries += 2; // a Full barrier ends two entries (maxwell/gpu_base.cpp)
-        cmd->barrier_pending = false;
-        cmd->barrier_invalidate = 0;
-    }
+    if (cmd->barrier_pending && !flush_barrier(cmd, compute))
+        return false;
     return reserve(cmd, words);
+}
+
+static bool begin(Command *cmd, uint32_t words) {
+    return begin_for(cmd, words, false);
+}
+
+// Bindings outside a render pass are for dispatches.
+static bool begin_binding(Command *cmd, uint32_t words) {
+    return begin_for(cmd, words, cmd && !cmd->in_pass);
 }
 
 void *dkp_cmd(void *ptr) {
@@ -988,13 +1081,24 @@ void dkp_cmd_free(void *ptr) {
 static bool finish(Command *cmd) {
     if (cmd->failed || cmd->in_pass)
         return false;
-    if (!cmd->finished && (cmd->started || cmd->barrier_pending)) {
-        // Complete copy-engine operations before the graphics queue's fence: begin records the
-        // Full barrier, merged with one the recording ended on.
-        cmd->barrier_pending = true;
+    if (cmd->finished)
+        return true;
+    if (cmd->started || cmd->barrier_pending) {
+        // The queue signals its fence from the 3D engine: copy, 2D and compute work must be
+        // complete before it. begin records the Full barrier, merged with one the recording
+        // ended on.
+        if (!cmd->barrier_pending && !cmd->busy)
+            cmd->counts[count_full_before] += 1; // as every list used to end with a Full barrier
+        if (cmd->busy) {
+            cmd->barrier_pending = true;
+            cmd->barrier_mode = DkBarrier_Full;
+        }
         if (!begin(cmd, 0) || !end_segment(cmd))
             return false;
     }
+    for (int i = 0; i < count_kinds; ++i)
+        if (cmd->counts[i])
+            __atomic_fetch_add(&record_counts[i], cmd->counts[i], __ATOMIC_RELAXED);
     cmd->finished = true;
     return true;
 }
@@ -1301,6 +1405,7 @@ void dkp_pass(void *command, const DkpPassDesc *desc) {
         dkCmdBufClearDepthStencil(cmd->buffer, desc->depth_clear, desc->depth_value,
                                   desc->stencil_clear ? 0xff : 0, (uint8_t)desc->stencil_value);
     cmd->in_pass = true;
+    cmd->counts[count_passes] += 1;
     cmd->pipeline = NULL;
     cmd->discard_mask = desc->discard_mask;
     cmd->depth_discard = depth && desc->depth_discard;
@@ -1325,6 +1430,7 @@ void dkp_end_pass(void *command) {
             resolving = true;
         }
         dkCmdBufResolveImage(cmd->buffer, &cmd->colors[i]->view, &cmd->resolves[i]->view);
+        cmd->busy |= busy_2d;
     }
     for (uint32_t i = 0; i < DK_MAX_RENDER_TARGETS; ++i)
         if (cmd->discard_mask >> i & 1)
@@ -1362,6 +1468,7 @@ void dkp_bind(void *command, void *pipeline_ptr) {
     if (p->depth_bias)
         dkCmdBufSetDepthBias(cmd->buffer, p->bias_constant, p->bias_clamp, p->bias_slope);
     cmd->pipeline = p;
+    cmd->counts[count_binds] += 1;
     apply_stencil(cmd);
 }
 
@@ -1414,7 +1521,7 @@ void dkp_index_buffer(void *command, uint32_t format, uint64_t address) {
 // Reservations cover all six stages.
 void dkp_uniform_buffer(void *command, uint32_t stages, uint32_t slot, uint64_t address, uint32_t size) {
     Command *cmd = command;
-    if (!require(cmd, slot < DK_NUM_UNIFORM_BUFS) || !begin(cmd, 6 * 16))
+    if (!require(cmd, slot < DK_NUM_UNIFORM_BUFS) || !begin_binding(cmd, 6 * 16))
         return;
     for (uint32_t stage = 0; stage <= DkStage_Compute; ++stage)
         if (stages >> stage & 1)
@@ -1423,7 +1530,7 @@ void dkp_uniform_buffer(void *command, uint32_t stages, uint32_t slot, uint64_t 
 
 void dkp_storage_buffer(void *command, uint32_t stages, uint32_t slot, uint64_t address, uint32_t size) {
     Command *cmd = command;
-    if (!require(cmd, slot < DK_NUM_STORAGE_BUFS) || !begin(cmd, 6 * 16))
+    if (!require(cmd, slot < DK_NUM_STORAGE_BUFS) || !begin_binding(cmd, 6 * 16))
         return;
     for (uint32_t stage = 0; stage <= DkStage_Compute; ++stage)
         if (stages >> stage & 1)
@@ -1433,7 +1540,7 @@ void dkp_storage_buffer(void *command, uint32_t stages, uint32_t slot, uint64_t 
 void dkp_textures(void *command, uint32_t stages, uint32_t first, const uint32_t *handles, uint32_t count) {
     Command *cmd = command;
     if (!require(cmd, handles && first <= DK_NUM_TEXTURE_BINDINGS && count <= DK_NUM_TEXTURE_BINDINGS - first) ||
-        !begin(cmd, 6 * (count + 16)))
+        !begin_binding(cmd, 6 * (count + 16)))
         return;
     for (uint32_t stage = 0; stage <= DkStage_Compute; ++stage)
         if (stages >> stage & 1)
@@ -1444,7 +1551,7 @@ void dkp_textures(void *command, uint32_t stages, uint32_t first, const uint32_t
 void dkp_images(void *command, uint32_t stages, uint32_t first, const uint32_t *handles, uint32_t count) {
     Command *cmd = command;
     if (!require(cmd, handles && first <= DK_NUM_IMAGE_BINDINGS && count <= DK_NUM_IMAGE_BINDINGS - first) ||
-        !begin(cmd, 6 * (count + 16)))
+        !begin_binding(cmd, 6 * (count + 16)))
         return;
     for (uint32_t stage = 0; stage <= DkStage_Compute; ++stage)
         if (stages >> stage & 1)
@@ -1478,6 +1585,7 @@ void dkp_draw(void *command, uint32_t vertices, uint32_t instances, uint32_t fir
     if (!require(cmd, cmd->in_pass && cmd->pipeline) || !vertices || !instances || !begin(cmd, 16))
         return;
     dkCmdBufDraw(cmd->buffer, cmd->pipeline->primitive, vertices, instances, first_vertex, first_instance);
+    cmd->counts[count_draws] += 1;
 }
 
 void dkp_draw_indexed(void *command, uint32_t indices, uint32_t instances, uint32_t first_index,
@@ -1487,17 +1595,37 @@ void dkp_draw_indexed(void *command, uint32_t indices, uint32_t instances, uint3
         return;
     dkCmdBufDrawIndexed(cmd->buffer, cmd->pipeline->primitive, indices, instances, first_index, base_vertex,
                         first_instance);
+    cmd->counts[count_draws] += 1;
 }
 
+// stride: 16 (DkDrawIndirectData) or 20 (DkDrawIndexedIndirectData) for packed draws, which go
+// to the GPU as one multi-draw macro call per DK_MAX_MULTI_DRAW_COUNT draws: two gpfifo entries
+// per call, where a draw of its own takes two.
 void dkp_draw_indirect(void *command, bool indexed, uint64_t address, uint32_t count, uint32_t stride) {
     Command *cmd = command;
     if (!require(cmd, cmd->in_pass && cmd->pipeline))
         return;
+    const DkPrimitive primitive = cmd->pipeline->primitive;
+    cmd->counts[count_indirect_calls] += 1;
+    cmd->counts[count_indirect_draws] += count;
+    if (stride == (indexed ? sizeof(DkDrawIndexedIndirectData) : sizeof(DkDrawIndirectData))) {
+        while (count && begin(cmd, 16)) {
+            const uint32_t draws = count < DK_MAX_MULTI_DRAW_COUNT ? count : DK_MAX_MULTI_DRAW_COUNT;
+            if (indexed)
+                dkCmdBufMultiDrawIndexedIndirect(cmd->buffer, primitive, address, draws);
+            else
+                dkCmdBufMultiDrawIndirect(cmd->buffer, primitive, address, draws);
+            cmd->entries += 2; // the macro call, then every draw's parameters
+            address += (uint64_t)draws * stride;
+            count -= draws;
+        }
+        return;
+    }
     for (uint32_t i = 0; i < count && begin(cmd, 16); ++i, address += stride) {
         if (indexed)
-            dkCmdBufDrawIndexedIndirect(cmd->buffer, cmd->pipeline->primitive, address);
+            dkCmdBufDrawIndexedIndirect(cmd->buffer, primitive, address);
         else
-            dkCmdBufDrawIndirect(cmd->buffer, cmd->pipeline->primitive, address);
+            dkCmdBufDrawIndirect(cmd->buffer, primitive, address);
         cmd->entries += 2; // the draw, then its parameters (maxwell/gpu_3d_base.cpp)
     }
 }
@@ -1505,7 +1633,7 @@ void dkp_draw_indirect(void *command, bool indexed, uint64_t address, uint32_t c
 void dkp_bind_compute(void *command, void *pipeline_ptr) {
     Command *cmd = command;
     ComputePipeline *p = pipeline_ptr;
-    if (!require(cmd, !cmd->in_pass && p && p->ctx == cmd->ctx) || !begin(cmd, 64))
+    if (!require(cmd, !cmd->in_pass && p && p->ctx == cmd->ctx) || !begin_for(cmd, 64, true))
         return;
     const DkShader *shader = &p->shader;
     dkCmdBufBindShaders(cmd->buffer, DkStageFlag_Compute, &shader, 1);
@@ -1513,18 +1641,22 @@ void dkp_bind_compute(void *command, void *pipeline_ptr) {
 
 void dkp_dispatch(void *command, uint32_t x, uint32_t y, uint32_t z) {
     Command *cmd = command;
-    if (!require(cmd, !cmd->in_pass) || !x || !y || !z || !begin(cmd, 64))
+    if (!require(cmd, !cmd->in_pass) || !x || !y || !z || !begin_for(cmd, 64, true))
         return;
     dkCmdBufDispatchCompute(cmd->buffer, x, y, z);
     cmd->entries += 2; // a control command here, and the queue's own commands for the job
+    cmd->busy |= busy_compute;
+    cmd->counts[count_dispatches] += 1;
 }
 
 void dkp_dispatch_indirect(void *command, uint64_t address) {
     Command *cmd = command;
-    if (!require(cmd, !cmd->in_pass) || !begin(cmd, 64))
+    if (!require(cmd, !cmd->in_pass) || !begin_for(cmd, 64, true))
         return;
     dkCmdBufDispatchComputeIndirect(cmd->buffer, address);
     cmd->entries += 8; // as dkp_dispatch, and each of the three parameters (maxwell/gpu_compute.cpp)
+    cmd->busy |= busy_compute;
+    cmd->counts[count_dispatches] += 1;
 }
 
 // Queries: counter reports are 16 bytes, {u64 value, u64 timestamp}, 16-byte aligned.
@@ -1548,12 +1680,14 @@ void dkp_copy_buffer(void *command, uint64_t from, uint64_t to, uint64_t size) {
     Command *cmd = command;
     if (!require(cmd, !cmd->in_pass && !((from | to | size) & 3)))
         return;
+    cmd->counts[count_copies] += 1;
     while (size && begin(cmd, 16)) {
         const uint32_t chunk = size > copy_chunk_size ? copy_chunk_size : (uint32_t)size;
         dkCmdBufCopyBuffer(cmd->buffer, from, to, chunk);
         from += chunk;
         to += chunk;
         size -= chunk;
+        cmd->busy |= busy_copy;
     }
 }
 
@@ -1562,9 +1696,26 @@ void dkp_clear_buffer(void *command, uint64_t to, uint64_t size) {
     if (!require(cmd, !cmd->in_pass && !((to | size) & 3)))
         return;
     const DkGpuAddr zeroes = dkMemBlockGetGpuAddr(cmd->ctx->zeroes);
+    cmd->counts[count_copies] += 1;
     while (size && begin(cmd, 16)) {
         const uint32_t chunk = size > zero_block_size ? zero_block_size : (uint32_t)size;
         dkCmdBufCopyBuffer(cmd->buffer, zeroes, to, chunk);
+        to += chunk;
+        size -= chunk;
+        cmd->busy |= busy_copy;
+    }
+}
+
+void dkp_zero(void *command, uint64_t to, uint32_t size) {
+    static const uint32_t zeroes[64];
+    Command *cmd = command;
+    if (!require(cmd, !((to | size) & 3)))
+        return;
+    while (size) {
+        const uint32_t chunk = size > sizeof(zeroes) ? sizeof(zeroes) : size;
+        if (!begin(cmd, 16 + chunk / 4))
+            return;
+        dkCmdBufPushData(cmd->buffer, to, zeroes, chunk);
         to += chunk;
         size -= chunk;
     }
@@ -1593,6 +1744,8 @@ void dkp_copy_buffer_image(void *command, bool to_image, uint64_t address, uint3
         dkCmdBufCopyBufferToImage(cmd->buffer, &buf, &view, &rect, 0);
     else
         dkCmdBufCopyImageToBuffer(cmd->buffer, &view, &rect, &buf, 0);
+    cmd->busy |= busy_copy;
+    cmd->counts[count_copies] += 1;
 }
 
 void dkp_copy_image(void *command, void *src_ptr, const DkpRegion *src_region, void *dst_ptr,
@@ -1607,16 +1760,21 @@ void dkp_copy_image(void *command, void *src_ptr, const DkpRegion *src_region, v
     region_view(&src_view, src, src_region, &src_rect);
     region_view(&dst_view, dst, dst_region, &dst_rect);
     dkCmdBufCopyImage(cmd->buffer, &src_view, &src_rect, &dst_view, &dst_rect, 0);
+    cmd->busy |= busy_copy;
+    cmd->counts[count_copies] += 1;
 }
 
-// invalidate: DkInvalidateFlags bits for what the next commands read. The barrier is recorded
-// before the next command, so back-to-back barriers (wgpu-core transitions buffers, then
-// textures) cost one.
-void dkp_barrier(void *command, uint32_t invalidate) {
+// mode: the DkBarrier the next commands need (DkBarrier_None for none: caches to invalidate
+// only); invalidate: DkInvalidateFlags bits for what they read. The barrier is recorded before
+// the next command, so back-to-back requests (wgpu-core transitions buffers, then textures) cost
+// one, of the strongest mode asked for.
+void dkp_barrier(void *command, uint32_t mode, uint32_t invalidate) {
     Command *cmd = command;
-    if (!require(cmd, true))
+    if (!require(cmd, mode <= DkBarrier_Full))
         return;
     cmd->barrier_pending = true;
+    if (mode > cmd->barrier_mode)
+        cmd->barrier_mode = mode;
     cmd->barrier_invalidate |= invalidate;
 }
 

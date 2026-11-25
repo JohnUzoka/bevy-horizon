@@ -210,14 +210,99 @@ fn buffer_strides(texture: &Texture, layout: &wgt::TexelCopyBufferLayout) -> (u3
     (row, layer)
 }
 
-fn invalidations(from: u64, to: u64, copy: u64) -> u32 {
-    // Image and shader caches hold whatever the next commands sample or read as uniforms.
-    // Copy and mapping traffic also goes around the GPU's L2.
-    let mut flags = dk::DkInvalidateFlags_Image | dk::DkInvalidateFlags_Shader;
-    if (from | to) & copy != 0 {
-        flags |= dk::DkInvalidateFlags_L2Cache;
+/// What deko3d must do between two uses of a buffer: a `DkBarrier` and `DkInvalidateFlags`.
+fn buffer_barrier(from: wgt::BufferUses, to: wgt::BufferUses) -> (u32, u32) {
+    use wgt::BufferUses as U;
+    // The CPU's side of mapped memory needs nothing: it is uncached on both sides, written before
+    // the submission and read after its fence, which waits for every engine (bridge.c's finish).
+    let host = U::MAP_READ | U::MAP_WRITE;
+    let (from, to) = (from - host, to - host);
+    let copy = U::COPY_SRC | U::COPY_DST | U::QUERY_RESOLVE;
+    let writes = U::COPY_DST | U::QUERY_RESOLVE | U::STORAGE_READ_WRITE;
+    let both = from | to;
+    if from.is_empty() || !both.intersects(writes) || (both - copy).is_empty() {
+        // Nothing before it on the GPU, reads after reads, or copies after copies, which the copy
+        // engine runs in order.
+        (dk::DkBarrier_None, 0)
+    } else if both.intersects(copy) || to.contains(U::INDIRECT) {
+        // The copy engine runs beside the 3D engine; indirect arguments are read by the host's
+        // command fetch, which only a Full barrier holds back.
+        (dk::DkBarrier_Full, dk::DkInvalidateFlags_Image | dk::DkInvalidateFlags_Shader | dk::DkInvalidateFlags_L2Cache)
+    } else {
+        // Shader stores against other shader or vertex work: draws and compute jobs complete.
+        (dk::DkBarrier_Primitives, dk::DkInvalidateFlags_Image | dk::DkInvalidateFlags_Shader)
     }
-    flags
+}
+
+/// What deko3d must do between two uses of a texture. `depth`: a depth or stencil format.
+fn texture_barrier(from: wgt::TextureUses, to: wgt::TextureUses, depth: bool) -> (u32, u32) {
+    use wgt::TextureUses as U;
+    // ZCULL keeps what it learnt of the depth image bound at an address while that address stays
+    // bound; deko3d drops it only when another address is bound. A copy into a depth image, or a
+    // new image where an old one was, changes the depth behind its back.
+    let zcull = if depth && (from.contains(U::UNINITIALIZED) || (from | to).contains(U::COPY_DST)) {
+        dk::DkInvalidateFlags_Zcull
+    } else {
+        0
+    };
+    // Presenting waits for the frame's fence, and an uninitialized image has no work before it.
+    let (from, to) = (from - (U::UNINITIALIZED | U::PRESENT), to - U::PRESENT);
+    let copy = U::COPY_SRC | U::COPY_DST;
+    let storage = U::STORAGE_READ_ONLY | U::STORAGE_WRITE_ONLY | U::STORAGE_READ_WRITE | U::STORAGE_ATOMIC;
+    let targets = U::COLOR_TARGET | U::DEPTH_STENCIL_READ | U::DEPTH_STENCIL_WRITE;
+    let rendered = U::COLOR_TARGET | U::DEPTH_STENCIL_WRITE;
+    let writes = U::COPY_DST | rendered | U::STORAGE_WRITE_ONLY | U::STORAGE_READ_WRITE | U::STORAGE_ATOMIC;
+    let both = from | to;
+    if from.is_empty() || !both.intersects(writes) || (both - copy).is_empty() {
+        (dk::DkBarrier_None, zcull)
+    } else if both.intersects(copy) {
+        (dk::DkBarrier_Full, dk::DkInvalidateFlags_Image | dk::DkInvalidateFlags_Shader | dk::DkInvalidateFlags_L2Cache | zcull)
+    } else if both.intersects(storage) {
+        (dk::DkBarrier_Primitives, dk::DkInvalidateFlags_Image | dk::DkInvalidateFlags_Shader)
+    } else if (both - targets).is_empty() {
+        // Render target after render target: the raster output units keep their order.
+        (dk::DkBarrier_None, 0)
+    } else if from.intersects(rendered) {
+        // Sampled after rendered: the pixel work must be done, and the texture cache dropped.
+        // (The bridge makes it Primitives before a dispatch.)
+        (dk::DkBarrier_Fragments, dk::DkInvalidateFlags_Image)
+    } else {
+        // Rendered over what was sampled.
+        (dk::DkBarrier_Fragments, 0)
+    }
+}
+
+/// Merges barriers: deko3d's are global, so one covers a whole batch.
+fn merge((mode, flags): (u32, u32), (m, f): (u32, u32)) -> (u32, u32) {
+    (mode.max(m), flags | f)
+}
+
+/// Every 5 s or so, logs what the recordings emitted per second since the last log: barriers by
+/// kind, draws, gpfifo entries. Called at each submission's transition to `PRESENT` (one or
+/// more per frame).
+fn log_counts() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::LazyLock;
+    use std::time::Instant;
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+    static LOGGED_MS: AtomicU64 = AtomicU64::new(0);
+    const NAMES: [&str; 14] = [
+        "Full barriers", "Primitives barriers", "Fragments barriers", "barriers without a wait",
+        "Full barriers before (one per request)", "draws", "indirect draws", "indirect calls", "pipeline binds",
+        "render passes", "copies", "dispatches", "gpfifo entries", "images given a tile-size fix",
+    ];
+    let now = START.elapsed().as_millis() as u64;
+    let last = LOGGED_MS.load(Ordering::Relaxed);
+    if now < last + 5000 || LOGGED_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let mut counts = [0u64; NAMES.len()];
+    let kinds = unsafe { ffi::dkp_counters(counts.as_mut_ptr(), counts.len() as u32) };
+    debug_assert_eq!(kinds as usize, NAMES.len());
+    let seconds = (now - last) as f64 / 1000.0;
+    let rates: Vec<String> =
+        NAMES.iter().zip(counts).map(|(name, n)| format!("{:.1} {name}", n as f64 / seconds)).collect();
+    log::info!("per second over {seconds:.1} s: {}", rates.join(", "));
 }
 
 impl hal::CommandEncoder for Encoder {
@@ -244,25 +329,27 @@ impl hal::CommandEncoder for Encoder {
     }
 
     unsafe fn transition_buffers<'a, T: Iterator<Item = hal::BufferBarrier<'a, Buffer>>>(&mut self, barriers: T) {
-        use wgt::BufferUses as U;
-        let copy = (U::COPY_SRC | U::COPY_DST | U::MAP_READ | U::MAP_WRITE | U::QUERY_RESOLVE).bits() as u64;
         // deko3d barriers are global, so one covers the whole batch.
-        let flags = barriers.fold(None, |acc: Option<u32>, b| {
-            Some(acc.unwrap_or(0) | invalidations(b.usage.from.bits() as u64, b.usage.to.bits() as u64, copy))
+        let barrier = barriers.fold(None, |acc, b| {
+            Some(merge(acc.unwrap_or((dk::DkBarrier_None, 0)), buffer_barrier(b.usage.from, b.usage.to)))
         });
-        if let Some(flags) = flags {
-            unsafe { ffi::dkp_barrier(self.ptr(), flags) };
+        if let Some((mode, flags)) = barrier {
+            unsafe { ffi::dkp_barrier(self.ptr(), mode, flags) };
         }
     }
 
     unsafe fn transition_textures<'a, T: Iterator<Item = hal::TextureBarrier<'a, Texture>>>(&mut self, barriers: T) {
-        use wgt::TextureUses as U;
-        let copy = (U::COPY_SRC | U::COPY_DST).bits() as u64;
-        let flags = barriers.fold(None, |acc: Option<u32>, b| {
-            Some(acc.unwrap_or(0) | invalidations(b.usage.from.bits() as u64, b.usage.to.bits() as u64, copy))
+        let mut presented = false;
+        let barrier = barriers.fold(None, |acc, b| {
+            presented |= b.usage.to.contains(wgt::TextureUses::PRESENT);
+            let depth = b.texture.format().is_depth_stencil_format();
+            Some(merge(acc.unwrap_or((dk::DkBarrier_None, 0)), texture_barrier(b.usage.from, b.usage.to, depth)))
         });
-        if let Some(flags) = flags {
-            unsafe { ffi::dkp_barrier(self.ptr(), flags) };
+        if let Some((mode, flags)) = barrier {
+            unsafe { ffi::dkp_barrier(self.ptr(), mode, flags) };
+        }
+        if presented {
+            log_counts();
         }
     }
 
@@ -371,16 +458,18 @@ impl hal::CommandEncoder for Encoder {
     }
 
     unsafe fn reset_queries(&mut self, set: &QuerySet, range: Range<u32>) {
+        // Zeroed from the 3D engine's command stream, in order with the reports that follow, so
+        // no barrier is needed against them, as one would be after a copy-engine clear.
         if !range.is_empty() {
             let start = Self::query_address(set, range.start);
-            unsafe { ffi::dkp_clear_buffer(self.ptr(), start, u64::from(range.end - range.start) * 16) };
+            unsafe { ffi::dkp_zero(self.ptr(), start, (range.end - range.start) * 16) };
         }
     }
 
     unsafe fn copy_query_results(&mut self, set: &QuerySet, range: Range<u32>, buffer: &Buffer, offset: u64, stride: wgt::BufferSize) {
         // Reports are {u64 value, u64 timestamp}; wgpu resolves one u64 per query.
         let field = if matches!(set.ty, wgt::QueryType::Timestamp) { 8 } else { 0 };
-        unsafe { ffi::dkp_barrier(self.ptr(), dk::DkInvalidateFlags_L2Cache) };
+        unsafe { ffi::dkp_barrier(self.ptr(), dk::DkBarrier_Full, dk::DkInvalidateFlags_L2Cache) };
         for (i, index) in range.enumerate() {
             let to = buffer.address(offset + i as u64 * stride.get());
             unsafe { ffi::dkp_copy_buffer(self.ptr(), Self::query_address(set, index) + field, to, 8) };
