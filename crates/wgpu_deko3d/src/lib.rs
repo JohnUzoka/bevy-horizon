@@ -13,7 +13,7 @@ use std::{
     ptr::NonNull,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -124,6 +124,14 @@ struct NativeContext {
     handle: Handle,
     lost: AtomicBool,
     shaders: shader::Cache,
+    compress: Compress,
+}
+
+/// Which render targets are made in compressible memory (WGPU_DEKO3D_COMPRESS).
+#[derive(Debug, Clone, Copy)]
+struct Compress {
+    depth: bool,
+    color: bool,
 }
 
 impl Drop for NativeContext {
@@ -147,8 +155,29 @@ impl Context {
             log::info!(target: "deko3d::timing", "gpfifo ring budget {budget}, batches of {batch}");
             unsafe { ffi::dkp_set_ring_budget(budget, batch) };
         }
+        // Measurements: WGPU_DEKO3D_ZCULL=0 makes the queue without ZCULL; WGPU_DEKO3D_DEPTH_REPORTS=1
+        // has every depth pass report ZCULL statistics, fragment shader invocations and samples
+        // passed, logged with the timings.
+        let zcull = std::env::var("WGPU_DEKO3D_ZCULL").map_or(true, |v| v.trim() != "0");
+        let reports = std::env::var("WGPU_DEKO3D_DEPTH_REPORTS").is_ok_and(|v| v.trim() == "1");
+        log::info!(target: "deko3d::timing", "zcull {}, depth reports {reports}", if zcull { "on" } else { "off" });
+        unsafe { ffi::dkp_set_zcull(zcull, reports) };
+        // WGPU_DEKO3D_REPORT_MS: how often the timings are logged, 10 s by default.
+        if let Some(ms) = std::env::var("WGPU_DEKO3D_REPORT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+            REPORT_PERIOD_MS.store(ms.max(100), Ordering::Relaxed);
+        }
+        // Measurements: WGPU_DEKO3D_COMPRESS=depth,color puts depth/stencil and/or color render
+        // targets that shaders don't store to in compressible memory (DkImageFlags_HwCompression).
+        let compress = std::env::var("WGPU_DEKO3D_COMPRESS").unwrap_or_default();
+        let compress = Compress {
+            depth: compress.split(',').any(|w| w.trim() == "depth"),
+            color: compress.split(',').any(|w| w.trim() == "color"),
+        };
+        log::info!(target: "deko3d::timing", "compressed targets: depth {}, color {}", compress.depth, compress.color);
         let handle = Handle::new(unsafe { ffi::dkp_open() }).ok_or(hal::DeviceError::Lost)?;
-        Ok(Self { raw: Arc::new(NativeContext { handle, lost: AtomicBool::new(false), shaders: Default::default() }) })
+        Ok(Self {
+            raw: Arc::new(NativeContext { handle, lost: AtomicBool::new(false), shaders: Default::default(), compress }),
+        })
     }
 
     pub(crate) fn ptr(&self) -> *mut c_void {
@@ -671,6 +700,14 @@ impl hal::Device for Context {
         {
             flags |= dk::DkImageFlags_Usage2DEngine;
         }
+        // Render targets in a compressible memory kind (WGPU_DEKO3D_COMPRESS): the raster output
+        // units then read and write compressed tiles. Not for images shaders store to.
+        let compress = self.raw.compress;
+        let depth_target = desc.format.is_depth_stencil_format()
+            && desc.usage.intersects(Use::DEPTH_STENCIL_READ | Use::DEPTH_STENCIL_WRITE);
+        if !storage && ((compress.depth && depth_target) || (compress.color && desc.usage.contains(Use::COLOR_TARGET))) {
+            flags |= dk::DkImageFlags_HwCompression;
+        }
         let native = ffi::TextureDesc {
             ty, format, flags, width, height, depth, mips: desc.mip_level_count, samples: desc.sample_count,
         };
@@ -1129,10 +1166,12 @@ pub const STAT_NAMES: [&str; 17] = [
 pub const COUNTED: usize = 3;
 
 /// How often [`frame_presented`] logs the bridge's timings.
-const REPORT_PERIOD: Duration = Duration::from_secs(10);
+static REPORT_PERIOD_MS: AtomicU64 = AtomicU64::new(10_000);
 static REPORT: Mutex<Option<(Instant, u32)>> = Mutex::new(None);
+/// dkp_depth_reports at the previous log.
+static DEPTH_REPORTS: Mutex<[u64; 6]> = Mutex::new([0; 6]);
 
-/// Logs, every REPORT_PERIOD, the time per presented frame the bridge spent in each operation:
+/// Logs, every REPORT_PERIOD_MS, the time per presented frame the bridge spent in each operation:
 /// where the CPU waited for the GPU or the display.
 pub(crate) fn frame_presented() {
     let mut report = REPORT.lock().unwrap_or_else(|e| e.into_inner());
@@ -1143,7 +1182,7 @@ pub(crate) fn frame_presented() {
     });
     *frames += 1;
     let elapsed = now - *since;
-    if elapsed < REPORT_PERIOD {
+    if elapsed < Duration::from_millis(REPORT_PERIOD_MS.load(Ordering::Relaxed)) {
         return;
     }
     let n = f64::from(*frames);
@@ -1161,6 +1200,21 @@ pub(crate) fn frame_presented() {
     }
     line.pop();
     log::info!(target: "deko3d::timing", "{line}");
+    let mut counters = [0u64; 6];
+    if unsafe { ffi::dkp_depth_reports(counters.as_mut_ptr()) } {
+        // The ZCULL statistics are 32-bit counters; samples passed restarts with occlusion queries.
+        let mut previous = DEPTH_REPORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let delta: [f64; 6] = std::array::from_fn(|i| {
+            let d = if i < 4 { u64::from((counters[i] as u32).wrapping_sub(previous[i] as u32)) } else { counters[i].wrapping_sub(previous[i]) };
+            d as f64 / n
+        });
+        log::info!(
+            target: "deko3d::timing",
+            "depth passes per frame: zcull stats {:.0} {:.0} {:.0} {:.0}, fragment invocations {:.0}, samples passed {:.0}",
+            delta[0], delta[1], delta[2], delta[3], delta[4], delta[5]
+        );
+        *previous = counters;
+    }
     (*since, *frames) = (now, 0);
 }
 

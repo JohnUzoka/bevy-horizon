@@ -53,6 +53,31 @@ void dkp_set_ring_budget(uint32_t budget, uint32_t batch) {
     }
 }
 
+// Measurements, set before dkp_open (dkp_set_zcull): a queue without ZCULL, and depth passes
+// reporting the GPU's ZCULL statistics, fragment shader invocations and samples passed into the
+// context's `reports` block, which dkp_depth_reports reads.
+static bool zcull_disabled, depth_reports;
+static const volatile uint32_t *report_words; // the last opened context's reports
+enum { report_zcull = 0, report_invocations = 16, report_samples = 32, report_bytes = 48 };
+
+void dkp_set_zcull(bool enabled, bool reports) {
+    zcull_disabled = !enabled;
+    depth_reports = reports;
+}
+
+// Writes the counters of the last depth pass the GPU finished: the four ZCULL statistics, then
+// fragment shader invocations and samples passed, all cumulative. False without depth_reports.
+bool dkp_depth_reports(uint64_t *out) {
+    const volatile uint32_t *words = report_words;
+    if (!words)
+        return false;
+    for (int i = 0; i < 4; ++i)
+        out[i] = words[report_zcull / 4 + i];
+    out[4] = words[report_invocations / 4] | (uint64_t)words[report_invocations / 4 + 1] << 32;
+    out[5] = words[report_samples / 4] | (uint64_t)words[report_samples / 4 + 1] << 32;
+    return true;
+}
+
 // Retired command-memory chunks kept for reuse. 0 restores per-encoder create/destroy.
 #ifndef DKP_CHUNK_POOL
 #define DKP_CHUNK_POOL 64
@@ -184,6 +209,7 @@ typedef struct {
     // to go to the queue, oldest first (queue_lock).
     uint32_t batched;
     struct Backlog *backlog, *backlog_tail;
+    DkMemBlock reports; // depth_reports' counters (dkp_depth_reports), or NULL
 } Context;
 
 static void lock_queue(Context *ctx) {
@@ -332,7 +358,7 @@ typedef struct {
     Pipeline *pipeline;
     uint32_t stencil_ref;
     uint32_t discard_mask;
-    bool depth_discard;
+    bool depth_discard, depth_bound;
     View *colors[DK_MAX_RENDER_TARGETS], *resolves[DK_MAX_RENDER_TARGETS];
     uint32_t colors_bound;
     // Upload arena (CPU-written, GPU-read) for per-draw data such as immediates.
@@ -444,7 +470,8 @@ void *dkp_open(void) {
 
         DkQueueMaker queue_maker;
         dkQueueMakerDefaults(&queue_maker, ctx->device);
-        queue_maker.flags = DkQueueFlags_Graphics | DkQueueFlags_Compute;
+        queue_maker.flags = DkQueueFlags_Graphics | DkQueueFlags_Compute |
+                            (zcull_disabled ? DkQueueFlags_DisableZcull : DkQueueFlags_EnableZcull);
         // The queue's own command memory holds fences, compute jobs (a QMD each) and present
         // commands. deko3d's default, 64 KiB in 16 fenced slices with a kickoff whenever 8 KiB
         // are in flight, made dkQueueSubmitCommands and dkQueueFlush wait for the GPU inside
@@ -453,6 +480,13 @@ void *dkp_open(void) {
         queue_maker.commandMemorySize = 1024 * 1024;
         queue_maker.flushThreshold = 256 * 1024;
         ctx->queue = dkQueueCreate(&queue_maker);
+        if (ctx->queue && depth_reports) {
+            ctx->reports = make_memory(ctx->device, report_bytes, mappable_flags);
+            if (ctx->reports) {
+                memset(dkMemBlockGetCpuAddr(ctx->reports), 0, report_bytes);
+                report_words = dkMemBlockGetCpuAddr(ctx->reports);
+            }
+        }
         if (ctx->queue)
             return ctx;
     }
@@ -497,6 +531,11 @@ void dkp_close(void *ptr) {
     }
     destroy_memory(ctx->descriptors);
     destroy_memory(ctx->zeroes);
+    if (ctx->reports) {
+        if (report_words == dkMemBlockGetCpuAddr(ctx->reports))
+            report_words = NULL;
+        destroy_memory(ctx->reports);
+    }
     dkDeviceDestroy(ctx->device);
     free(ctx);
 }
@@ -1617,6 +1656,7 @@ void dkp_pass(void *command, const DkpPassDesc *desc) {
     cmd->pipeline = NULL;
     cmd->discard_mask = desc->discard_mask;
     cmd->depth_discard = depth && desc->depth_discard;
+    cmd->depth_bound = depth != NULL;
     cmd->colors_bound = desc->color_count;
     for (uint32_t i = 0; i < DK_MAX_RENDER_TARGETS; ++i) {
         cmd->colors[i] = i < desc->color_count ? desc->colors[i] : NULL;
@@ -1626,7 +1666,7 @@ void dkp_pass(void *command, const DkpPassDesc *desc) {
 
 void dkp_end_pass(void *command) {
     Command *cmd = command;
-    if (!require(cmd, cmd->in_pass) || !begin(cmd, 48 + DK_MAX_RENDER_TARGETS * 64))
+    if (!require(cmd, cmd->in_pass) || !begin(cmd, 96 + DK_MAX_RENDER_TARGETS * 64))
         return;
     bool resolving = false;
     for (uint32_t i = 0; i < cmd->colors_bound; ++i) {
@@ -1645,6 +1685,12 @@ void dkp_end_pass(void *command) {
             dkCmdBufDiscardColor(cmd->buffer, i);
     if (cmd->depth_discard)
         dkCmdBufDiscardDepthStencil(cmd->buffer);
+    if (cmd->depth_bound && cmd->ctx->reports) {
+        const DkGpuAddr reports = dkMemBlockGetGpuAddr(cmd->ctx->reports);
+        dkCmdBufReportCounter(cmd->buffer, DkCounter_ZcullStats, reports + report_zcull);
+        dkCmdBufReportCounter(cmd->buffer, DkCounter_FragmentShaderInvocations, reports + report_invocations);
+        dkCmdBufReportCounter(cmd->buffer, DkCounter_SamplesPassed, reports + report_samples);
+    }
     cmd->in_pass = false;
 }
 
