@@ -542,9 +542,11 @@ impl hal::Queue for Context {
     unsafe fn submit(&self, commands: &[&CommandBuffer], _surfaces: &[&SurfaceTexture], (fence, value): (SignalFence<'_>, u64)) -> DeviceResult<()> {
         self.check_alive()?;
         let raw: Vec<*const c_void> = commands.iter().map(|cmd| cmd.ptr().cast_const()).collect();
-        // The native queue signals its fence and flushes, but does not wait. Core retains all
-        // submitted command buffers and resources until get_fence_value/wait report completion.
-        // Acquired surface images were already waited for on the queue (Surface::acquire_texture).
+        // The native queue never waits for the GPU here: it kicks off what the gpfifo ring has
+        // room for and keeps the rest for later calls (the next present waits for it). Core
+        // retains all submitted command buffers and resources until get_fence_value/wait report
+        // completion. Acquired surface images were already waited for on the queue
+        // (Surface::acquire_texture).
         synchronize_device_memory();
         if !unsafe { ffi::dkp_submit(self.ptr(), raw.as_ptr(), raw.len(), fence.0.ptr(), value) } {
             return Err(self.lose());
@@ -1102,13 +1104,14 @@ pub fn instance() -> wgpu::Instance {
     unsafe { wgpu::Instance::from_hal::<Api>(Instance) }
 }
 
-/// Native operations timed by the bridge, in its stat_* order; the last ([`COUNTED`]) count an
+/// Native operations timed by the bridge, in its stat_* order; the last [`COUNTED`] count an
 /// amount instead of nanoseconds.
-pub const STAT_NAMES: [&str; 15] = [
+pub const STAT_NAMES: [&str; 17] = [
     "block_create", "block_destroy", "cmdbuf_create", "cmd_free", "submit", "fence_poll", "fence_wait",
     "ring_wait", "queue_commands", "kick", "queue_lock", "acquire", "present", "wait_idle", "entries",
+    "exact_entries", "outstanding",
 ];
-pub const COUNTED: usize = 1;
+pub const COUNTED: usize = 3;
 
 /// How often [`frame_presented`] logs the bridge's timings.
 const REPORT_PERIOD: Duration = Duration::from_secs(10);
@@ -1134,11 +1137,11 @@ pub(crate) fn frame_presented() {
         if calls == 0 {
             continue;
         }
-        let (amount, calls) = (amount as f64 / n, calls as f64 / n);
+        let (per_frame, calls_per_frame) = (amount as f64 / n, calls as f64 / n);
         let _ = if i < STAT_NAMES.len() - COUNTED {
-            write!(line, " {name} {:.2} ms ({calls:.1}x),", amount / 1e6)
+            write!(line, " {name} {:.2} ms ({calls_per_frame:.1}x),", per_frame / 1e6)
         } else {
-            write!(line, " {name} {amount:.0} ({calls:.1}x),")
+            write!(line, " {name} {per_frame:.0} ({calls_per_frame:.1}x, {:.0} each),", amount as f64 / calls as f64)
         };
     }
     line.pop();

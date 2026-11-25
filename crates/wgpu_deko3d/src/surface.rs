@@ -91,7 +91,10 @@ impl Surface {
             maximum_frame_latency: 1..=2,
             current_extent: (rc == 0 && width > 0).then_some(wgt::Extent3d { width, height, depth_or_array_layers: 1 }),
             usage: wgt::TextureUses::COLOR_TARGET | wgt::TextureUses::COPY_SRC | wgt::TextureUses::COPY_DST,
-            present_modes: vec![wgt::PresentMode::Fifo],
+            // Fifo shows each frame for at least one refresh (swap interval 1). With swap interval
+            // 0 the compositor shows the newest frame at each refresh and releases the frames it
+            // skips, without tearing: Mailbox.
+            present_modes: vec![wgt::PresentMode::Fifo, wgt::PresentMode::Mailbox],
             composite_alpha_modes: vec![wgt::CompositeAlphaMode::Opaque],
         }
     }
@@ -115,6 +118,11 @@ impl hal::Surface for Surface {
             wgt::TextureFormat::Rgba8UnormSrgb => dk::DkImageFormat_RGBA8_Unorm_sRGB,
             wgt::TextureFormat::Rgba8Unorm => dk::DkImageFormat_RGBA8_Unorm,
             _ => return Err(hal::SurfaceError::Other("deko3d swapchains are RGBA8")),
+        };
+        let interval = match config.present_mode {
+            wgt::PresentMode::Fifo => 1,
+            wgt::PresentMode::Mailbox => 0,
+            _ => return Err(hal::SurfaceError::Other("deko3d presents with Fifo or Mailbox")),
         };
         let size = wgt::Extent3d { width: config.extent.width, height: config.extent.height, depth_or_array_layers: 1 };
         let count = (config.maximum_frame_latency + 1).clamp(2, 3);
@@ -140,7 +148,7 @@ impl hal::Surface for Surface {
         // Cleared to black first: Bevy presents its first frame before drawing to it.
         let handle = Handle::new(unsafe { ffi::dkp_swapchain(device.ptr(), self.window.as_ptr(), raw.as_ptr(), count, size.width, size.height) })
             .ok_or(hal::SurfaceError::Lost)?;
-        unsafe { ffi::dkp_swapchain_interval(handle.ptr(), 1) };
+        unsafe { ffi::dkp_swapchain_interval(handle.ptr(), interval) };
         *swapchain = Some(Swapchain { handle, textures, _ctx: device.clone() });
         Ok(())
     }
