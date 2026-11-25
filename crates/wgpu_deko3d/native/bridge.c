@@ -26,10 +26,17 @@ enum {
     // end one in deko3d (maxwell/gpu_base.cpp, gpu_3d_base.cpp, gpu_compute.cpp, dk_cmdbuf.cpp),
     // generously; the budget leaves half the ring for what the estimates miss.
     segment_entries = 128,
-    gpfifo_batch_entries = 384,
-    ring_budget = 1024,
     kick_slots = 16,
 };
+// See above; dkp_set_ring_budget overrides them for measurements.
+static uint32_t gpfifo_batch_entries = 384, ring_budget = 1024;
+
+void dkp_set_ring_budget(uint32_t budget, uint32_t batch) {
+    if (batch >= segment_entries && budget >= batch && budget <= 2000) {
+        ring_budget = budget;
+        gpfifo_batch_entries = batch;
+    }
+}
 
 // Retired command-memory chunks kept for reuse. 0 restores per-encoder create/destroy.
 #ifndef DKP_CHUNK_POOL
@@ -42,25 +49,41 @@ static const uint32_t chunk_pool_limit = DKP_CHUNK_POOL;
 static const uint32_t mappable_flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuUncached;
 static const uint32_t gpu_flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
 
-// Benchmark instrumentation: call counts and accumulated ticks per native operation.
+// Benchmark instrumentation: call counts and accumulated ticks per native operation. The kinds
+// from stat_timed on count an amount instead of ticks.
 enum { stat_block_create, stat_block_destroy, stat_cmdbuf_create, stat_cmd_free,
-       stat_submit, stat_fence_poll, stat_fence_wait, stat_count };
+       stat_submit, stat_fence_poll, stat_fence_wait,
+       stat_ring_wait,      // dkp_submit waiting for the GPU to free gpfifo ring room
+       stat_queue_commands, // dkQueueSubmitCommands (deko3d may wait for its own command ring)
+       stat_kick,           // a kickoff's fence and dkQueueFlush
+       stat_queue_lock,     // waiting for the queue lock
+       stat_acquire,        // dkSwapchainAcquireImage: the compositor handing back an image
+       stat_present,        // dkQueuePresentImage
+       stat_wait_idle,
+       stat_timed,
+       stat_entries = stat_timed, // estimated gpfifo entries per submission
+       stat_count };
 static uint64_t stat_calls[stat_count], stat_ticks[stat_count];
 
-static void stat_end(int kind, uint64_t started) {
+static void stat_add(int kind, uint64_t amount) {
     __atomic_fetch_add(&stat_calls[kind], 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&stat_ticks[kind], armGetSystemTick() - started, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stat_ticks[kind], amount, __ATOMIC_RELAXED);
+}
+
+static void stat_end(int kind, uint64_t started) {
+    stat_add(kind, armGetSystemTick() - started);
 }
 
 uint32_t dkp_chunk_pool_limit(void) {
     return chunk_pool_limit;
 }
 
-// Writes {calls, ns} per operation, then resets the counters.
+// Writes {calls, ns (or amount)} per kind, then resets the counters.
 void dkp_stats(uint64_t *out) {
     for (int i = 0; i < stat_count; ++i) {
         out[2 * i] = __atomic_exchange_n(&stat_calls[i], 0, __ATOMIC_RELAXED);
-        out[2 * i + 1] = armTicksToNs(__atomic_exchange_n(&stat_ticks[i], 0, __ATOMIC_RELAXED));
+        const uint64_t amount = __atomic_exchange_n(&stat_ticks[i], 0, __ATOMIC_RELAXED);
+        out[2 * i + 1] = i < stat_timed ? armTicksToNs(amount) : amount;
     }
 }
 
@@ -119,6 +142,12 @@ typedef struct {
     } kicks[kick_slots];
     uint32_t kick_head, kick_count, kick_entries;
 } Context;
+
+static void lock_queue(Context *ctx) {
+    const uint64_t started = armGetSystemTick();
+    mutexLock(&ctx->queue_lock);
+    stat_end(stat_queue_lock, started);
+}
 
 typedef struct {
     Context *ctx;
@@ -1068,7 +1097,7 @@ bool dkp_fence_completed(void *ptr, uint64_t *completed) {
         return false;
     Context *ctx = fence->ctx;
     uint64_t started = armGetSystemTick();
-    mutexLock(&ctx->queue_lock);
+    lock_queue(ctx);
     bool ok = queue_healthy_locked(ctx);
     bool polled = false;
     while (ok && fence->head) {
@@ -1098,7 +1127,7 @@ int dkp_fence_wait(void *ptr, uint64_t value, int64_t timeout_ns) {
         return -1;
     uint64_t started = armGetSystemTick();
     Context *ctx = fence->ctx;
-    mutexLock(&ctx->queue_lock);
+    lock_queue(ctx);
     int result = 1;
     if (value > fence->submitted || (value > fence->completed && !queue_healthy_locked(ctx))) {
         lose_queue_locked(ctx);
@@ -1157,7 +1186,10 @@ static bool make_room_locked(Context *ctx, uint32_t entries) {
             break;
         if (waited != DkResult_Success || !queue_healthy_locked(ctx))
             return false;
-        const uint64_t ms = armTicksToNs(armGetSystemTick() - started) / 1000000;
+        const uint64_t waited_ticks = armGetSystemTick() - started;
+        if (full)
+            stat_add(stat_ring_wait, waited_ticks);
+        const uint64_t ms = armTicksToNs(waited_ticks) / 1000000;
         if (ms >= 500) {
             char message[160];
             snprintf(message, sizeof(message), "waited %u ms for the GPU to make room on the gpfifo ring "
@@ -1176,10 +1208,12 @@ static bool make_room_locked(Context *ctx, uint32_t entries) {
 // when the GPU is past them. make_room_locked has left a slot free.
 static bool kick_locked(Context *ctx, uint32_t entries) {
     const uint32_t slot = (ctx->kick_head + ctx->kick_count) % kick_slots;
+    const uint64_t started = armGetSystemTick();
     dkQueueSignalFence(ctx->queue, &ctx->kicks[slot].fence, false);
     if (!queue_healthy_locked(ctx))
         return false;
     dkQueueFlush(ctx->queue);
+    stat_end(stat_kick, started);
     if (!queue_healthy_locked(ctx))
         return false;
     // nvservices adds up to two entries of its own to each kickoff (its fence wait and increment).
@@ -1196,7 +1230,7 @@ bool dkp_submit(void *ptr, const void *const *commands, size_t count, void *fenc
         return false;
 
     uint64_t started = armGetSystemTick();
-    mutexLock(&ctx->queue_lock);
+    lock_queue(ctx);
     bool ok = false;
     PendingFence *pending = NULL;
     bool attached = false;
@@ -1218,7 +1252,7 @@ bool dkp_submit(void *ptr, const void *const *commands, size_t count, void *fenc
     // started once the ring has room for a whole batch.
     if (!make_room_locked(ctx, gpfifo_batch_entries))
         goto done;
-    uint32_t batched = 0;
+    uint32_t batched = 0, submitted_entries = 0;
     for (size_t i = 0; i < count; ++i) {
         const Command *cmd = commands[i];
         for (uint32_t j = 0; j < cmd->list_count; ++j) {
@@ -1229,10 +1263,13 @@ bool dkp_submit(void *ptr, const void *const *commands, size_t count, void *fenc
                     goto done;
                 batched = 0;
             }
+            const uint64_t queued = armGetSystemTick();
             dkQueueSubmitCommands(ctx->queue, cmd->lists[j]);
+            stat_end(stat_queue_commands, queued);
             if (!queue_healthy_locked(ctx))
                 goto done;
             batched += entries;
+            submitted_entries += entries;
         }
     }
     if (fence->tail)
@@ -1248,6 +1285,7 @@ bool dkp_submit(void *ptr, const void *const *commands, size_t count, void *fenc
     if (!kick_locked(ctx, batched + 4))
         goto done;
     fence->submitted = value;
+    stat_add(stat_entries, submitted_entries);
     ok = true;
 done:
     if (!attached)
@@ -1264,13 +1302,15 @@ bool dkp_wait_idle(void *ptr) {
     Context *ctx = ptr;
     if (!ctx)
         return false;
-    mutexLock(&ctx->queue_lock);
+    const uint64_t started = armGetSystemTick();
+    lock_queue(ctx);
     bool ok = queue_healthy_locked(ctx);
     if (ok) {
         dkQueueWaitIdle(ctx->queue);
         ok = queue_healthy_locked(ctx);
     }
     mutexUnlock(&ctx->queue_lock);
+    stat_end(stat_wait_idle, started);
     return ok;
 }
 
@@ -1707,9 +1747,11 @@ int dkp_acquire(void *ptr) {
         return -1;
     int slot = -1;
     DkFence fence;
+    const uint64_t started = armGetSystemTick();
     dkSwapchainAcquireImage(swapchain->native, &slot, &fence);
+    stat_end(stat_acquire, started);
     Context *ctx = swapchain->ctx;
-    mutexLock(&ctx->queue_lock);
+    lock_queue(ctx);
     bool ok = slot >= 0 && queue_healthy_locked(ctx);
     if (ok)
         dkQueueWaitFence(ctx->queue, &fence);
@@ -1722,10 +1764,12 @@ bool dkp_present(void *ptr, int slot) {
     if (!swapchain || slot < 0)
         return false;
     Context *ctx = swapchain->ctx;
-    mutexLock(&ctx->queue_lock);
+    lock_queue(ctx);
     bool ok = queue_healthy_locked(ctx);
     if (ok) {
+        const uint64_t started = armGetSystemTick();
         dkQueuePresentImage(ctx->queue, swapchain->native, slot);
+        stat_end(stat_present, started);
         ok = queue_healthy_locked(ctx);
     }
     mutexUnlock(&ctx->queue_lock);

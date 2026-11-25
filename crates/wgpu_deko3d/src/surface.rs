@@ -97,11 +97,11 @@ impl Surface {
     }
 
     pub(super) fn present(&self, texture: SurfaceTexture) -> Result<(), hal::SurfaceError> {
-        if unsafe { ffi::dkp_present(texture.swapchain.as_ptr(), texture.slot) } {
-            Ok(())
-        } else {
-            Err(hal::SurfaceError::Lost)
+        if !unsafe { ffi::dkp_present(texture.swapchain.as_ptr(), texture.slot) } {
+            return Err(hal::SurfaceError::Lost);
         }
+        super::frame_presented();
+        Ok(())
     }
 }
 
