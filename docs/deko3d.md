@@ -17,7 +17,7 @@ This page is for anyone who wants a Bevy game to draw through [deko3d](https://g
 | `crates/wgpu_deko3d/src` | The `wgpu_hal::Api`: bind group slots, texture/sampler pairing, immediates, queries, surface |
 | `crates/wgpu_deko3d/src/shader_cache.rs` | Keeps UAM's output on the SD card, so launches after the first skip compiling ([Shader cache](#shader-cache)) |
 | `patches/uam/console-library.patch` | UAM v1.1.0 as a static library with a C API, and three scheduling fixes (below) |
-| `patches/deko3d` | deko3d v0.5.0, the source of devkitPro's package, with its alpha blend factor fixed (below) |
+| `patches/deko3d` | deko3d v0.5.0, the source of devkitPro's package, with its alpha blend factor fixed, its release library's errors reported, and a multi-draw indirect macro added (below) |
 | `crates/bevy_horizon/src/deko3d.rs` | Creates the device and queue Bevy's automatic setup would, on deko3d's one adapter |
 | `patches/wgpu-hal` | Two accessors an out-of-tree backend needs: `BufferBinding::buffer` and `InstanceError::new` |
 | `patches/naga` | naga 29.0.4's GLSL writer, changed for the depth reads below |
@@ -50,7 +50,7 @@ A game on wgpu 30 vendors the crate: `scripts/vendor_deko3d.sh <game checkout>` 
 
 UAM compiles a shader on the console in 5 ms to 3 s; Bevy's PBR fragment shader, 96 KB of GLSL, takes 2.9 s. Bevy without `multi_threaded` creates pipelines on the main thread as it first needs them, so each compile holds up a frame. hello_switch compiles 33 programs (21 of them compute) in its first three frames, 6.1 s of UAM, and without a cache the screen keeps its first frame for 6.4 s. That frame is black: Bevy presents it before its blit pipeline exists, so nothing draws to it, and the backend clears the swapchain's images when the surface is configured. Before the clear, it showed whatever the memory last held, such as a scrambled frame of the previous app.
 
-The backend therefore keeps every program it compiles in `sdmc:/.deko3d/shader_cache/uam-<UAM>-v<format>/`, one file per program, as NVK keeps its own in `sdmc:/.mesa`. Games share it: a program is found by a hash of everything that decides UAM's output, which is the GLSL, the stage, the bytes of the linked `libuam.a` (`<UAM>` in the directory name) and the cache's format. A new UAM build or format starts a new directory and leaves the old one.
+The backend therefore keeps every program it compiles in `sdmc:/.deko3d/shader_cache/uam-<UAM>-v<format>/`, one file per program, as NVK keeps its own in `sdmc:/.mesa`. Games share it: a program is found by a hash of everything that decides UAM's output, which is the GLSL, the stage, the bytes of the linked `libuam.a` (`<UAM>` in the directory name) and the cache's format. `scripts/build_uam.sh` writes `libuam.a` without timestamps, so rebuilding the same UAM keeps the same directory. A new UAM build or format starts a new directory and leaves the old one.
 
 - **Writes are atomic:** a file is written under a temporary name and renamed into place.
 - **Reads are checked:** a file is used only if its header, key, length and checksum all match. Otherwise, and on any SD card error, the shader is compiled as if there were no cache, a damaged file is replaced, and `log.txt` says why.
