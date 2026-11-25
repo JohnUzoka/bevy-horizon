@@ -9,12 +9,13 @@ use std::{
     any::Any,
     borrow::Borrow,
     ffi::c_void,
+    fmt::Write as _,
     ptr::NonNull,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use naga::back::glsl;
@@ -138,6 +139,14 @@ pub struct Context {
 
 impl Context {
     fn open() -> DeviceResult<Self> {
+        // Measurements: WGPU_DEKO3D_RING=budget,batch sets the gpfifo ring budget and batch size.
+        if let Some((budget, batch)) = std::env::var("WGPU_DEKO3D_RING").ok().and_then(|v| {
+            let (budget, batch) = v.split_once(',')?;
+            Some((budget.trim().parse().ok()?, batch.trim().parse().ok()?))
+        }) {
+            log::info!(target: "deko3d::timing", "gpfifo ring budget {budget}, batches of {batch}");
+            unsafe { ffi::dkp_set_ring_budget(budget, batch) };
+        }
         let handle = Handle::new(unsafe { ffi::dkp_open() }).ok_or(hal::DeviceError::Lost)?;
         Ok(Self { raw: Arc::new(NativeContext { handle, lost: AtomicBool::new(false), shaders: Default::default() }) })
     }
@@ -540,9 +549,11 @@ impl hal::Queue for Context {
     unsafe fn submit(&self, commands: &[&CommandBuffer], _surfaces: &[&SurfaceTexture], (fence, value): (SignalFence<'_>, u64)) -> DeviceResult<()> {
         self.check_alive()?;
         let raw: Vec<*const c_void> = commands.iter().map(|cmd| cmd.ptr().cast_const()).collect();
-        // The native queue signals its fence and flushes, but does not wait. Core retains all
-        // submitted command buffers and resources until get_fence_value/wait report completion.
-        // Acquired surface images were already waited for on the queue (Surface::acquire_texture).
+        // The native queue never waits for the GPU here: it kicks off what the gpfifo ring has
+        // room for and keeps the rest for later calls (the next present waits for it). Core
+        // retains all submitted command buffers and resources until get_fence_value/wait report
+        // completion. Acquired surface images were already waited for on the queue
+        // (Surface::acquire_texture).
         synchronize_device_memory();
         if !unsafe { ffi::dkp_submit(self.ptr(), raw.as_ptr(), raw.len(), fence.0.ptr(), value) } {
             return Err(self.lose());
@@ -1108,9 +1119,50 @@ pub fn instance() -> wgpu::Instance {
     unsafe { wgpu::Instance::from_hal::<Api>(Instance) }
 }
 
-/// Native operations timed by the bridge, in its stat_* order.
-pub const STAT_NAMES: [&str; 7] =
-    ["block_create", "block_destroy", "cmdbuf_create", "cmd_free", "submit", "fence_poll", "fence_wait"];
+/// Native operations timed by the bridge, in its stat_* order; the last [`COUNTED`] count an
+/// amount instead of nanoseconds.
+pub const STAT_NAMES: [&str; 17] = [
+    "block_create", "block_destroy", "cmdbuf_create", "cmd_free", "submit", "fence_poll", "fence_wait",
+    "ring_wait", "queue_commands", "kick", "queue_lock", "acquire", "present", "wait_idle", "entries",
+    "exact_entries", "outstanding",
+];
+pub const COUNTED: usize = 3;
+
+/// How often [`frame_presented`] logs the bridge's timings.
+const REPORT_PERIOD: Duration = Duration::from_secs(10);
+static REPORT: Mutex<Option<(Instant, u32)>> = Mutex::new(None);
+
+/// Logs, every REPORT_PERIOD, the time per presented frame the bridge spent in each operation:
+/// where the CPU waited for the GPU or the display.
+pub(crate) fn frame_presented() {
+    let mut report = REPORT.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let (since, frames) = report.get_or_insert_with(|| {
+        take_stats();
+        (now, 0)
+    });
+    *frames += 1;
+    let elapsed = now - *since;
+    if elapsed < REPORT_PERIOD {
+        return;
+    }
+    let n = f64::from(*frames);
+    let mut line = format!("{:.1} s, {} frames; per frame:", elapsed.as_secs_f64(), frames);
+    for (i, (name, (calls, amount))) in STAT_NAMES.iter().zip(take_stats()).enumerate() {
+        if calls == 0 {
+            continue;
+        }
+        let (per_frame, calls_per_frame) = (amount as f64 / n, calls as f64 / n);
+        let _ = if i < STAT_NAMES.len() - COUNTED {
+            write!(line, " {name} {:.2} ms ({calls_per_frame:.1}x),", per_frame / 1e6)
+        } else {
+            write!(line, " {name} {per_frame:.0} ({calls_per_frame:.1}x, {:.0} each),", amount as f64 / calls as f64)
+        };
+    }
+    line.pop();
+    log::info!(target: "deko3d::timing", "{line}");
+    (*since, *frames) = (now, 0);
+}
 
 pub fn chunk_pool_limit() -> u32 {
     unsafe { ffi::dkp_chunk_pool_limit() }

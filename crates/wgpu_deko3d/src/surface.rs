@@ -91,17 +91,19 @@ impl Surface {
             maximum_frame_latency: 1..=2,
             current_extent: (rc == 0 && width > 0).then_some(wgt::Extent3d { width, height, depth_or_array_layers: 1 }),
             usage: wgt::TextureUses::COLOR_TARGET | wgt::TextureUses::COPY_SRC | wgt::TextureUses::COPY_DST,
+            // Swap interval 0 (Mailbox) measured no faster in Horizon's forest benchmark (25.7 fps
+            // over 2 runs, against Fifo's 26.0), with a one-second hitch in one run.
             present_modes: vec![wgt::PresentMode::Fifo],
             composite_alpha_modes: vec![wgt::CompositeAlphaMode::Opaque],
         }
     }
 
     pub(super) fn present(&self, texture: SurfaceTexture) -> Result<(), hal::SurfaceError> {
-        if unsafe { ffi::dkp_present(texture.swapchain.as_ptr(), texture.slot) } {
-            Ok(())
-        } else {
-            Err(hal::SurfaceError::Lost)
+        if !unsafe { ffi::dkp_present(texture.swapchain.as_ptr(), texture.slot) } {
+            return Err(hal::SurfaceError::Lost);
         }
+        super::frame_presented();
+        Ok(())
     }
 }
 
