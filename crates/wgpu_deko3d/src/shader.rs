@@ -62,6 +62,35 @@ pub const EMPTY_FRAGMENT: &str = "#version 450\nvoid main() {}\n";
 /// The binding immediates are rewritten to: a uniform buffer the encoder fills per draw.
 pub const IMMEDIATES: naga::ResourceBinding = naga::ResourceBinding { group: u32::MAX, binding: 0 };
 
+/// For a void entry point whose body ends in an `if` (or a block) whose sides end in a bare
+/// `return`: those returns removed, and one `return` after it, which they now fall through to.
+/// Naga's WGSL front end ends every side of a trailing `if` with a `return`
+/// (`proc::ensure_block_returns`), so `if c { discard; }` at the end of a fragment entry becomes
+/// `if (c) { discard; } else { return; }`; UAM compiles that `main` without an EXIT, the
+/// discarding invocations branch back into the program and never finish, and the queue times out
+/// (Daybreak's entity shadow pass: `horizon_entity_shadow_fs`). `if (c) { discard; } return;` gets
+/// its EXIT. Returns whether it changed the body.
+fn end_with_return(body: &mut naga::Block) -> bool {
+    use naga::Statement as S;
+    fn strip(block: &mut naga::Block) -> bool {
+        if matches!(block.last(), Some(S::Return { value: None })) {
+            let len = block.len();
+            block.cull(len - 1..);
+            return true;
+        }
+        match block.last_mut() {
+            Some(S::If { accept, reject, .. }) => strip(accept) | strip(reject),
+            Some(S::Block(inner)) => strip(inner),
+            _ => false,
+        }
+    }
+    if !matches!(body.last(), Some(S::If { .. } | S::Block(_))) || !strip(body) {
+        return false;
+    }
+    body.push(S::Return { value: None }, naga::Span::default());
+    true
+}
+
 pub fn compile(
     cache: &Cache,
     stage: &hal::ProgrammableStage<'_, super::ShaderModule>,
@@ -78,6 +107,18 @@ pub fn compile(
     let (mut module, mut info) = naga::back::pipeline_constants::process_overrides(
         &shader.module, &shader.info, Some((kind, stage.entry_point)), stage.constants,
     ).map_err(|e| hal::PipelineError::PipelineConstants(mask, e.to_string()))?;
+
+    // UAM compiles a `main` that ends in an `if` with `discard` on one side and `return` on the
+    // other into a program with no EXIT, which the discarding invocations never leave (see
+    // `end_with_return`). End such a body with one `return` of its own.
+    if let Some(index) = module.entry_points.iter().position(|e| e.stage == kind && e.name == stage.entry_point)
+        && module.entry_points[index].function.result.is_none()
+    {
+        let mut body = module.entry_points[index].function.body.clone();
+        if end_with_return(&mut body) {
+            module.to_mut().entry_points[index].function.body = body;
+        }
+    }
 
     // deko3d has no push constants: immediates become a uniform buffer the encoder fills.
     if module.global_variables.iter().any(|(_, var)| var.space == naga::AddressSpace::Immediate) {
