@@ -1870,7 +1870,29 @@ impl<'a, W: Write> Writer<'a, W> {
                 break_if,
             } => {
                 self.continue_ctx.enter_loop();
-                if !continuing.is_empty() || break_if.is_some() {
+                // bevy-horizon: a body with no `continue` of this loop reaches its end on every
+                // iteration that goes on, so the continuing block follows it there. The gated
+                // form below writes the continuing block before the body, where an expression of
+                // the body it uses (a `let` of a WGSL `loop`) isn't declared yet: it is written
+                // out again and reads the variables as the next iteration starts, not as the
+                // body left them. Its test of `loop_init` on every iteration also hides the
+                // loop's counter from Mesa's GLSL compiler (UAM).
+                let rotate = (!continuing.is_empty() || break_if.is_some()) && !continues(body);
+                if rotate {
+                    writeln!(self.out, "{level}while(true) {{")?;
+                    for sta in body.iter().chain(continuing.iter()) {
+                        self.write_stmt(sta, ctx, level.next())?;
+                    }
+                    if let Some(condition) = break_if {
+                        let l2 = level.next();
+                        write!(self.out, "{l2}if (")?;
+                        self.write_expr(condition, ctx)?;
+                        writeln!(self.out, ") {{")?;
+                        writeln!(self.out, "{}break;", l2.next())?;
+                        writeln!(self.out, "{l2}}}")?;
+                    }
+                    writeln!(self.out, "{level}}}")?;
+                } else if !continuing.is_empty() || break_if.is_some() {
                     let gate_name = self.namer.call("loop_init");
                     writeln!(self.out, "{level}bool {gate_name} = true;")?;
                     writeln!(self.out, "{level}while(true) {{")?;
@@ -1892,10 +1914,12 @@ impl<'a, W: Write> Writer<'a, W> {
                 } else {
                     writeln!(self.out, "{level}while(true) {{")?;
                 }
-                for sta in body {
-                    self.write_stmt(sta, ctx, level.next())?;
+                if !rotate {
+                    for sta in body {
+                        self.write_stmt(sta, ctx, level.next())?;
+                    }
+                    writeln!(self.out, "{level}}}")?;
                 }
-                writeln!(self.out, "{level}}}")?;
                 self.continue_ctx.exit_loop();
             }
             // Break, continue and return as written as in C
@@ -4685,4 +4709,16 @@ impl<'a, W: Write> Writer<'a, W> {
             _ => unreachable!(),
         }
     }
+}
+
+/// Whether `block` has a `continue` of the loop it is the body of (nested loops' own aside).
+fn continues(block: &crate::Block) -> bool {
+    use crate::Statement as S;
+    block.iter().any(|statement| match statement {
+        S::Continue => true,
+        S::Block(inner) => continues(inner),
+        S::If { accept, reject, .. } => continues(accept) || continues(reject),
+        S::Switch { cases, .. } => cases.iter().any(|case| continues(&case.body)),
+        _ => false,
+    })
 }
